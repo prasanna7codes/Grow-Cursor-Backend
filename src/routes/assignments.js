@@ -50,18 +50,14 @@ router.post('/', requireAuth, requireRole('superadmin', 'listingadmin'), async (
 
 router.get('/', requireAuth, requireRole('superadmin', 'listingadmin', 'productadmin'), async (req, res) => {
   try {
-    const {
-      taskId, listerId, platformId, storeId,
-      page = 1, limit = 50, sortBy = 'createdAt', sortOrder = 'desc',
-    } = req.query;
+    const { taskId, listerId, platformId, storeId } = req.query;
+    const { page, limit, sortBy = 'createdAt', sortOrder = 'desc' } = req.query;
 
     const q = {};
     if (taskId) q.task = taskId;
     if (listerId) q.lister = listerId;
     if (platformId) q.listingPlatform = platformId;
     if (storeId) q.store = storeId;
-
-    const skip = (Number(page) - 1) * Number(limit);
 
     const cursor = Assignment.find(q)
       .populate([
@@ -71,17 +67,27 @@ router.get('/', requireAuth, requireRole('superadmin', 'listingadmin', 'producta
         { path: 'store', select: 'name' },
         { path: 'createdBy', select: 'username' },
       ])
-      .sort({ [sortBy]: sortOrder === 'asc' ? 1 : -1 })
-      .skip(skip)
-      .limit(Number(limit));
+      .sort({ [sortBy]: sortOrder === 'asc' ? 1 : -1 });
 
-    const [items, total] = await Promise.all([cursor, Assignment.countDocuments(q)]);
-    res.json({ items, total, page: Number(page), limit: Number(limit) });
+    if (page === undefined && limit === undefined) {
+      const items = await cursor;
+      return res.json(items);
+    }
+
+    const pageNum = Math.max(1, Number(page) || 1);
+    const limitNum = Math.max(1, Number(limit) || 50);
+    const [items, total] = await Promise.all([
+      cursor.skip((pageNum - 1) * limitNum).limit(limitNum),
+      Assignment.countDocuments(q),
+    ]);
+
+    res.json({ items, total, page: pageNum, limit: limitNum });
   } catch (e) {
     console.error(e);
     res.status(500).json({ message: 'Failed to fetch assignments.' });
   }
 });
+
 
 /* -------------------- LISTER FLOWS (FIXED) -------------------- */
 

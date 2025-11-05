@@ -36,12 +36,14 @@ router.post('/', requireAuth, requireRole('superadmin', 'productadmin'), async (
 });
 
 // List tasks (productadmin see all; listingadmin see all; listers see assigned to them)
+// List tasks (productadmin see all; listingadmin see all; listers see assigned to them)
 router.get('/', requireAuth, async (req, res) => {
   const { role, userId } = req.user;
-  const { platformId, storeId, listerId, date, page = 1, limit = 10, sortBy = 'date', sortOrder = 'desc', search } = req.query || {};
+  const { platformId, storeId, listerId, date, sortBy = 'date', sortOrder = 'desc', search } = req.query || {};
+  const { page, limit } = req.query; // <-- no defaults here
+
   const query = role === 'lister' ? { assignedLister: userId } : {};
 
-  // Basic filters
   if (role !== 'lister') {
     if (platformId) query.listingPlatform = platformId;
     if (storeId) query.store = storeId;
@@ -54,7 +56,6 @@ router.get('/', requireAuth, async (req, res) => {
     }
   }
 
-  // Search functionality
   if (search) {
     query.$or = [
       { productTitle: { $regex: search, $options: 'i' } },
@@ -63,39 +64,40 @@ router.get('/', requireAuth, async (req, res) => {
   }
 
   try {
-    // Calculate total count for pagination
-    const total = await Task.countDocuments(query);
-
-    // Prepare sort options
-    const sortOptions = {};
-    sortOptions[sortBy] = sortOrder === 'desc' ? -1 : 1;
-
-    // Get paginated and sorted results
-    const tasks = await Task.find(query)
+    const sortOptions = { [sortBy]: sortOrder === 'desc' ? -1 : 1 };
+    const base = Task.find(query)
       .sort(sortOptions)
-      .skip((Number(page) - 1) * Number(limit))
-      .limit(Number(limit))
       .populate('sourcePlatform')
       .populate('listingPlatform')
       .populate('store')
       .populate('assignedLister', 'email username')
       .populate('createdBy', 'username');
 
-    // If the client did not request pagination (legacy clients), return the raw tasks array
-    if (!req.query.page) {
+    // If the client did NOT request pagination, return ALL results.
+    if (page === undefined && limit === undefined) {
+      const tasks = await base;
       return res.json(tasks);
     }
+
+    // Otherwise, do normal pagination.
+    const pageNum = Math.max(1, Number(page) || 1);
+    const limitNum = Math.max(1, Number(limit) || 10);
+    const [total, tasks] = await Promise.all([
+      Task.countDocuments(query),
+      base.skip((pageNum - 1) * limitNum).limit(limitNum)
+    ]);
 
     res.json({
       tasks,
       total,
-      page: Number(page),
-      totalPages: Math.ceil(total / Number(limit))
+      page: pageNum,
+      totalPages: Math.ceil(total / limitNum)
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
+
 
 // Assign a task to a lister (listingadmin or superadmin)
 router.post('/:id/assign', requireAuth, requireRole('superadmin', 'listingadmin'), async (req, res) => {
