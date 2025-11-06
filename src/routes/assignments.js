@@ -14,7 +14,7 @@ const router = express.Router();
 
 router.post('/', requireAuth, requireRole('superadmin', 'listingadmin'), async (req, res) => {
   try {
-    const { taskId, listerId, quantity, listingPlatformId, storeId } = req.body || {};
+    const { taskId, listerId, quantity, listingPlatformId, storeId, notes } = req.body || {};
     if (!taskId || !listerId || !quantity || !listingPlatformId || !storeId) {
       return res.status(400).json({ message: 'All fields are required.' });
     }
@@ -32,6 +32,7 @@ router.post('/', requireAuth, requireRole('superadmin', 'listingadmin'), async (
       listingPlatform: listingPlatformId,
       store: storeId,
       createdBy: creatorId,
+      notes: notes || '',
     });
 
     const populated = await doc.populate([
@@ -535,13 +536,13 @@ router.post('/:id/complete-range',
         return res.status(403).json({ message: 'Forbidden' });
       }
 
-      // Validate that range belongs to the task's subcategory
+      // Validate that range belongs to the task's category
       
-      const range = await Range.findById(rangeId).populate('subcategory');
+      const range = await Range.findById(rangeId).populate('category');
       if (!range) return res.status(404).json({ message: 'Range not found' });
       
-      if (String(range.subcategory._id) !== String(doc.task.subcategory)) {
-        return res.status(400).json({ message: 'Range does not belong to task subcategory' });
+      if (String(range.category._id) !== String(doc.task.category)) {
+        return res.status(400).json({ message: 'Range does not belong to task category' });
       }
 
       // Update or add range quantity
@@ -560,9 +561,13 @@ router.post('/:id/complete-range',
       // Calculate total distributed quantity
       const totalDistributed = doc.rangeQuantities.reduce((sum, rq) => sum + (rq.quantity || 0), 0);
       
-      // Update completedQuantity but don't auto-complete assignment
+      // Update completedQuantity
       doc.completedQuantity = Math.min(totalDistributed, doc.quantity);
-      // Don't set completedAt here - only on submit
+      
+      // Auto-complete assignment when total distributed equals or exceeds assigned quantity
+      if (totalDistributed >= doc.quantity && !doc.completedAt) {
+        doc.completedAt = new Date();
+      }
 
       await doc.save();
 

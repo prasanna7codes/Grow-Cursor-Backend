@@ -9,6 +9,7 @@ const AssignmentSchema = new mongoose.Schema(
     listingPlatform: { type: mongoose.Schema.Types.ObjectId, ref: 'Platform', required: true },
     store: { type: mongoose.Schema.Types.ObjectId, ref: 'Store', required: true },
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }, // listing admin who shared
+    notes: { type: String, default: '' }, // notes from listing admin to lister
 
     // ✅ Completion tracking
     completedQuantity: { type: Number, default: 0, min: 0 },
