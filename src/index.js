@@ -13,6 +13,7 @@ import rangeRoutes from './routes/ranges.js';
 import categoryRoutes from './routes/categories.js';
 import subcategoryRoutes from './routes/subcategories.js';
 import assignmentsRouter from './routes/assignments.js';
+import compatibilityRoutes from './routes/compatibility.js';
 
 dotenv.config();
 
@@ -40,6 +41,7 @@ app.use('/api/ranges', rangeRoutes);
 app.use('/api/categories', categoryRoutes);
 app.use('/api/subcategories', subcategoryRoutes);
 app.use('/api/assignments', assignmentsRouter);
+app.use('/api/compatibility', compatibilityRoutes);
 
 const port = process.env.PORT || 5000;
 

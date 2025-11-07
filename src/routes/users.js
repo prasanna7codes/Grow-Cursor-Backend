@@ -12,27 +12,40 @@ router.post('/', requireAuth, async (req, res) => {
   if (!email || !username || !password || !newUserRole) {
     return res.status(400).json({ error: 'email, username, password, newUserRole required' });
   }
-  if (!['productadmin', 'listingadmin', 'lister'].includes(newUserRole)) return res.status(400).json({ error: 'Invalid newUserRole' });
-  if (role === 'lister' || role === 'productadmin') return res.status(403).json({ error: 'Forbidden' });
-  // Only superadmin can create productadmin and listingadmin
-  if (['productadmin', 'listingadmin'].includes(newUserRole) && role !== 'superadmin') {
-    return res.status(403).json({ error: 'Only superadmin can create productadmin and listingadmin' });
+  const allowedRoles = ['productadmin', 'listingadmin', 'lister', 'compatibilityadmin', 'compatibilityeditor'];
+  if (!allowedRoles.includes(newUserRole)) return res.status(400).json({ error: 'Invalid newUserRole' });
+
+  // Forbidden base roles
+  if (role === 'lister' || role === 'productadmin' || role === 'compatibilityeditor') {
+    return res.status(403).json({ error: 'Forbidden' });
   }
+
+  // Only superadmin can create high-level admins (productadmin, listingadmin, compatibilityadmin)
+  if (['productadmin', 'listingadmin', 'compatibilityadmin'].includes(newUserRole) && role !== 'superadmin') {
+    return res.status(403).json({ error: 'Only superadmin can create admin roles' });
+  }
+
   // Listing admin can only create listers
   if (role === 'listingadmin' && newUserRole !== 'lister') {
     return res.status(403).json({ error: 'Listing Admins can only create listers' });
   }
+
+  // Compatibility admin can only create compatibility editors
+  if (role === 'compatibilityadmin' && newUserRole !== 'compatibilityeditor') {
+    return res.status(403).json({ error: 'Compatibility Admins can only create compatibility editors' });
+  }
+
   // Check both email and username uniqueness
   const existingEmail = await User.findOne({ email });
   if (existingEmail) return res.status(409).json({ error: 'Email already in use' });
-  
+
   const existingUsername = await User.findOne({ username });
   if (existingUsername) return res.status(409).json({ error: 'Username already in use' });
   const passwordHash = await bcrypt.hash(password, 10);
   const user = await User.create({ email, username, passwordHash, role: newUserRole });
-  
-  // Store the credentials if the creator is a superadmin
+
   if (role === 'superadmin') {
+    // Return credentials for superadmin record-keeping
     res.json({
       id: user._id,
       email: user.email,
@@ -41,7 +54,7 @@ router.post('/', requireAuth, async (req, res) => {
       credentials: {
         email: user.email,
         username: user.username,
-        password: password,  // Send back the original password for storage
+        password: password,
         role: user.role,
         createdAt: new Date()
       }
@@ -54,6 +67,12 @@ router.post('/', requireAuth, async (req, res) => {
 router.get('/listers', requireAuth, requireRole('superadmin', 'listingadmin'), async (req, res) => {
   const listers = await User.find({ role: 'lister', active: true }).select('email username role');
   res.json(listers);
+});
+
+// List compatibility editors (for superadmin or compatibilityadmin)
+router.get('/compatibility-editors', requireAuth, requireRole('superadmin', 'compatibilityadmin'), async (req, res) => {
+  const editors = await User.find({ role: 'compatibilityeditor', active: true }).select('email username role');
+  res.json(editors);
 });
 
 // Check if email or username already exists
