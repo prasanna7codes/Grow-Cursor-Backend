@@ -16,7 +16,11 @@ const EmployeeProfileSchema = new mongoose.Schema(
     workingMode: { type: String, enum: ['remote', 'office', 'hybrid'], trim: true },
     workingHours: { type: String, trim: true },
     aadharNumber: { type: String, trim: true },
-    panNumber: { type: String, trim: true }
+    panNumber: { type: String, trim: true },
+    // File URLs for profile photo and documents (all images now)
+    profilePicUrl: { type: String },
+    aadharImageUrl: { type: String },
+    panImageUrl: { type: String }
   },
   { timestamps: true }
 );

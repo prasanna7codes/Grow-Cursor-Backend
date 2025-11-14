@@ -17,7 +17,10 @@ function pickProfile(body) {
     'bankIFSC',
     'bankName',
     'aadharNumber',
-    'panNumber'
+    'panNumber',
+    'profilePicUrl',
+    'aadharImageUrl',
+    'panImageUrl'
   ];
   const out = {};
   for (const k of allowed) {
