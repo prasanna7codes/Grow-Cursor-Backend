@@ -113,6 +113,9 @@ router.get('/callback', async (req, res) => {
         // Extract tracking number if fulfillmentHrefs exists
         const trackingNumber = await extractTrackingNumber(order.fulfillmentHrefs, tokenRes.data.access_token);
         
+        // Extract purchaseMarketplaceId from lineItems
+        const purchaseMarketplaceId = lineItem.purchaseMarketplaceId || '';
+        
         await Order.findOneAndUpdate(
           { orderId: order.orderId },
           {
@@ -158,7 +161,8 @@ router.get('/callback', async (req, res) => {
             adFee: parseFloat(lineItem.appliedPromotions?.[0]?.discountAmount?.value || 0),
             cancelState: order.cancelStatus?.cancelState || 'NONE_REQUESTED',
             refunds: order.paymentSummary?.refunds || [],
-            trackingNumber: trackingNumber
+            trackingNumber: trackingNumber,
+            purchaseMarketplaceId: purchaseMarketplaceId
           },
           { upsert: true, new: true }
         );
@@ -254,6 +258,9 @@ router.get('/orders', async (req, res) => {
       // Extract tracking number if fulfillmentHrefs exists
       const trackingNumber = await extractTrackingNumber(order.fulfillmentHrefs, accessToken);
       
+      // Extract purchaseMarketplaceId from lineItems
+      const purchaseMarketplaceId = lineItem.purchaseMarketplaceId || '';
+      
       await Order.findOneAndUpdate(
         { orderId: order.orderId },
         {
@@ -300,7 +307,8 @@ router.get('/orders', async (req, res) => {
           adFee: parseFloat(lineItem.appliedPromotions?.[0]?.discountAmount?.value || 0),
           cancelState: order.cancelStatus?.cancelState || 'NONE_REQUESTED',
           refunds: order.paymentSummary?.refunds || [],
-          trackingNumber: trackingNumber
+          trackingNumber: trackingNumber,
+          purchaseMarketplaceId: purchaseMarketplaceId
         },
         { upsert: true, new: true }
       );
@@ -372,6 +380,32 @@ router.patch('/orders/:orderId/ad-fee-general', async (req, res) => {
       return res.status(404).json({ error: 'Order not found' });
     }
     
+    res.json({ success: true, order });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update manual tracking number for an order (does NOT affect fulfillment tracking)
+router.patch('/orders/:orderId/manual-tracking', async (req, res) => {
+  const { orderId } = req.params;
+  const { manualTrackingNumber } = req.body;
+
+  if (manualTrackingNumber === undefined || manualTrackingNumber === null) {
+    return res.status(400).json({ error: 'Missing manualTrackingNumber value' });
+  }
+
+  try {
+    const order = await Order.findByIdAndUpdate(
+      orderId,
+      { manualTrackingNumber: String(manualTrackingNumber) },
+      { new: true }
+    );
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
     res.json({ success: true, order });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -532,6 +566,9 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
           const fulfillmentInstr = ebayOrder.fulfillmentStartInstructions?.[0] || {};
           const shipTo = fulfillmentInstr.shippingStep?.shipTo || {};
           const buyerAddr = `${shipTo.contactAddress?.addressLine1 || ''}, ${shipTo.contactAddress?.city || ''}, ${shipTo.contactAddress?.stateOrProvince || ''}, ${shipTo.contactAddress?.postalCode || ''}, ${shipTo.contactAddress?.countryCode || ''}`.trim();
+          
+          // Extract purchaseMarketplaceId from lineItems
+          const purchaseMarketplaceId = lineItem.purchaseMarketplaceId || '';
 
           // Always upsert with all fields, so new and updated orders are consistent
           const upsertedOrder = await Order.findOneAndUpdate(
@@ -555,6 +592,7 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
               cancelState,
               refunds,
               trackingNumber,
+              purchaseMarketplaceId,
               // Denormalized fields for dashboard
               dateSold: ebayOrder.creationDate,
               shipByDate: lineItem.lineItemFulfillmentInstructions?.shipByDate,
@@ -678,6 +716,9 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
                     const fulfillmentInstr = ebayOrder.fulfillmentStartInstructions?.[0] || {};
                     const shipTo = fulfillmentInstr.shippingStep?.shipTo || {};
                     const buyerAddr = `${shipTo.contactAddress?.addressLine1 || ''}, ${shipTo.contactAddress?.city || ''}, ${shipTo.contactAddress?.stateOrProvince || ''}, ${shipTo.contactAddress?.postalCode || ''}, ${shipTo.contactAddress?.countryCode || ''}`.trim();
+                    
+                    // Extract purchaseMarketplaceId from lineItems
+                    const purchaseMarketplaceId = lineItem.purchaseMarketplaceId || '';
 
                     // Update order
                     existingOrder.orderFulfillmentStatus = ebayOrder.orderFulfillmentStatus;
@@ -695,6 +736,7 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
                     existingOrder.cancelState = cancelState;
                     existingOrder.refunds = refunds;
                     existingOrder.trackingNumber = trackingNumber;
+                    existingOrder.purchaseMarketplaceId = purchaseMarketplaceId;
                     // Update denormalized fields
                     existingOrder.dateSold = ebayOrder.creationDate;
                     existingOrder.shipByDate = lineItem.lineItemFulfillmentInstructions?.shipByDate;
@@ -803,4 +845,120 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
   }
 });
 
+// Update messaging status for an order
+router.patch('/orders/:orderId/messaging-status', async (req, res) => {
+  const { orderId } = req.params;
+  const { messagingStatus } = req.body;
+
+  if (!messagingStatus) {
+    return res.status(400).json({ error: 'Missing messagingStatus value' });
+  }
+
+  // Validate enum values
+  const validStatuses = ['Not Yet Started', 'Ongoing Conversation', 'Resolved'];
+  if (!validStatuses.includes(messagingStatus)) {
+    return res.status(400).json({ error: 'Invalid messagingStatus value' });
+  }
+
+  try {
+    const order = await Order.findByIdAndUpdate(
+      orderId,
+      { messagingStatus },
+      { new: true }
+    ).populate({
+      path: 'seller',
+      populate: {
+        path: 'user',
+        select: 'username email'
+      }
+    });
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    res.json({ success: true, order });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update item status for an order
+router.patch('/orders/:orderId/item-status', async (req, res) => {
+  const { orderId } = req.params;
+  const { itemStatus, resolvedFrom } = req.body;
+
+  if (!itemStatus) {
+    return res.status(400).json({ error: 'Missing itemStatus value' });
+  }
+
+  // Validate enum values
+  const validStatuses = ['None', 'Return', 'Replace', 'INR', 'Resolved'];
+  if (!validStatuses.includes(itemStatus)) {
+    return res.status(400).json({ error: 'Invalid itemStatus value' });
+  }
+
+  try {
+    const updateData = { itemStatus };
+    
+    // If resolving, save the resolvedFrom field
+    if (itemStatus === 'Resolved' && resolvedFrom) {
+      updateData.resolvedFrom = resolvedFrom;
+    }
+    
+    const order = await Order.findByIdAndUpdate(
+      orderId,
+      updateData,
+      { new: true }
+    ).populate({
+      path: 'seller',
+      populate: {
+        path: 'user',
+        select: 'username email'
+      }
+    });
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    res.json({ success: true, order });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update notes for an order
+router.patch('/orders/:orderId/notes', async (req, res) => {
+  const { orderId } = req.params;
+  const { notes } = req.body;
+
+  if (notes === undefined || notes === null) {
+    return res.status(400).json({ error: 'Missing notes value' });
+  }
+
+  try {
+    const order = await Order.findByIdAndUpdate(
+      orderId,
+      { notes: String(notes) },
+      { new: true }
+    ).populate({
+      path: 'seller',
+      populate: {
+        path: 'user',
+        select: 'username email'
+      }
+    });
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    res.json({ success: true, order });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 export default router;
+

@@ -47,7 +47,21 @@ const OrderSchema = new mongoose.Schema(
     adFeeGeneral: Number, // Manually editable ad fee
     cancelState: String, // NONE_REQUESTED, CANCEL_REQUESTED, CANCELED, etc.
     refunds: Array, // Array of refund objects from paymentSummary.refunds
-    trackingNumber: String // Extracted from fulfillmentHrefs
+    trackingNumber: String, // Extracted from fulfillmentHrefs
+    manualTrackingNumber: String, // Manually entered tracking number (separate from trackingNumber)
+    purchaseMarketplaceId: String, // e.g., EBAY_US, EBAY_AUS, EBAY_Canada
+    messagingStatus: { 
+      type: String, 
+      enum: ['Not Yet Started', 'Ongoing Conversation', 'Resolved'],
+      default: 'Not Yet Started'
+    },
+    itemStatus: {
+      type: String,
+      enum: ['None', 'Return', 'Replace', 'INR', 'Resolved'],
+      default: 'None'
+    },
+    resolvedFrom: String, // Track which page it was resolved from: 'Return', 'Replace', or 'INR'
+    notes: String // Notes field for internal use
   },
   { timestamps: true }
 );
