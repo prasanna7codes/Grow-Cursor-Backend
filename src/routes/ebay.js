@@ -1213,20 +1213,20 @@ router.get('/stored-orders', async (req, res) => {
 
     // Timezone-Aware Date Range Logic
     if (startDate || endDate) {
-      query.dateSold = {};
-      const PST_OFFSET_HOURS = 8;
+      // For awaitingShipment, filter by shipByDate; otherwise filter by dateSold
+      const dateField = awaitingShipment === 'true' ? 'shipByDate' : 'dateSold';
+      query[dateField] = {};
 
       if (startDate) {
-        const start = new Date(startDate);
-        start.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0);
-        query.dateSold.$gte = start;
+        // Convert PST/PDT date to UTC for querying
+        const startMoment = moment.tz(startDate, 'America/Los_Angeles').startOf('day');
+        query[dateField].$gte = startMoment.toDate();
       }
 
       if (endDate) {
-        const end = new Date(endDate);
-        end.setDate(end.getDate() + 1);
-        end.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999);
-        query.dateSold.$lte = end;
+        // Convert PST/PDT date to UTC for querying (end of day)
+        const endMoment = moment.tz(endDate, 'America/Los_Angeles').endOf('day');
+        query[dateField].$lte = endMoment.toDate();
       }
     }
 
