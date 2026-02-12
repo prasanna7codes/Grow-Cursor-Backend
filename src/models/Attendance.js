@@ -6,7 +6,10 @@ import mongoose from 'mongoose';
 
 const AttendanceSchema = new mongoose.Schema(
     {
+        // Current canonical field referencing User
         user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+        // Legacy field name kept for backward-compatibility with older indexes/queries
+        employee: { type: mongoose.Schema.Types.ObjectId, ref: 'User', index: true },
         date: { type: String, required: true, index: true }, // YYYY-MM-DD format
         sessions: [
             {
@@ -28,6 +31,16 @@ const AttendanceSchema = new mongoose.Schema(
 
 // Compound index for efficient querying
 AttendanceSchema.index({ user: 1, date: 1 });
+// Keep a compatibility index for legacy collections that used `employee` as field name
+AttendanceSchema.index({ employee: 1, date: 1 });
+
+// Sync legacy `employee` field with `user` before saving to avoid null index entries
+AttendanceSchema.pre('save', function (next) {
+    if (this.user && !this.employee) {
+        this.employee = this.user;
+    }
+    next();
+});
 
 // Method to calculate total work time from sessions
 AttendanceSchema.methods.calculateTotalWorkTime = function () {

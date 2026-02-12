@@ -125,6 +125,19 @@ router.get('/compatibility-editors', requireAuth, requireRole('superadmin', 'com
   res.json(editors);
 });
 
+// Get all active users (for announcements and other features)
+router.get('/', requireAuth, async (req, res) => {
+  try {
+    const users = await User.find({ active: true })
+      .select('username email role department')
+      .sort({ username: 1 });
+    res.json(users);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
 // Check if email or username already exists
 router.get('/check-exists', async (req, res) => {
   const { email, username } = req.query;

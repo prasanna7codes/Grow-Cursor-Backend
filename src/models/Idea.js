@@ -4,17 +4,17 @@ const IdeaSchema = new mongoose.Schema(
   {
     title: { type: String, required: true },
     description: { type: String, required: true },
-    type: { 
-      type: String, 
-      enum: ['issue', 'idea', 'feature', 'bug'], 
+    type: {
+      type: String,
+      enum: ['issue', 'idea', 'feature', 'bug'],
       default: 'idea',
-      required: true 
+      required: true
     },
-    priority: { 
-      type: String, 
-      enum: ['low', 'medium', 'high'], 
+    priority: {
+      type: String,
+      enum: ['low', 'medium', 'high'],
       default: 'medium',
-      required: true 
+      required: true
     },
     status: {
       type: String,
@@ -24,10 +24,10 @@ const IdeaSchema = new mongoose.Schema(
     createdBy: { type: String, required: true }, // Name of the person
     createdByUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // Optional: if logged in
     assignedTo: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // Optional: assign to someone
-    pickedUpBy: { 
-      type: String, 
-      enum: ['aaryan', 'rajarshi', 'prassanna'], 
-      required: false 
+    pickedUpBy: {
+      type: String,
+      enum: ['aaryan', 'rajarshi', 'prassanna'],
+      required: false
     },
     notes: { type: String, default: '' }, // Progress notes for person working on the issue
     comments: [
@@ -40,6 +40,8 @@ const IdeaSchema = new mongoose.Schema(
     resolvedAt: Date,
     resolvedBy: String,
     completeByDate: { type: Date, required: false } // New field for target completion date
+    , department: { type: String, required: false, trim: true } // Department for department-wise issues
+    , source: { type: String, enum: ['ideas', 'department'], default: 'ideas' } // Which page created this record
   },
   { timestamps: true }
 );

@@ -1,10 +1,18 @@
+
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import morgan from 'morgan';
 import dotenv from 'dotenv';
 import path from 'path';
+//import { setServers } from 'dns';
 
+// Set DNS to use Google's DNS servers to resolve MongoDB Atlas
+//setServers(['8.8.8.8', '8.8.4.4']);
+<<<<<<< HEAD
+=======
+
+>>>>>>> 6cf0d93 (Disable DNS server settings in index.js)
 // Load environment variables FIRST before any other imports
 dotenv.config();
 
@@ -54,11 +62,16 @@ import accountHealthRoutes from './routes/accountHealth.js';
 import chatTemplatesRoutes from './routes/chatTemplates.js';
 import remarkTemplatesRoutes from './routes/remarkTemplates.js';
 import extraExpensesRoutes from './routes/extraExpenses.js';
+<<<<<<< HEAD
+=======
+
+import announcementsRoutes from './routes/announcements.js';
+>>>>>>> bc5e119 (Made Required Changes for Backend)
 import leavesRoutes from './routes/leaves.js';
+
+
+
 import asinDirectoryRoutes from './routes/asinDirectory.js';
-import asinListCategoriesRoutes from './routes/asinListCategories.js';
-import asinListRangesRoutes from './routes/asinListRanges.js';
-import asinListProductsRoutes from './routes/asinListProducts.js';
 import attendanceRoutes from './routes/attendance.js';
 import { initializeScheduledJobs } from './scheduledJobs.js';
 
@@ -134,10 +147,9 @@ app.use('/api/chat-templates', chatTemplatesRoutes);
 app.use('/api/remark-templates', remarkTemplatesRoutes);
 app.use('/api/extra-expenses', extraExpensesRoutes);
 app.use('/api/leaves', leavesRoutes);
+
+
 app.use('/api/asin-directory', asinDirectoryRoutes);
-app.use('/api/asin-list-categories', asinListCategoriesRoutes);
-app.use('/api/asin-list-ranges', asinListRangesRoutes);
-app.use('/api/asin-list-products', asinListProductsRoutes);
 // Nomenclature note:
 // `/api/attendance` is a legacy endpoint name kept for compatibility;
 // it serves working-hours tracking behavior (timer sessions), not traditional attendance management.

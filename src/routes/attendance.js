@@ -34,7 +34,8 @@ router.post('/start', requireAuth, async (req, res) => {
         if (!attendance) {
             // Create new attendance record for today
             attendance = await Attendance.create({
-                user: userId,
+                    user: userId,
+                    employee: userId,
                 date: today,
                 sessions: [{ startTime: now }],
                 status: 'active',
