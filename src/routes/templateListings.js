@@ -397,8 +397,8 @@ router.get('/bulk-preview-stream', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'At least one ASIN is required' });
     }
     
-    if (asins.length > 80) {
-      return res.status(400).json({ error: 'Maximum 80 ASINs allowed per batch' });
+    if (asins.length > 100) {
+      return res.status(400).json({ error: 'Maximum 100 ASINs allowed per batch' });
     }
     
     // Set up SSE headers
@@ -871,9 +871,9 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
     }
     
     // Validate batch size
-    if (asins.length > 50) {
+    if (asins.length > 100) {
       return res.status(400).json({ 
-        error: 'Maximum 50 ASINs allowed per batch' 
+        error: 'Maximum 100 ASINs allowed per batch' 
       });
     }
     
@@ -1464,9 +1464,9 @@ router.post('/bulk-preview', requireAuth, async (req, res) => {
     }
     
     // Validate batch size
-    if (asins.length > 80) {
+    if (asins.length > 100) {
       return res.status(400).json({ 
-        error: 'Maximum 80 ASINs allowed per batch' 
+        error: 'Maximum 100 ASINs allowed per batch' 
       });
     }
     

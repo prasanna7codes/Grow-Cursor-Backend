@@ -22,7 +22,227 @@ import ConversationMeta from '../models/ConversationMeta.js';
 import ExchangeRate from '../models/ExchangeRate.js';
 import { parseStringPromise } from 'xml2js';
 import imageCache from '../lib/imageCache.js';
+import multer from 'multer';
+import FeedUpload from '../models/FeedUpload.js';
+
+const upload = multer({ storage: multer.memoryStorage() });
 const router = express.Router();
+
+// ============================================
+// UPLOAD FEED TO EBAY
+// ============================================
+router.post('/feed/upload', requireAuth, upload.single('file'), async (req, res) => {
+  try {
+    const { sellerId, feedType = 'FX_LISTING', schemaVersion = '1.0' } = req.body;
+    const file = req.file;
+
+    if (!file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    if (!sellerId) {
+      return res.status(400).json({ error: 'Missing sellerId' });
+    }
+
+    console.log(`[Feed Upload] Starting upload for seller ${sellerId}, feedType=${feedType}`);
+
+    // 1. Get Seller & Token
+    const seller = await Seller.findById(sellerId);
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
+
+    const accessToken = await ensureValidToken(seller);
+
+    // 2. Create Task
+    // POST https://api.ebay.com/sell/feed/v1/task
+    console.log(`[Feed Upload] Creating task...`);
+    const createTaskRes = await axios.post(
+      'https://api.ebay.com/sell/feed/v1/task',
+      {
+        feedType: feedType,
+        schemaVersion: schemaVersion
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US' // Default to US, make configurable if needed
+        }
+      }
+    );
+
+    // Task location is in "location" header, but ID is usually part of the URL
+    // The response body is empty for 202, but some docs say it returns ID in location header
+    // The documentation says: "The location response header contains the URL to the newly created task. The URL includes the eBay-assigned task ID"
+    const locationHeader = createTaskRes.headers.location;
+    if (!locationHeader) {
+      throw new Error('Failed to get task location from eBay');
+    }
+
+    const taskId = locationHeader.split('/').pop();
+    console.log(`[Feed Upload] Task created with ID: ${taskId}`);
+
+    // 3. Upload File
+    // POST https://api.ebay.com/sell/feed/v1/task/{task_id}/upload_file
+    console.log(`[Feed Upload] Uploading file to task ${taskId}...`);
+
+    const formData = new FormData();
+    // 'file' is the required key name for the file content
+    formData.append('file', file.buffer, {
+      filename: file.originalname,
+      contentType: file.mimetype,
+    });
+    // 'fileName', 'name', 'type' might be required as extra fields based on some examples,
+    // but the official docs say: "This call does not have a JSON Request payload but uploads the file as form-data."
+    // and "key-value pair name: 'file'".
+    // The user's example showed payload = {"fileName": ..., "name": "file", "type": "form-data"}
+    // valid form-data keys: fileName, name, type.
+    formData.append('fileName', file.originalname);
+    formData.append('name', 'file');
+    formData.append('type', 'form-data');
+
+
+    const uploadRes = await axios.post(
+      `https://api.ebay.com/sell/feed/v1/task/${taskId}/upload_file`,
+      formData,
+      {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          ...formData.getHeaders()
+        }
+      }
+    );
+
+    console.log(`[Feed Upload] File uploaded successfully. Status: ${uploadRes.status}`);
+
+    // Create local record
+    await FeedUpload.create({
+      seller: seller._id,
+      taskId: taskId,
+      fileName: file.originalname,
+      feedType: feedType,
+      schemaVersion: schemaVersion,
+      status: 'CREATED' // Initial status
+    });
+
+    res.json({
+      success: true,
+      taskId: taskId,
+      message: 'File uploaded and processing started',
+      uploadStatus: uploadRes.status
+    });
+
+  } catch (error) {
+    console.error('[Feed Upload] Error:', error.message);
+    if (error.response) {
+      console.error('[Feed Upload] eBay Response:', error.response.data);
+      console.error('[Feed Upload] eBay Status:', error.response.status);
+    }
+    res.status(500).json({
+      error: 'Failed to upload feed',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
+// ============================================
+// GET FEED TASKS STATUS
+// ============================================
+router.get('/feed/tasks', requireAuth, async (req, res) => {
+  try {
+    const { sellerId, limit = 10, offset = 0 } = req.query;
+
+    if (!sellerId) {
+      return res.status(400).json({ error: 'Missing sellerId' });
+    }
+
+    // 1. Get Seller & Token
+    const seller = await Seller.findById(sellerId);
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
+
+    const accessToken = await ensureValidToken(seller);
+
+    // 2. Fetch Tasks from eBay
+    // GET https://api.ebay.com/sell/feed/v1/task
+    // 2. Fetch Tasks from Local DB
+    console.log(`[Feed Tasks] Fetching tasks for seller ${sellerId} from DB...`);
+
+    // Calculate skip based on offset/limit
+    const skip = parseInt(offset) || 0;
+    const limitNum = parseInt(limit) || 10;
+
+    const dbTasks = await FeedUpload.find({ seller: sellerId })
+      .sort({ creationDate: -1 })
+      .skip(skip)
+      .limit(limitNum);
+
+    const total = await FeedUpload.countDocuments({ seller: sellerId });
+
+    // 3. Sync Status with eBay for Incomplete Tasks
+    // We only need to check status if it's not COMPLETED or FAILURE
+    const tasksToSync = dbTasks.filter(t =>
+      t.status !== 'COMPLETED' &&
+      t.status !== 'COMPLETED_WITH_ERROR' &&
+      t.status !== 'FAILURE'
+    );
+
+    if (tasksToSync.length > 0) {
+      console.log(`[Feed Tasks] Syncing ${tasksToSync.length} tasks with eBay...`);
+
+      for (const task of tasksToSync) {
+        try {
+          // GET https://api.ebay.com/sell/feed/v1/task/{task_id}
+          const taskRes = await axios.get(
+            `https://api.ebay.com/sell/feed/v1/task/${task.taskId}`,
+            {
+              headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json',
+                'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
+              }
+            }
+          );
+
+          const ebayTask = taskRes.data;
+
+          // Update local DB if status changed
+          if (ebayTask.status !== task.status || ebayTask.uploadSummary) {
+            task.status = ebayTask.status;
+            if (ebayTask.uploadSummary) {
+              task.uploadSummary = {
+                successCount: ebayTask.uploadSummary.successCount,
+                failureCount: ebayTask.uploadSummary.failureCount
+              };
+            }
+            task.lastUpdated = new Date();
+            await task.save();
+          }
+        } catch (err) {
+          console.error(`[Feed Tasks] Failed to sync task ${task.taskId}:`, err.message);
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      tasks: dbTasks,
+      total: total
+    });
+
+  } catch (error) {
+    console.error('[Feed Tasks] Error:', error.message);
+    if (error.response) {
+      console.error('[Feed Tasks] eBay Response:', error.response.data);
+    }
+    res.status(500).json({
+      error: 'Failed to fetch feed tasks',
+      details: error.response?.data || error.message
+    });
+  }
+});
 
 // ============================================
 // EBAY OAUTH SCOPES - Single source of truth
@@ -2132,7 +2352,7 @@ router.post('/orders/:orderId/upload-tracking', async (req, res) => {
     order.trackingNumber = trackingNumber.trim();
     order.manualTrackingNumber = trackingNumber.trim();
     order.orderFulfillmentStatus = 'FULFILLED';
-    order.lastModifiedDate = new Date().toISOString();
+
     await order.save();
 
     console.log(`[Upload Tracking] 💾 Database updated successfully for order ${ebayOrderId}`);
@@ -2334,7 +2554,7 @@ router.post('/orders/:orderId/upload-tracking-multiple', async (req, res) => {
       order.trackingNumber = allTrackingNumbers;
       order.manualTrackingNumber = allTrackingNumbers;
       order.orderFulfillmentStatus = isFulfilled ? 'FULFILLED' : order.orderFulfillmentStatus;
-      order.lastModifiedDate = new Date().toISOString();
+
       await order.save();
 
       console.log(`[Upload Multiple Tracking] 💾 Database updated with ${trackingData.length} tracking numbers`);
@@ -3296,23 +3516,7 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
                 // ONLY NOW fetch full order data (includes expensive tracking lookup)
                 const orderData = await buildOrderData(ebayOrder, seller._id, accessToken);
 
-                // Define fields that should trigger notifications
-                const notifiableFields = [
-                  'cancelState',
-                  'cancelStatus',
-                  'orderPaymentStatus',
-                  'refunds',
-                  'orderFulfillmentStatus',
-                  'trackingNumber',
-                  'shippingFullName',
-                  'shippingAddressLine1',
-                  'shippingAddressLine2',
-                  'shippingCity',
-                  'shippingState',
-                  'shippingPostalCode',
-                  'shippingCountry'
-                  // NOTE: buyerCheckoutNotes is NOT included - updates DB silently
-                ];
+
 
                 // Detect changed fields with smart comparison
                 const changedFields = [];
@@ -3322,10 +3526,7 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
                   }
                 }
 
-                // Filter to only notifiable fields (exclude lastModifiedDate)
-                const notifiableChanges = changedFields.filter(f =>
-                  notifiableFields.includes(f) && f !== 'lastModifiedDate'
-                );
+
 
                 // Always save ALL changes to DB (even non-notifiable)
                 Object.assign(existingOrder, orderData);
@@ -3370,11 +3571,11 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
                   }
                 }
 
-                // Only add to notification list if there are notifiable changes
-                if (notifiableChanges.length > 0) {
+                // Add to list if there are ANY changes
+                if (changedFields.length > 0) {
                   // Check if shipping address changed
                   const shippingFields = ['shippingFullName', 'shippingAddressLine1', 'shippingCity', 'shippingState', 'shippingPostalCode'];
-                  const shippingChanged = notifiableChanges.some(f => shippingFields.includes(f));
+                  const shippingChanged = changedFields.some(f => shippingFields.includes(f));
 
                   if (shippingChanged) {
                     console.log(`  🏠 SHIPPING ADDRESS CHANGED: ${ebayOrder.orderId}`);
@@ -3382,12 +3583,9 @@ router.post('/poll-order-updates', requireAuth, requireRole('fulfillmentadmin', 
 
                   updatedOrders.push({
                     orderId: existingOrder.orderId,
-                    changedFields: notifiableChanges
+                    changedFields: changedFields
                   });
-                  console.log(`  🔔 NOTIFY: ${ebayOrder.orderId} - ${notifiableChanges.join(', ')}`);
-                } else {
-                  // Changes were made but not notifiable (e.g., buyerCheckoutNotes, dates, etc.)
-                  console.log(`  ✅ UPDATED (silent): ${ebayOrder.orderId} - ${changedFields.join(', ')}`);
+                  console.log(`  🔔 NOTIFY: ${ebayOrder.orderId} - ${changedFields.join(', ')}`);
                 }
               }
             }

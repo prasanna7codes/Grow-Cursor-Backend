@@ -104,7 +104,8 @@ const OrderSchema = new mongoose.Schema(
         'Delayed',
         'Re-ordered',
         'Refund',
-        'Return started'
+        'Return started',
+        'Processing'
       ],
       default: null
     },

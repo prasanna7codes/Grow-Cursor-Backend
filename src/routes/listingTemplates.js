@@ -165,6 +165,75 @@ router.post('/', requireAuth, async (req, res) => {
   }
 });
 
+// Duplicate template
+router.post('/:id/duplicate', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Find the source template
+    const sourceTemplate = await ListingTemplate.findById(id);
+    
+    if (!sourceTemplate) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    // Generate unique name with (Copy) suffix
+    let duplicateName = `${sourceTemplate.name} (Copy)`;
+    let copyNumber = 2;
+    
+    // Check if name already exists and increment counter
+    while (await ListingTemplate.findOne({ name: duplicateName })) {
+      duplicateName = `${sourceTemplate.name} (Copy ${copyNumber})`;
+      copyNumber++;
+    }
+    
+    // Create duplicate with all configurations
+    const duplicateData = {
+      name: duplicateName,
+      description: sourceTemplate.description,
+      category: sourceTemplate.category,
+      ebayCategory: sourceTemplate.ebayCategory,
+      customColumns: sourceTemplate.customColumns ? JSON.parse(JSON.stringify(sourceTemplate.customColumns)) : [],
+      asinAutomation: sourceTemplate.asinAutomation ? {
+        enabled: sourceTemplate.asinAutomation.enabled,
+        fieldConfigs: sourceTemplate.asinAutomation.fieldConfigs ? 
+          JSON.parse(JSON.stringify(sourceTemplate.asinAutomation.fieldConfigs)) : []
+      } : { enabled: false, fieldConfigs: [] },
+      pricingConfig: sourceTemplate.pricingConfig ? {
+        enabled: sourceTemplate.pricingConfig.enabled,
+        spentRate: sourceTemplate.pricingConfig.spentRate,
+        payoutRate: sourceTemplate.pricingConfig.payoutRate,
+        desiredProfit: sourceTemplate.pricingConfig.desiredProfit,
+        fixedFee: sourceTemplate.pricingConfig.fixedFee,
+        saleTax: sourceTemplate.pricingConfig.saleTax,
+        ebayFee: sourceTemplate.pricingConfig.ebayFee,
+        adsFee: sourceTemplate.pricingConfig.adsFee,
+        tdsFee: sourceTemplate.pricingConfig.tdsFee,
+        shippingCost: sourceTemplate.pricingConfig.shippingCost,
+        taxRate: sourceTemplate.pricingConfig.taxRate,
+        profitTiers: sourceTemplate.pricingConfig.profitTiers ? {
+          enabled: sourceTemplate.pricingConfig.profitTiers.enabled,
+          tiers: sourceTemplate.pricingConfig.profitTiers.tiers ? 
+            JSON.parse(JSON.stringify(sourceTemplate.pricingConfig.profitTiers.tiers)) : []
+        } : { enabled: false, tiers: [] }
+      } : { enabled: false },
+      coreFieldDefaults: sourceTemplate.coreFieldDefaults ? 
+        JSON.parse(JSON.stringify(sourceTemplate.coreFieldDefaults)) : {},
+      customActionField: sourceTemplate.customActionField,
+      createdBy: req.user.userId
+    };
+    
+    const duplicateTemplate = new ListingTemplate(duplicateData);
+    await duplicateTemplate.save();
+    await duplicateTemplate.populate('createdBy', 'name email');
+    
+    res.status(201).json(duplicateTemplate);
+  } catch (error) {
+    console.error('Error duplicating template:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Update template
 router.put('/:id', requireAuth, async (req, res) => {
   try {
