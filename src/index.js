@@ -58,6 +58,8 @@ import sellerPricingConfigRoutes from './routes/sellerPricingConfig.js';
 import accountHealthRoutes from './routes/accountHealth.js';
 import chatTemplatesRoutes from './routes/chatTemplates.js';
 import extraExpensesRoutes from './routes/extraExpenses.js';
+import leavesRoutes from './routes/leaves.js';
+import asinDirectoryRoutes from './routes/asinDirectory.js';
 
 const app = express();
 
@@ -129,6 +131,8 @@ app.use('/api/seller-pricing-config', sellerPricingConfigRoutes);
 app.use('/api/account-health', accountHealthRoutes);
 app.use('/api/chat-templates', chatTemplatesRoutes);
 app.use('/api/extra-expenses', extraExpensesRoutes);
+app.use('/api/leaves', leavesRoutes);
+app.use('/api/asin-directory', asinDirectoryRoutes);
 
 
 const port = process.env.PORT || 5000;

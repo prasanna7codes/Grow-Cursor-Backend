@@ -213,7 +213,11 @@ router.get('/evaluation-windows', requireAuth, requireRole('fulfillmentadmin', '
           type: 'bbe_market_avg',
           $or: [{ seller: { $exists: false } }, { seller: null }]
         };
-    const marketMetrics = await MarketMetric.find(marketMetricQuery).sort({ effectiveDate: 1 }).lean();
+    // Important: when multiple metrics exist for the same effectiveDate,
+    // prefer the most recently created record.
+    const marketMetrics = await MarketMetric.find(marketMetricQuery)
+      .sort({ effectiveDate: 1, createdAt: 1, _id: 1 })
+      .lean();
     const sellerScopedMetrics = sellerId
       ? marketMetrics.filter(m => m.seller && m.seller.toString() === sellerId)
       : [];
