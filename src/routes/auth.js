@@ -13,8 +13,13 @@ router.post('/login', async (req, res) => {
   if (!user.active) return res.status(401).json({ error: 'Account is not active' });
   const ok = await bcrypt.compare(password, user.passwordHash);
   if (!ok) return res.status(401).json({ error: 'Incorrect password' });
-  const token = jwt.sign({ userId: user._id.toString(), role: user.role }, process.env.JWT_SECRET, { expiresIn: '7d' });
-  res.json({ token, user: { id: user._id, email: user.email, username: user.username, role: user.role } });
+  const token = jwt.sign({
+    userId: user._id.toString(),
+    username: user.username,
+    role: user.role,
+    department: user.department
+  }, process.env.JWT_SECRET, { expiresIn: '7d' });
+  res.json({ token, user: { id: user._id, email: user.email, username: user.username, role: user.role, department: user.department } });
 });
 
 // Seed superadmin if none exists (development helper)

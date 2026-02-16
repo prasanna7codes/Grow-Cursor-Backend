@@ -40,6 +40,7 @@ const IdeaSchema = new mongoose.Schema(
     resolvedAt: Date,
     resolvedBy: String,
     completeByDate: { type: Date, required: false } // New field for target completion date
+    ,department: { type: String, required: false, trim: true } // Department for department-wise issues
   },
   { timestamps: true }
 );
