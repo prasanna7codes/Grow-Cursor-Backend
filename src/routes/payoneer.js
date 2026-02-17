@@ -24,21 +24,58 @@ const calculateFields = (amount, exchangeRate) => {
     };
 };
 
-// GET /api/payoneer - List all records
+// GET /api/payoneer - List all records with pagination and filtering
 router.get('/', requireAuth, requireRole('superadmin'), async (req, res) => {
     try {
-        const records = await PayoneerRecord.find()
-            .populate({
-                path: 'store',
-                select: 'user',
-                populate: {
-                    path: 'user',
-                    select: 'username'
-                }
-            })
-            .populate('bankAccount', 'name') // Direct population
-            .sort({ paymentDate: -1 });
-        res.json(records);
+        const { page = 1, limit = 50, startDate, endDate, store } = req.query;
+
+        const query = {};
+
+        // Store Filter
+        if (store) {
+            query.store = store;
+        }
+
+        // Date Filter
+        if (startDate || endDate) {
+            query.paymentDate = {};
+            if (startDate) {
+                // Assuming startDate is YYYY-MM-DD
+                query.paymentDate.$gte = new Date(startDate);
+            }
+            if (endDate) {
+                // Assuming endDate is YYYY-MM-DD, set to end of day
+                const end = new Date(endDate);
+                end.setHours(23, 59, 59, 999);
+                query.paymentDate.$lte = end;
+            }
+        }
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        const [records, totalRecords] = await Promise.all([
+            PayoneerRecord.find(query)
+                .populate({
+                    path: 'store',
+                    select: 'user',
+                    populate: {
+                        path: 'user',
+                        select: 'username'
+                    }
+                })
+                .populate('bankAccount', 'name')
+                .sort({ paymentDate: -1 })
+                .skip(skip)
+                .limit(parseInt(limit)),
+            PayoneerRecord.countDocuments(query)
+        ]);
+
+        res.json({
+            records,
+            totalRecords,
+            totalPages: Math.ceil(totalRecords / parseInt(limit)),
+            currentPage: parseInt(page)
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

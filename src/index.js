@@ -57,6 +57,7 @@ import templateOverridesRoutes from './routes/templateOverrides.js';
 import sellerPricingConfigRoutes from './routes/sellerPricingConfig.js';
 import accountHealthRoutes from './routes/accountHealth.js';
 import chatTemplatesRoutes from './routes/chatTemplates.js';
+import remarkTemplatesRoutes from './routes/remarkTemplates.js';
 import extraExpensesRoutes from './routes/extraExpenses.js';
 
 import announcementsRoutes from './routes/announcements.js';
@@ -135,6 +136,7 @@ app.use('/api/template-overrides', templateOverridesRoutes);
 app.use('/api/seller-pricing-config', sellerPricingConfigRoutes);
 app.use('/api/account-health', accountHealthRoutes);
 app.use('/api/chat-templates', chatTemplatesRoutes);
+app.use('/api/remark-templates', remarkTemplatesRoutes);
 app.use('/api/extra-expenses', extraExpensesRoutes);
 app.use('/api/announcements', announcementsRoutes);
 app.use('/api/leaves', leavesRoutes);
