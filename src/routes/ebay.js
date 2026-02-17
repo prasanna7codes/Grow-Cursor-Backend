@@ -1402,7 +1402,7 @@ router.get('/order/:orderId', requireAuth, requireRole('fulfillmentadmin', 'supe
 
 // Get stored orders from database with pagination support
 router.get('/stored-orders', async (req, res) => {
-  const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchItemId, searchMarketplace, paymentStatus, startDate, endDate, awaitingShipment, hasFulfillmentNotes, amazonArriving, arrivalSort, amazonAccount, arrivalStartDate, arrivalEndDate } = req.query;
+  const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchItemId, searchMarketplace, paymentStatus, startDate, endDate, awaitingShipment, hasFulfillmentNotes, amazonArriving, arrivalSort, amazonAccount, arrivalStartDate, arrivalEndDate, productName } = req.query;
 
   try {
     let query = {};
@@ -1468,6 +1468,26 @@ router.get('/stored-orders', async (req, res) => {
         { 'lineItems.legacyItemId': { $regex: searchItemId, $options: 'i' } },
         { itemNumber: { $regex: searchItemId, $options: 'i' } }
       ];
+    }
+
+    if (productName) {
+      const productClause = {
+        $or: [
+          { productName: { $regex: productName, $options: 'i' } },
+          { 'lineItems.title': { $regex: productName, $options: 'i' } }
+        ]
+      };
+
+      if (query.$or) {
+        if (!query.$and) query.$and = [];
+        query.$and.push({ $or: query.$or });
+        delete query.$or;
+        query.$and.push(productClause);
+      } else if (query.$and) {
+        query.$and.push(productClause);
+      } else {
+        query.$or = productClause.$or;
+      }
     }
 
     // Timezone-Aware Date Range Logic
