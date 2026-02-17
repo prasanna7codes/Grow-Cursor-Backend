@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { requireAuth, requireRole } from '../middleware/auth.js';
 import LeaveRequest from '../models/LeaveRequest.js';
 import User from '../models/User.js';
+import { sendLeaveRequestEmail } from '../lib/email.js';
 
 const router = Router();
 
@@ -150,7 +151,23 @@ router.post('/', requireAuth, async (req, res) => {
             status: 'pending'
         });
 
+        // Respond to client first
         res.status(201).json(leaveRequest);
+
+        // Notify HR admins and superadmins via email (non-blocking)
+        (async () => {
+            try {
+                // populate user info for email
+                const populated = await LeaveRequest.findById(leaveRequest._id).populate('user', 'username email department');
+                const admins = await User.find({ role: { $in: ['hradmin', 'superadmin'] }, email: { $exists: true, $ne: '' } }).lean();
+                const recipients = admins.map(a => a.email).filter(Boolean);
+                if (recipients.length > 0) {
+                    await sendLeaveRequestEmail(populated, recipients);
+                }
+            } catch (err) {
+                console.error('Error sending leave notification emails:', err);
+            }
+        })();
     } catch (error) {
         console.error('Error creating leave request:', error);
         res.status(500).json({ error: 'Failed to create leave request' });

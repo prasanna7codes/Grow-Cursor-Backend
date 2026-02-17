@@ -2,6 +2,7 @@ import express from 'express';
 import jwt from 'jsonwebtoken';
 import Announcement from '../models/Announcement.js';
 import User from '../models/User.js';
+import { sendAnnouncementEmail } from '../lib/email.js';
 
 const router = express.Router();
 
@@ -183,6 +184,27 @@ router.post('/', authenticateUser, requireAdmin, async (req, res) => {
             targetUsers: type === 'individual' ? targetUsers : [],
             expiresAt: expiresAt || null
         });
+
+        // Send email notifications
+        try {
+            let recipients = [];
+            if (type === 'company-wide') {
+                // Get all users with email
+                const users = await User.find({ email: { $exists: true, $ne: null } }).select('email');
+                recipients = users.map(u => u.email);
+            } else if (type === 'individual' && targetUsers && targetUsers.length > 0) {
+                // Get target users' emails
+                const users = await User.find({ username: { $in: targetUsers } }).select('email');
+                recipients = users.map(u => u.email);
+            }
+
+            if (recipients.length > 0) {
+                // Send asynchronously without blocking response
+                sendAnnouncementEmail(announcement, recipients).catch(console.error);
+            }
+        } catch (emailErr) {
+            console.error('Failed to prepare email recipients:', emailErr);
+        }
 
         res.status(201).json(announcement);
     } catch (err) {

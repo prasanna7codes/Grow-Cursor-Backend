@@ -1,6 +1,8 @@
 import express from 'express';
 import Idea from '../models/Idea.js';
+import User from '../models/User.js';
 import jwt from 'jsonwebtoken';
+import { sendIssueCreatedEmail } from '../lib/email.js';
 
 const router = express.Router();
 
@@ -39,6 +41,21 @@ router.get('/', async (req, res) => {
     if (priority) query.priority = priority;
     if (type) query.type = type;
     if (department) query.department = department;
+
+    // Date filtering
+    const { startDate, endDate } = req.query;
+    if (startDate || endDate) {
+      query.createdAt = {};
+      if (startDate) {
+        query.createdAt.$gte = new Date(startDate);
+      }
+      if (endDate) {
+        // Set end date to end of day to be inclusive
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        query.createdAt.$lte = end;
+      }
+    }
 
     // STRICT AUTHENTICATION REQUIRED
     if (!req.headers.authorization) {
@@ -146,6 +163,50 @@ router.post('/', async (req, res) => {
       completeByDate: completeByDate || undefined,
       department: department || undefined
     });
+
+    // Send email notification asynchronously
+    try {
+      const recipients = new Set();
+
+      // 1. Get Superadmins
+      const superadmins = await User.find({ role: 'superadmin', email: { $exists: true, $ne: null } }).select('email');
+      superadmins.forEach(u => recipients.add(u.email));
+
+      // 2. Get Department Heads/Admins
+      if (department) {
+        // Define admin roles
+        const adminRoles = [
+          'productadmin', 'listingadmin', 'compatibilityadmin', 'fulfillmentadmin',
+          'hradmin', 'operationhead', 'hoc', 'compliancemanager'
+        ];
+
+        // Find users who are admins AND (belong to the department OR their role maps to it)
+        const allAdmins = await User.find({
+          role: { $in: adminRoles },
+          email: { $exists: true, $ne: null }
+        });
+
+        allAdmins.forEach(admin => {
+          // Check explicit department match
+          if (admin.department === department) {
+            recipients.add(admin.email);
+            return;
+          }
+
+          // Check role-based department mapping
+          const roleDept = getRoleDepartment(admin.role);
+          if (roleDept === department) {
+            recipients.add(admin.email);
+          }
+        });
+      }
+
+      if (recipients.size > 0) {
+        sendIssueCreatedEmail(newIdea, Array.from(recipients)).catch(console.error);
+      }
+    } catch (emailErr) {
+      console.error('Failed to send issue email:', emailErr);
+    }
 
     res.status(201).json(newIdea);
   } catch (err) {
