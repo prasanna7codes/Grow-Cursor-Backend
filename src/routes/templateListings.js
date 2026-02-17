@@ -552,7 +552,9 @@ router.get('/bulk-preview-stream', requireAuth, async (req, res) => {
             brand: amazonData.brand,
             price: amazonData.price,
             description: amazonData.description,
-            images: amazonData.images
+            images: amazonData.images,
+            color: amazonData.color,
+            compatibility: amazonData.compatibility
           },
           generatedListing: {
             ...mergedCoreFields,
@@ -1715,6 +1717,8 @@ router.post('/bulk-preview', requireAuth, async (req, res) => {
             price: amazonData.price,
             description: amazonData.description,
             images: amazonData.images,
+            color: amazonData.color,
+            compatibility: amazonData.compatibility,
             rawData: amazonData.rawData
           },
           generatedListing: {

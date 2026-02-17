@@ -30,7 +30,7 @@ export async function fetchAmazonData(asin) {
     const responseTime = Date.now() - startTime;
     
     // Extract fields
-    let { title, brand, price, description, images } = scrapedData;
+    let { title, brand, price, description, images, color, compatibility } = scrapedData;
     
     // Remove brand from title (maintain existing behavior)
     if (brand && brand !== 'Unbranded' && title.toLowerCase().includes(brand.toLowerCase())) {
@@ -42,6 +42,8 @@ export async function fetchAmazonData(asin) {
     
     console.log(`[fetchAmazonData] ✅ Successfully fetched data for ${asin} in ${responseTime}ms`);
     console.log(`[fetchAmazonData] 📊 Extracted fields: Title="${title.substring(0, 40)}...", Brand="${brand}", Price="${price}", Images=${imagesArray.length} URLs, Description=${description.split('\n').length} features`);
+    if (color) console.log(`[fetchAmazonData] 🎨 Color: "${color}"`);
+    if (compatibility) console.log(`[fetchAmazonData] 📱 Compatibility: "${compatibility}"`);
     console.log(`[fetchAmazonData] 🖼️ First image: ${imagesArray[0] || 'none'}`);
     
     const result = {
@@ -51,6 +53,8 @@ export async function fetchAmazonData(asin) {
       brand,
       description,
       images: imagesArray, // Return as array (same as PAAPI)
+      color: color || '',
+      compatibility: compatibility || '',
       rawData: scrapedData // Store scraped data for debugging
     };
     

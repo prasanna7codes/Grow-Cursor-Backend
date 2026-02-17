@@ -67,6 +67,47 @@ function extractPriceFromStructured(data) {
 }
 
 /**
+ * Extract color from structured API response
+ */
+function extractColor(data) {
+  if (!data) return '';
+  
+  // Try product_information.color first
+  if (data.product_information?.color) {
+    return data.product_information.color;
+  }
+  
+  // Try customization_options.color for selected variant
+  if (data.customization_options?.color && Array.isArray(data.customization_options.color)) {
+    const selectedColor = data.customization_options.color.find(c => c.is_selected);
+    if (selectedColor?.value) {
+      return selectedColor.value;
+    }
+  }
+  
+  return '';
+}
+
+/**
+ * Extract compatibility from structured API response
+ */
+function extractCompatibility(data) {
+  if (!data) return '';
+  
+  // Try product_information.item_model_number first
+  if (data.product_information?.item_model_number) {
+    return data.product_information.item_model_number;
+  }
+  
+  // Try top-level model field
+  if (data.model) {
+    return data.model;
+  }
+  
+  return '';
+}
+
+/**
  * Extract title from Amazon HTML (DEPRECATED - now using structured API)
  */
 function extractTitle(html, asin) {
@@ -438,6 +479,10 @@ export async function scrapeAmazonProductWithScraperAPI(asin, region = 'US', ret
         const features = data.feature_bullets || [];
         const description = features.join('\n');
         
+        // Extract color and compatibility
+        const color = extractColor(data);
+        const compatibility = extractCompatibility(data);
+        
         // Use high_res_images if available, otherwise fall back to regular images
         // Take ONLY first 6 images (main product images, not all variants)
         let images = [];
@@ -466,6 +511,8 @@ export async function scrapeAmazonProductWithScraperAPI(asin, region = 'US', ret
         console.log(`[ScraperAPI] ✅ Brand found for ${asin}: "${brand}"`);
         console.log(`[ScraperAPI] ✅ Description found for ${asin}: ${features.length} features`);
         console.log(`[ScraperAPI] ✅ Images found for ${asin}: ${images.length} images`);
+        if (color) console.log(`[ScraperAPI] ✅ Color found for ${asin}: "${color}"`);
+        if (compatibility) console.log(`[ScraperAPI] ✅ Compatibility found for ${asin}: "${compatibility}"`);
         if (images.length > 0) {
           console.log(`[ScraperAPI] 🖼️ First image: ${images[0].substring(0, 80)}...`);
           if (images.length > 1) {
@@ -475,6 +522,8 @@ export async function scrapeAmazonProductWithScraperAPI(asin, region = 'US', ret
 
         // Track successful usage
         const extractedFields = ['price', 'title', 'brand', 'description', 'images'];
+        if (color) extractedFields.push('color');
+        if (compatibility) extractedFields.push('compatibility');
 
         trackApiUsage({
           service: 'ScraperAPI',
@@ -494,6 +543,8 @@ export async function scrapeAmazonProductWithScraperAPI(asin, region = 'US', ret
           brand: brand || 'Unbranded',
           description: description || '',
           images: images,
+          color: color || '',
+          compatibility: compatibility || '',
           rawData: data // Store full response for debugging
         };
       } catch (error) {
