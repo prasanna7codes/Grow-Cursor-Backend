@@ -8679,6 +8679,173 @@ router.get('/selling/summary', requireAuth, async (req, res) => {
   }
 });
 
+// =====================================================
+// REFUND ENDPOINTS
+// =====================================================
+
+// GET /ebay/refund/eligible-orders — fetch cancel-requested orders or lookup by orderId
+router.get('/refund/eligible-orders', async (req, res) => {
+  try {
+    const { sellerId, orderId, page = 1, limit = 50 } = req.query;
+    const query = {};
+
+    if (sellerId) query.seller = new mongoose.Types.ObjectId(sellerId);
+
+    // If orderId provided, search by orderId (manual lookup)
+    if (orderId) {
+      query.orderId = { $regex: orderId, $options: 'i' };
+    } else {
+      // Default: show cancel-requested orders
+      query.cancelState = 'CANCEL_REQUESTED';
+    }
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const total = await Order.countDocuments(query);
+    const orders = await Order.find(query)
+      .sort({ creationDate: -1 })
+      .skip(skip)
+      .limit(parseInt(limit))
+      .lean();
+
+    // Attach seller info
+    const sellerIds = [...new Set(orders.map(o => o.seller?.toString()).filter(Boolean))];
+    const sellers = await Seller.find({ _id: { $in: sellerIds } }).populate('user', 'username email').lean();
+    const sellerMap = {};
+    sellers.forEach(s => { sellerMap[s._id.toString()] = s; });
+
+    for (const order of orders) {
+      const s = sellerMap[order.seller?.toString()];
+      if (s) {
+        order.sellerUsername = s.user?.username || s.user?.email || s._id.toString();
+        order.sellerObjectId = s._id;
+      }
+    }
+
+    res.json({
+      orders,
+      pagination: {
+        total,
+        page: parseInt(page),
+        totalPages: Math.ceil(total / parseInt(limit))
+      }
+    });
+  } catch (error) {
+    console.error('[Refund] Error fetching eligible orders:', error.message);
+    res.status(500).json({ error: 'Failed to fetch orders', details: error.message });
+  }
+});
+
+// POST /ebay/refund/issue — Issue refund via eBay Fulfillment API
+router.post('/refund/issue', async (req, res) => {
+  try {
+    const {
+      sellerId,
+      orderId,
+      reasonForRefund,
+      comment,
+      refundAmount,    // { value: "10.00", currency: "USD" }
+      refundType,      // "order" or "lineItem"
+      lineItemId       // required if refundType is "lineItem"
+    } = req.body;
+
+    // Validation
+    if (!sellerId || !orderId || !reasonForRefund) {
+      return res.status(400).json({ error: 'Missing required fields: sellerId, orderId, reasonForRefund' });
+    }
+
+    const validReasons = [
+      'BUYER_CANCEL', 'SELLER_CANCEL', 'ITEM_NOT_RECEIVED',
+      'ITEM_NOT_AS_DESCRIBED', 'OUT_OF_STOCK_OR_CANNOT_FULFILL',
+      'BUYER_NOT_SCHEDULED_RETURN'
+    ];
+    if (!validReasons.includes(reasonForRefund)) {
+      return res.status(400).json({ error: `Invalid reasonForRefund. Must be one of: ${validReasons.join(', ')}` });
+    }
+
+    if (!refundAmount?.value || !refundAmount?.currency) {
+      return res.status(400).json({ error: 'refundAmount.value and refundAmount.currency are required' });
+    }
+
+    if (refundType === 'lineItem' && !lineItemId) {
+      return res.status(400).json({ error: 'lineItemId is required for line-item level refunds' });
+    }
+
+    // Get seller & token
+    const seller = await Seller.findById(sellerId);
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
+
+    const accessToken = await ensureValidToken(seller);
+
+    // Build eBay request payload
+    const ebayPayload = {
+      reasonForRefund,
+    };
+
+    if (comment) {
+      ebayPayload.comment = comment.substring(0, 100); // eBay max 100 chars
+    }
+
+    if (refundType === 'lineItem' && lineItemId) {
+      ebayPayload.refundItems = [{
+        refundAmount: {
+          value: refundAmount.value,
+          currency: refundAmount.currency
+        },
+        lineItemId: lineItemId
+      }];
+    } else {
+      ebayPayload.orderLevelRefundAmount = {
+        value: refundAmount.value,
+        currency: refundAmount.currency
+      };
+    }
+
+    console.log(`[Refund] Issuing refund for order ${orderId}, seller ${sellerId}`, JSON.stringify(ebayPayload));
+
+    // Call eBay issueRefund API
+    const ebayRes = await axios.post(
+      `https://api.ebay.com/sell/fulfillment/v1/order/${encodeURIComponent(orderId)}/issue_refund`,
+      ebayPayload,
+      {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    console.log(`[Refund] eBay response:`, ebayRes.data);
+
+    res.json({
+      success: true,
+      refundId: ebayRes.data.refundId,
+      refundStatus: ebayRes.data.refundStatus,
+      message: `Refund ${ebayRes.data.refundStatus === 'PENDING' ? 'initiated successfully' : 'status: ' + ebayRes.data.refundStatus}`
+    });
+
+  } catch (error) {
+    console.error('[Refund] Error issuing refund:', error.message);
+
+    // Parse eBay error response
+    if (error.response?.data?.errors) {
+      const ebayErrors = error.response.data.errors;
+      const errorMessages = ebayErrors.map(e => `${e.errorId}: ${e.message}`).join('; ');
+      return res.status(error.response.status || 400).json({
+        error: 'eBay refund failed',
+        details: errorMessages,
+        ebayErrors
+      });
+    }
+
+    res.status(500).json({
+      error: 'Failed to issue refund',
+      details: error.response?.data || error.message
+    });
+  }
+});
+
 // Export for optional external schedulers
 export { sendPolicyMessage, processPendingPolicyMessages, getPolicyEligibilityDate };
 
