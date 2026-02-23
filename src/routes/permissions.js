@@ -11,6 +11,21 @@ import {
 const router = Router();
 
 /**
+ * GET /api/permissions/me
+ * Returns the current user's permissions (for refreshing on page load).
+ * Any authenticated user can call this.
+ */
+router.get('/me', requireAuth, async (req, res) => {
+    try {
+        const user = await User.findById(req.user.userId).select('permissions').lean();
+        res.json({ permissions: user?.permissions || [] });
+    } catch (error) {
+        console.error('Error fetching user permissions:', error);
+        res.status(500).json({ error: 'Failed to fetch permissions' });
+    }
+});
+
+/**
  * GET /api/permissions/available
  * Returns the full permission catalog (groups, labels, etc.) for the UI.
  * Superadmin only.
