@@ -103,7 +103,7 @@ router.get('/', requireAuth, async (req, res) => {
     if (!['superadmin', 'hradmin', 'operationhead'].includes(req.user.role)) {
       return res.status(403).json({ error: 'Forbidden' });
     }
-    const list = await EmployeeProfile.find({}).populate('user', 'username role email department');
+    const list = await EmployeeProfile.find({}).populate('user', 'username role email department isStrictTimer');
 
     // Filter out superadmin accounts and map profiles to exclude binary data and add file flags
     const profiles = list

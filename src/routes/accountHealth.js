@@ -61,10 +61,13 @@ router.get('/details', requireAuth, requireRole('fulfillmentadmin', 'superadmin'
       caseType: 'INR'
     }).lean();
 
-    // Get SNAD-related returns
+    // Get SNAD-related returns (by reason code OR manually marked)
     const snadReturns = await Return.find({
       ...sellerMatch,
-      returnReason: { $in: SNAD_RETURN_REASONS }
+      $or: [
+        { returnReason: { $in: SNAD_RETURN_REASONS } },
+        { markedAsSNAD: true }
+      ]
     }).lean();
 
     // Collect unique order IDs from SNAD cases and returns
@@ -248,10 +251,13 @@ router.get('/evaluation-windows', requireAuth, requireRole('fulfillmentadmin', '
         creationDate: { $gte: windowStart, $lte: calculationEnd }
       });
 
-      // Get SNAD returns in this 84-day window
+      // Get SNAD returns in this 84-day window (by reason code OR manually marked)
       const snadReturnCount = await Return.countDocuments({
         ...sellerMatch,
-        returnReason: { $in: SNAD_RETURN_REASONS },
+        $or: [
+          { returnReason: { $in: SNAD_RETURN_REASONS } },
+          { markedAsSNAD: true }
+        ],
         creationDate: { $gte: windowStart, $lte: calculationEnd }
       });
 
@@ -434,10 +440,13 @@ router.get('/overview', requireAuth, requireRole('fulfillmentadmin', 'superadmin
           creationDate: { $gte: windowStart, $lte: calculationEnd }
         });
 
-        // Get SNAD returns
+        // Get SNAD returns (by reason code OR manually marked)
         const snadReturnCount = await Return.countDocuments({
           ...sellerMatch,
-          returnReason: { $in: SNAD_RETURN_REASONS },
+          $or: [
+            { returnReason: { $in: SNAD_RETURN_REASONS } },
+            { markedAsSNAD: true }
+          ],
           creationDate: { $gte: windowStart, $lte: calculationEnd }
         });
 

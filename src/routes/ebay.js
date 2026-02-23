@@ -5,6 +5,7 @@ import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
 import moment from 'moment-timezone';
 import fs from 'fs';
+import zlib from 'zlib';
 import path from 'path';
 import sharp from 'sharp';
 import FormData from 'form-data';
@@ -240,6 +241,86 @@ router.get('/feed/tasks', requireAuth, async (req, res) => {
     res.status(500).json({
       error: 'Failed to fetch feed tasks',
       details: error.response?.data || error.message
+    });
+  }
+});
+
+// ============================================
+// DOWNLOAD FEED RESULT FILE (Error Details)
+// ============================================
+router.get('/feed/result/:taskId', requireAuth, async (req, res) => {
+  try {
+    const { taskId } = req.params;
+    const { sellerId } = req.query;
+
+    if (!sellerId) {
+      return res.status(400).json({ error: 'Missing sellerId' });
+    }
+
+    // 1. Get Seller & Token
+    const seller = await Seller.findById(sellerId);
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
+
+    const accessToken = await ensureValidToken(seller);
+
+    // 2. Check task exists and is in a completed state
+    const feedUpload = await FeedUpload.findOne({ taskId, seller: sellerId });
+    if (!feedUpload) {
+      return res.status(404).json({ error: 'Task not found' });
+    }
+
+    if (feedUpload.status !== 'COMPLETED' && feedUpload.status !== 'COMPLETED_WITH_ERROR') {
+      return res.status(400).json({ error: 'Result file is only available for completed tasks' });
+    }
+
+    console.log(`[Feed Result] Downloading result file for task ${taskId}...`);
+
+    // 3. Download result file from eBay
+    // GET https://api.ebay.com/sell/feed/v1/task/{task_id}/download_result_file
+    const resultRes = await axios.get(
+      `https://api.ebay.com/sell/feed/v1/task/${taskId}/download_result_file`,
+      {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+          'Accept': 'application/octet-stream'
+        },
+        responseType: 'arraybuffer'
+      }
+    );
+
+    console.log(`[Feed Result] Received response, size: ${resultRes.data.length} bytes`);
+
+    // 4. Decompress if gzipped, otherwise use raw data
+    let fileContent;
+    try {
+      fileContent = zlib.gunzipSync(Buffer.from(resultRes.data));
+    } catch (e) {
+      // Not gzipped, use raw data
+      fileContent = Buffer.from(resultRes.data);
+    }
+
+    // 5. Send as downloadable CSV
+    const fileName = `errors_${feedUpload.fileName || taskId}.csv`;
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    res.send(fileContent);
+
+  } catch (error) {
+    console.error('[Feed Result] Error:', error.message);
+    if (error.response) {
+      console.error('[Feed Result] eBay Status:', error.response.status);
+    }
+
+    if (error.response?.status === 404) {
+      return res.status(404).json({ error: 'Result file not available yet. Task may still be processing.' });
+    }
+
+    res.status(500).json({
+      error: 'Failed to download result file',
+      details: error.response?.data?.toString?.() || error.message
     });
   }
 });
@@ -1535,6 +1616,26 @@ router.get('/stored-orders', async (req, res) => {
       query.shipByDate = { $gte: startOfDay, $lte: endOfDay };
     }
 
+    // Date Sold Specific Day Filter (req.query.dateSold)
+    // This is different from startDate/endDate range, it targets a single specific day
+    if (req.query.dateSold) {
+      const dateSold = req.query.dateSold;
+      const PST_OFFSET_HOURS = 8;
+
+      // Start of sold date in UTC (midnight PST = 8am UTC)
+      const startOfDay = new Date(dateSold);
+      startOfDay.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0);
+
+      // End of sold date in UTC (11:59:59 PM PST = 7:59:59 AM UTC next day)
+      const endOfDay = new Date(dateSold);
+      endOfDay.setDate(endOfDay.getDate() + 1);
+      endOfDay.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999);
+
+      // If startDate/endDate were already set, this specific date filter overrides or intersects
+      // For simplicity in this specific "Awaiting Shipment" context, we'll let this take precedence if set
+      query.dateSold = { $gte: startOfDay, $lte: endOfDay };
+    }
+
     // Exclude Low Value Orders (less than $3)
     if (req.query.excludeLowValue === 'true') {
       // Filter orders where subtotal or subtotalUSD is >= 3
@@ -2790,6 +2891,10 @@ router.post('/poll-all-sellers', requireAuth, requireRole('fulfillmentadmin', 's
                 newOrders.push(newOrder);
                 console.log(`  🆕 NEW: ${ebayOrder.orderId}`);
                 await sendAutoWelcomeMessage(seller, newOrder);
+
+                // Fire-and-forget: Update listing quantity to 1
+                updateListingQuantityOnOrder(ebayOrder, accessToken, sellerName)
+                  .catch(err => console.error(`[Quantity Update] Background error for ${ebayOrder.orderId}:`, err.message));
               } else {
                 // Order exists, check if needs update
                 const ebayModTime = new Date(ebayOrder.lastModifiedDate).getTime();
@@ -3157,6 +3262,10 @@ router.post('/poll-new-orders', requireAuth, requireRole('fulfillmentadmin', 'su
               newOrders.push(newOrder);
               console.log(`  🆕 NEW: ${ebayOrder.orderId}`);
               await sendAutoWelcomeMessage(seller, newOrder);
+
+              // Fire-and-forget: Update listing quantity to 1
+              updateListingQuantityOnOrder(ebayOrder, accessToken, sellerName)
+                .catch(err => console.error(`[Quantity Update] Background error for ${ebayOrder.orderId}:`, err.message));
 
               // Fetch ad fee from eBay Finances API
               try {
@@ -3929,6 +4038,100 @@ async function fetchAllOrdersWithPagination(accessToken, filter, sellerName) {
 
   console.log(`[${sellerName}] ✅ Pagination complete: ${allOrders.length} orders`);
   return allOrders;
+}
+
+// Item IDs that should NOT have their quantity updated when ordered
+const QUANTITY_UPDATE_EXCLUDED_ITEMS = new Set([
+  '127311585410',
+  '127311587672',
+  '127311588411',
+  '127311588863',
+  '127311596014',
+  '389381058706',
+  '389381053145',
+  '389381049342',
+  '389381045467',
+  '389381039761',
+  '317649392161',
+  '317649397683',
+  '317649395742',
+  '317649399983',
+  '317649401541',
+  '127632524706',
+  '127632525908',
+  '127632527199',
+  '127632535240',
+  '127632517576',
+]);
+
+// ============================================
+// HELPER: Update Listing Quantity to 1 on New Order
+// ============================================
+// When a new order arrives, set quantity to 1 for each line item's listing.
+// Uses Trading API (ReviseInventoryStatus) which works for ALL listing types.
+async function updateListingQuantityOnOrder(ebayOrder, accessToken, sellerName) {
+  const lineItems = ebayOrder.lineItems || [];
+  if (lineItems.length === 0) return;
+
+  const orderId = ebayOrder.orderId;
+  console.log(`[Quantity Update] Processing ${lineItems.length} line item(s) for order ${orderId}`);
+
+  for (const lineItem of lineItems) {
+    const legacyItemId = lineItem.legacyItemId;
+    const title = lineItem.title || 'Unknown';
+
+    if (!legacyItemId) {
+      console.log(`[Quantity Update] ⚠️ Line item has no ItemID, skipping: ${title}`);
+      continue;
+    }
+
+    if (QUANTITY_UPDATE_EXCLUDED_ITEMS.has(legacyItemId)) {
+      console.log(`[Quantity Update] ⏭️ Excluded ItemID: ${legacyItemId} (${title}), skipping`);
+      continue;
+    }
+
+    try {
+      console.log(`[Quantity Update] Setting quantity to 1 for ItemID: ${legacyItemId} (${title})`);
+
+      const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+<ReviseInventoryStatusRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials>
+    <eBayAuthToken>${accessToken}</eBayAuthToken>
+  </RequesterCredentials>
+  <InventoryStatus>
+    <ItemID>${legacyItemId}</ItemID>
+    <Quantity>1</Quantity>
+  </InventoryStatus>
+</ReviseInventoryStatusRequest>`;
+
+      const tradingRes = await axios.post(
+        'https://api.ebay.com/ws/api.dll',
+        xmlRequest,
+        {
+          headers: {
+            'X-EBAY-API-SITEID': '0',
+            'X-EBAY-API-COMPATIBILITY-LEVEL': '1271',
+            'X-EBAY-API-CALL-NAME': 'ReviseInventoryStatus',
+            'X-EBAY-API-IAF-TOKEN': accessToken,
+            'Content-Type': 'text/xml'
+          }
+        }
+      );
+
+      // Parse XML response to check for errors
+      const parsed = await parseStringPromise(tradingRes.data, { explicitArray: false });
+      const ack = parsed?.ReviseInventoryStatusResponse?.Ack;
+
+      if (ack === 'Success' || ack === 'Warning') {
+        console.log(`[Quantity Update] ✅ Set quantity to 1 for ItemID: ${legacyItemId}`);
+      } else {
+        const errorMsg = parsed?.ReviseInventoryStatusResponse?.Errors?.ShortMessage || 'Unknown error';
+        console.error(`[Quantity Update] ❌ Trading API error for ItemID ${legacyItemId}: ${errorMsg}`);
+      }
+    } catch (err) {
+      console.error(`[Quantity Update] ❌ Error updating quantity for ItemID ${legacyItemId}:`, err.response?.data || err.message);
+    }
+  }
 }
 
 // Helper function to build order data object for insert/update
@@ -6864,7 +7067,79 @@ router.post('/update-listing', requireAuth, async (req, res) => {
 });
 
 
-// 4.5. GET EBAY API USAGE STATS
+// ============================================
+// HELPER: Fetch eBay Developer Analytics Rate Limits
+// Cached for 5 minutes to avoid inflating the developer API usage counter.
+// eBay rate limits are APP-LEVEL (per Client ID), not per-seller.
+// All sellers share the same pool — fetching with any seller token gives the same result.
+// ============================================
+let _rateLimitCache = null;
+let _rateLimitCacheTime = 0;
+const RATE_LIMIT_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function fetchEbayRateLimits(accessToken, forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && _rateLimitCache && (now - _rateLimitCacheTime) < RATE_LIMIT_CACHE_TTL_MS) {
+    console.log('[Rate Limits] Returning cached result');
+    return _rateLimitCache;
+  }
+
+  try {
+    const response = await axios.get(
+      'https://api.ebay.com/developer/analytics/v1_beta/rate_limit',
+      {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
+        }
+      }
+    );
+
+    const rateLimitData = response.data?.rateLimits || [];
+
+    // Build per-context entries, each with their individual resources listed.
+    // Note: eBay uses a SHARED pool per context — all resources draw from the same bucket.
+    // The used/limit/remaining is the same for every resource in a context.
+    const contexts = [];
+    for (const api of rateLimitData) {
+      const ctx = api.apiContext || 'Other';
+      const firstResource = api.resources?.[0];
+      const firstRate = firstResource?.rates?.[0];
+      if (!firstRate) continue;
+
+      const used = (firstRate.limit || 0) - (firstRate.remaining || 0);
+      const usagePercent = firstRate.limit > 0
+        ? Math.round((used / firstRate.limit) * 100)
+        : 0;
+
+      // Collect all resource names
+      const resources = (api.resources || []).map(r => r.name).filter(Boolean);
+
+      contexts.push({
+        apiContext: ctx,
+        apiName: api.apiName,
+        apiVersion: api.apiVersion,
+        limit: firstRate.limit,
+        remaining: firstRate.remaining,
+        reset: firstRate.reset,
+        used,
+        usagePercent,
+        resources  // individual resource names that share this pool
+      });
+    }
+
+    const result = { success: true, rateLimits: contexts, fetchedAt: new Date().toISOString() };
+    _rateLimitCache = result;
+    _rateLimitCacheTime = now;
+    return result;
+  } catch (err) {
+    console.error('[Rate Limits] Error fetching from eBay:', err.message);
+    return { success: false, error: err.message, rateLimits: [] };
+  }
+}
+
+// 4.5. GET EBAY API USAGE STATS (single seller — for compatibility dashboard badge)
 router.get('/api-usage-stats', requireAuth, async (req, res) => {
   const { sellerId } = req.query;
 
@@ -6879,15 +7154,68 @@ router.get('/api-usage-stats', requireAuth, async (req, res) => {
     }
 
     const token = await ensureValidToken(seller);
-    const stats = await getCachedUsageStats(sellerId, token);
+    const stats = await fetchEbayRateLimits(token);
 
-    res.json(stats);
+    // Compute a simple summary for the compatibility dashboard badge
+    let used = 0, limit = 1, remaining = 0, hoursUntilReset = 24;
+    if (stats.rateLimits.length > 0) {
+      const mostUsed = stats.rateLimits.reduce((a, b) => (a.usagePercent > b.usagePercent ? a : b));
+      used = mostUsed.used;
+      limit = mostUsed.limit;
+      remaining = mostUsed.remaining;
+      if (mostUsed.reset) {
+        const resetTime = new Date(mostUsed.reset);
+        hoursUntilReset = Math.max(0, Math.ceil((resetTime - Date.now()) / (1000 * 60 * 60)));
+      }
+    }
+
+    res.json({ success: stats.success, used, limit, remaining, hoursUntilReset, rateLimits: stats.rateLimits });
   } catch (err) {
     console.error('Error fetching API usage stats:', err.message);
-    res.status(500).json({
-      error: 'Failed to fetch API usage stats',
-      success: false
+    res.status(500).json({ error: 'Failed to fetch API usage stats', success: false });
+  }
+});
+
+// 4.6. GET EBAY API USAGE STATS (app-level — same for all sellers)
+// Calls eBay ONCE (not once per seller) since limits are app-level.
+// Uses a 5-minute cache to avoid inflating developer API usage.
+router.get('/api-usage-stats/all', requireAuth, async (req, res) => {
+  try {
+    const forceRefresh = req.query.refresh === 'true';
+
+    // Get any one seller to use their token — result is the same for all
+    const sellers = await Seller.find({}).populate('user');
+    if (sellers.length === 0) {
+      return res.json({ success: true, rateLimits: [], sellers: [], fetchedAt: null });
+    }
+
+    // Try each seller until we get a valid token
+    let stats = null;
+    for (const seller of sellers) {
+      try {
+        const token = await ensureValidToken(seller);
+        stats = await fetchEbayRateLimits(token, forceRefresh);
+        if (stats.success) break;
+      } catch (err) {
+        console.warn(`[API Usage] Skipping seller ${seller._id}: ${err.message}`);
+      }
+    }
+
+    if (!stats) stats = { success: false, error: 'No valid seller token found', rateLimits: [] };
+
+    res.json({
+      success: stats.success,
+      rateLimits: stats.rateLimits,
+      fetchedAt: stats.fetchedAt || null,
+      cached: !forceRefresh,
+      sellers: sellers.map(s => ({
+        _id: s._id,
+        name: s.user?.username || s.user?.email || 'Unknown'
+      }))
     });
+  } catch (err) {
+    console.error('[API Usage All] Error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -7042,7 +7370,14 @@ router.get('/conversation-management/list', requireAuth, async (req, res) => {
 
   try {
     let query = {};
-    if (status) query.status = status;
+    if (status) {
+      const statuses = String(status)
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+      if (statuses.length === 1) query.status = statuses[0];
+      else if (statuses.length > 1) query.status = { $in: statuses };
+    }
 
     const list = await ConversationMeta.aggregate([
       { $match: query },
@@ -7103,6 +7438,83 @@ router.get('/conversation-management/list', requireAuth, async (req, res) => {
             ]
           }
         }
+      },
+
+      // 5. LOOKUP MESSAGE TIMESTAMPS FOR SLA / REPLY TIMERS
+      {
+        $lookup: {
+          from: 'messages',
+          let: {
+            sellerId: '$sellerId',
+            metaOrderId: '$orderId',
+            metaBuyerUsername: '$buyerUsername',
+            metaItemId: '$itemId'
+          },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ['$seller', '$$sellerId'] },
+                    {
+                      $cond: [
+                        { $ne: ['$$metaOrderId', null] },
+                        { $eq: ['$orderId', '$$metaOrderId'] },
+                        {
+                          $and: [
+                            { $eq: ['$buyerUsername', '$$metaBuyerUsername'] },
+                            { $eq: ['$itemId', '$$metaItemId'] },
+                            { $eq: [{ $ifNull: ['$orderId', null] }, null] }
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              $group: {
+                _id: null,
+                lastBuyerMessageAt: {
+                  $max: {
+                    $cond: [{ $eq: ['$sender', 'BUYER'] }, '$messageDate', null]
+                  }
+                },
+                lastSellerMessageAt: {
+                  $max: {
+                    $cond: [{ $eq: ['$sender', 'SELLER'] }, '$messageDate', null]
+                  }
+                }
+              }
+            },
+            {
+              $project: {
+                _id: 0,
+                lastBuyerMessageAt: 1,
+                lastSellerMessageAt: 1
+              }
+            }
+          ],
+          as: 'messageTimes'
+        }
+      },
+      {
+        $unwind: {
+          path: '$messageTimes',
+          preserveNullAndEmptyArrays: true
+        }
+      },
+      {
+        $addFields: {
+          lastBuyerMessageAt: '$messageTimes.lastBuyerMessageAt',
+          lastSellerMessageAt: '$messageTimes.lastSellerMessageAt'
+        }
+      },
+      {
+        $project: {
+          messageTimes: 0
+        }
       }
     ]);
 
@@ -7147,7 +7559,21 @@ router.patch('/orders/:orderId/manual-fields', requireAuth, async (req, res) => 
 
   Object.keys(updates).forEach(key => {
     if (allowedFields.includes(key)) {
-      updateData[key] = updates[key];
+      if (key === 'remark') {
+        const rawRemark = updates[key];
+        if (
+          rawRemark === null ||
+          rawRemark === undefined ||
+          String(rawRemark).trim() === '' ||
+          String(rawRemark).trim().toLowerCase() === 'select'
+        ) {
+          updateData[key] = null;
+        } else {
+          updateData[key] = String(rawRemark).trim();
+        }
+      } else {
+        updateData[key] = updates[key];
+      }
     }
   });
 
@@ -7595,6 +8021,33 @@ router.patch('/returns/:returnId/logs', requireAuth, async (req, res) => {
     res.json({ success: true, return: returnDoc });
   } catch (err) {
     console.error('Error updating return logs:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Mark / unmark a return as SNAD (manual BBE override)
+router.patch('/returns/:returnId/mark-snad', requireAuth, async (req, res) => {
+  try {
+    const { returnId } = req.params;
+    const { markedAsSNAD } = req.body;
+
+    if (typeof markedAsSNAD !== 'boolean') {
+      return res.status(400).json({ error: 'markedAsSNAD must be a boolean' });
+    }
+
+    const returnDoc = await Return.findOneAndUpdate(
+      { returnId },
+      { markedAsSNAD },
+      { new: true }
+    );
+
+    if (!returnDoc) {
+      return res.status(404).json({ error: 'Return not found' });
+    }
+
+    res.json({ success: true, return: returnDoc });
+  } catch (err) {
+    console.error('Error updating return SNAD status:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -8051,6 +8504,178 @@ router.get('/awaiting-sheet-summary', requireAuth, requireRole('fulfillmentadmin
   } catch (err) {
     console.error('Error fetching awaiting sheet summary:', err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+
+// ============================================
+// GET ALL SELLING PRIVILEGES (BULK)
+// ============================================
+router.get('/selling/summary/all', requireAuth, async (req, res) => {
+  try {
+    const sellers = await Seller.find({}).populate('user');
+    console.log(`[Selling Limits] Fetching limits for ${sellers.length} sellers...`);
+
+    const results = await Promise.all(sellers.map(async (seller) => {
+      try {
+        const accessToken = await ensureValidToken(seller);
+
+        const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+<GetMyeBaySellingRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials>
+    <eBayAuthToken>${accessToken}</eBayAuthToken>
+  </RequesterCredentials>
+  <SellingSummary>
+    <Include>true</Include>
+  </SellingSummary>
+  <DetailLevel>ReturnAll</DetailLevel>
+  <Version>1173</Version>
+</GetMyeBaySellingRequest>`;
+
+        const response = await axios.post(
+          'https://api.ebay.com/ws/api.dll',
+          xmlRequest,
+          {
+            headers: {
+              'X-EBAY-API-CALL-NAME': 'GetMyeBaySelling',
+              'X-EBAY-API-SITEID': '0',
+              'X-EBAY-API-COMPATIBILITY-LEVEL': '1173',
+              'Content-Type': 'text/xml'
+            }
+          }
+        );
+
+        const result = await parseStringPromise(response.data, { explicitArray: false });
+
+        if (result.GetMyeBaySellingResponse.Ack === 'Failure') {
+          return {
+            sellerId: seller._id,
+            sellerName: seller.user?.username || seller.sellerId || 'Unknown',
+            error: result.GetMyeBaySellingResponse.Errors?.LongMessage || 'eBay API Error'
+          };
+        }
+
+        const summary = result.GetMyeBaySellingResponse.Summary;
+
+        return {
+          sellerId: seller._id,
+          sellerName: seller.user?.username || seller.sellerId || 'Unknown',
+          quantityLimitRemaining: summary?.QuantityLimitRemaining,
+          amountLimitRemaining: summary?.AmountLimitRemaining?._,
+          amountLimitCurrency: summary?.AmountLimitRemaining?.$?.currencyID,
+          activeAuctionCount: summary?.ActiveAuctionCount,
+          auctionSellingCount: summary?.AuctionSellingCount,
+          totalSoldCount: summary?.TotalSoldCount,
+          totalSoldValue: summary?.TotalSoldValue?._,
+          totalSoldValueCurrency: summary?.TotalSoldValue?.$?.currencyID,
+        };
+
+      } catch (err) {
+        console.error(`[Selling Limits] Failed for seller ${seller._id}:`, err.message);
+        return {
+          sellerId: seller._id,
+          sellerName: seller.user?.username || seller.sellerId || 'Unknown',
+          error: err.message
+        };
+      }
+    }));
+
+    res.json({
+      success: true,
+      data: results
+    });
+
+  } catch (error) {
+    console.error('[Selling Summary All] Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// GET SELLING PRIVILEGES / LIMITS
+// ============================================
+router.get('/selling/summary', requireAuth, async (req, res) => {
+  try {
+    const { sellerId } = req.query;
+
+    if (!sellerId) {
+      return res.status(400).json({ error: 'Missing sellerId' });
+    }
+
+    // 1. Get Seller & Token
+    const seller = await Seller.findById(sellerId);
+    if (!seller) {
+      return res.status(404).json({ error: 'Seller not found' });
+    }
+
+    const accessToken = await ensureValidToken(seller);
+
+    // 2. Prepare Trading API Request
+    const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+<GetMyeBaySellingRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials>
+    <eBayAuthToken>${accessToken}</eBayAuthToken>
+  </RequesterCredentials>
+  <SellingSummary>
+    <Include>true</Include>
+  </SellingSummary>
+  <DetailLevel>ReturnAll</DetailLevel>
+  <Version>1173</Version>
+</GetMyeBaySellingRequest>`;
+
+    // 3. Call eBay Trading API
+    const response = await axios.post(
+      'https://api.ebay.com/ws/api.dll',
+      xmlRequest,
+      {
+        headers: {
+          'X-EBAY-API-CALL-NAME': 'GetMyeBaySelling',
+          'X-EBAY-API-SITEID': '0',
+          'X-EBAY-API-COMPATIBILITY-LEVEL': '1173',
+          'Content-Type': 'text/xml'
+        }
+      }
+    );
+
+    // 4. Parse XML Response
+    const result = await parseStringPromise(response.data, { explicitArray: false });
+
+    if (result.GetMyeBaySellingResponse.Ack === 'Failure') {
+      const errors = result.GetMyeBaySellingResponse.Errors;
+      const errorMsg = Array.isArray(errors) ? errors[0].LongMessage : errors.LongMessage;
+      throw new Error(`eBay API Error: ${errorMsg}`);
+    }
+
+    const summary = result.GetMyeBaySellingResponse.Summary;
+
+    // Extract Relevant Limits
+    const limits = {
+      quantityLimitRemaining: summary?.QuantityLimitRemaining,
+      amountLimitRemaining: summary?.AmountLimitRemaining?._, // currencyID is in attribute
+      amountLimitCurrency: summary?.AmountLimitRemaining?.$?.currencyID,
+      activeAuctionCount: summary?.ActiveAuctionCount,
+      auctionSellingCount: summary?.AuctionSellingCount,
+      totalSoldCount: summary?.TotalSoldCount,
+      totalSoldValue: summary?.TotalSoldValue?._,
+      totalSoldValueCurrency: summary?.TotalSoldValue?.$?.currencyID,
+    };
+
+    res.json({
+      success: true,
+      sellerId,
+      limits,
+      rawSummary: summary
+    });
+
+  } catch (error) {
+    console.error('[Selling Summary] Error:', error.message);
+    if (error.response) {
+      console.error('[Selling Summary] eBay Response:', error.response.data);
+    }
+    res.status(500).json({
+      error: 'Failed to fetch selling limits',
+      details: error.response?.data || error.message
+    });
   }
 });
 

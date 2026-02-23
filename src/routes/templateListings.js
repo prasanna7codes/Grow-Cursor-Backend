@@ -39,8 +39,8 @@ router.get('/', requireAuth, async (req, res) => {
       // Specific batch
       filter.downloadBatchId = batchId;
     } else if (batchFilter === 'active') {
-      // Active batch only (not downloaded)
-      filter.downloadBatchId = null;
+      // Active batch: not yet downloaded OR flagged for re-download after duplicate update
+      filter.$or = [{ downloadBatchId: null }, { pendingRedownload: true }];
     } else if (batchFilter === 'all') {
       // All batches (no filter on downloadBatchId)
     }
@@ -438,14 +438,14 @@ router.get('/bulk-preview-stream', requireAuth, async (req, res) => {
       sellerId,
       _asinReference: { $in: asins },
       status: 'active'
-    }).select('_asinReference templateId').lean();
+    }).select('+_asinReference').lean();
     
-    const asinInCurrentTemplate = new Set();
+    const asinInCurrentTemplate = new Map(); // Changed to Map to store full listing data
     const asinInOtherTemplates = new Map();
     
     existingAsinListings.forEach(listing => {
       if (listing.templateId.toString() === templateId.toString()) {
-        asinInCurrentTemplate.add(listing._asinReference);
+        asinInCurrentTemplate.set(listing._asinReference, listing); // Store full listing
       } else {
         asinInOtherTemplates.set(listing._asinReference, listing.templateId);
       }
@@ -490,6 +490,54 @@ router.get('/bulk-preview-stream', requireAuth, async (req, res) => {
           return;
         }
         
+        // Check if ASIN exists in current template (duplicate_updateable case)
+        // This must be checked BEFORE SKU conflict check because duplicate ASINs
+        // will have the same SKU and should be updateable, not blocked
+        if (asinInCurrentTemplate.has(asin)) {
+          const existingListing = asinInCurrentTemplate.get(asin);
+          const sku = generateSKUFromASIN(asin);
+          
+          // Get existing customFields (already an object from .lean())
+          const existingCustomFields = existingListing.customFields || {};
+          
+          // Return existing listing data for editing (no re-fetch)
+          const item = {
+            id: `preview-${asin}`,
+            asin,
+            sku: existingListing.customLabel || sku,
+            status: 'duplicate_updateable',
+            
+            // Return existing data as generatedListing so modal can display it
+            generatedListing: {
+              title: existingListing.title,
+              description: existingListing.description,
+              startPrice: existingListing.startPrice,
+              quantity: existingListing.quantity,
+              itemPhotoUrl: existingListing.itemPhotoUrl || '',
+              conditionId: existingListing.conditionId || '',
+              format: existingListing.format || '',
+              duration: existingListing.duration || '',
+              location: existingListing.location || '',
+              customLabel: existingListing.customLabel,
+              customFields: existingCustomFields,
+              _asinReference: asin,
+              _existingListingId: existingListing._id // Track which listing to update
+            },
+            
+            warnings: [
+              `This ASIN already exists in this template.`,
+              existingListing.duplicateCount > 0 
+                ? `Previously updated ${existingListing.duplicateCount} time(s).`
+                : `First time editing this ASIN.`
+            ],
+            errors: []
+          };
+          
+          res.write(`data: ${JSON.stringify({ type: 'item', item, progress: ++completed, total: asins.length })}\n\n`);
+          return;
+        }
+        
+        // Check for SKU conflicts (only for new ASINs, not duplicates)
         const sku = generateSKUFromASIN(asin);
         const existingSKU = existingSKUMap.get(sku);
         
@@ -506,7 +554,7 @@ router.get('/bulk-preview-stream', requireAuth, async (req, res) => {
           return;
         }
         
-        // Fetch and process ASIN
+        // Fetch and process ASIN (new listing case)
         const amazonData = await fetchAmazonData(asin);
         const { coreFields, customFields, pricingCalculation } = 
           await applyFieldConfigs(amazonData, template.asinAutomation.fieldConfigs, pricingConfig);
@@ -533,10 +581,6 @@ router.get('/bulk-preview-stream', requireAuth, async (req, res) => {
         
         if (mergedCoreFields.startPrice === undefined || mergedCoreFields.startPrice === null || mergedCoreFields.startPrice === '') {
           validationErrors.push('Missing required field: startPrice');
-        }
-        
-        if (asinInCurrentTemplate.has(asin)) {
-          warnings.push('ASIN already exists in this template');
         }
         
         if (!mergedCoreFields.description) {
@@ -917,21 +961,21 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
       sellerId,  // Check across all templates for this seller
       _asinReference: { $in: cleanedAsins },
       status: 'active'
-    }).select('_asinReference _id templateId');
+    }).select('+_asinReference').lean();
     
     // Create maps for both current template and cross-template duplicates
-    const existingInCurrentTemplate = new Map();
+    const existingInCurrentTemplate = new Map(); // Changed to Map to store full listing data
     const existingInOtherTemplates = new Map();
     
     existingListings.forEach(listing => {
       if (listing.templateId.toString() === templateId.toString()) {
-        existingInCurrentTemplate.set(listing._asinReference, listing._id);
+        existingInCurrentTemplate.set(listing._asinReference, listing); // Store full listing
       } else {
         existingInOtherTemplates.set(listing._asinReference, listing.templateId);
       }
     });
     
-    console.log(`Found ${existingInCurrentTemplate.size} ASINs in current template (will skip)`);
+    console.log(`Found ${existingInCurrentTemplate.size} ASINs in current template (will update)`);
     console.log(`Found ${existingInOtherTemplates.size} ASINs in other templates (will block)\n`);
     
     // Pre-generate all SKUs and check for collisions with existing SKUs
@@ -985,13 +1029,42 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
           };
         }
         
-        // Check if ASIN already exists in CURRENT template (skip)
+        // Check if ASIN already exists in CURRENT template (duplicate_updateable)
         if (existingInCurrentTemplate.has(asin)) {
+          const existingListing = existingInCurrentTemplate.get(asin);
+          const generatedSKU = generateSKUFromASIN(asin);
+          
+          // Get existing customFields (already an object from .lean())
+          const existingCustomFields = existingListing.customFields || {};
+          
+          // Return existing listing data for editing (no re-fetch)
           return {
             asin,
-            status: 'duplicate',
-            existingListingId: existingInCurrentTemplate.get(asin).toString(),
-            error: 'ASIN already exists in this template'
+            status: 'duplicate_updateable',
+            
+            // Return existing data for editing
+            autoFilledData: {
+              coreFields: {
+                title: existingListing.title,
+                description: existingListing.description,
+                startPrice: existingListing.startPrice,
+                quantity: existingListing.quantity,
+                itemPhotoUrl: existingListing.itemPhotoUrl || '',
+                conditionId: existingListing.conditionId || '',
+                format: existingListing.format || '',
+                duration: existingListing.duration || '',
+                location: existingListing.location || ''
+              },
+              customFields: existingCustomFields
+            },
+            sku: existingListing.customLabel || generatedSKU,
+            _existingListingId: existingListing._id, // Track which listing to update
+            warnings: [
+              `This ASIN already exists in this template.`,
+              existingListing.duplicateCount > 0 
+                ? `Previously updated ${existingListing.duplicateCount} time(s).`
+                : `First time editing this ASIN.`
+            ]
           };
         }
         
@@ -1932,6 +2005,60 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
           continue;
         }
         
+        // Check if this is a duplicate update request
+        if (listingData._isDuplicateUpdate && listingData._existingListingId) {
+          const existingListing = await TemplateListing.findById(listingData._existingListingId).select('+_asinReference');
+          
+          if (!existingListing) {
+            errors.push({
+              asin: listingData._asinReference,
+              error: 'Existing listing not found for update'
+            });
+            results.push({
+              status: 'failed',
+              asin: listingData._asinReference,
+              error: 'Existing listing not found'
+            });
+            continue;
+          }
+          
+          // Convert customFields
+          const customFieldsMap = listingData.customFields && typeof listingData.customFields === 'object'
+            ? new Map(Object.entries(listingData.customFields))
+            : new Map();
+          
+          // Update existing listing with new data
+          // Build update object - only overwrite fields that are explicitly provided
+          // (guards against undefined wiping values that weren't sent from the frontend)
+          const updateData = {
+            customFields: customFieldsMap,
+            pendingRedownload: true,
+            duplicateCount: (existingListing.duplicateCount || 0) + 1,
+            lastDuplicateAttempt: Date.now(),
+            updatedAt: Date.now()
+          };
+          const overwritableFields = ['title', 'description', 'startPrice', 'quantity', 'itemPhotoUrl', 'conditionId', 'format', 'duration', 'location'];
+          for (const field of overwritableFields) {
+            if (listingData[field] !== undefined && listingData[field] !== null && listingData[field] !== '') {
+              updateData[field] = listingData[field];
+            }
+          }
+          Object.assign(existingListing, updateData);
+          
+          await existingListing.save();
+          
+          results.push({
+            status: 'updated',
+            listing: existingListing.toObject(),
+            asin: listingData._asinReference,
+            sku: listingData.customLabel,
+            duplicateCount: existingListing.duplicateCount
+          });
+          
+          console.log(`✅ Updated duplicate ASIN ${listingData._asinReference} (count: ${existingListing.duplicateCount})`);
+          continue;
+        }
+        
         // Validate required fields
         if (!listingData.title) {
           errors.push({
@@ -2112,15 +2239,17 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
     }
     
     const created = results.filter(r => r.status === 'created').length;
+    const updated = results.filter(r => r.status === 'updated').length;
     const reactivated = results.filter(r => r.status === 'reactivated').length;
     const failed = results.filter(r => r.status === 'failed').length;
     
-    console.log(`✅ Bulk save completed: ${created} created, ${reactivated} reactivated, ${failed} failed, ${skippedCount} skipped`);
+    console.log(`✅ Bulk save completed: ${created} created, ${updated} updated, ${reactivated} reactivated, ${failed} failed, ${skippedCount} skipped`);
     
     res.json({
       success: true,
       total: listings.length,
       created,
+      updated,
       reactivated,
       failed,
       skipped: skippedCount,
@@ -2690,7 +2819,7 @@ router.get('/export-csv/:templateId', requireAuth, async (req, res) => {
     // even if they have downloadBatchId=null, ensuring consistency with UI
     const filter = { 
       templateId,
-      downloadBatchId: null, // Only active batch (not yet downloaded)
+      $or: [{ downloadBatchId: null }, { pendingRedownload: true }], // Active batch: not downloaded yet OR flagged for re-download
       status: 'active'       // Only active listings (exclude inactive/draft/sold/ended)
     };
     if (sellerId) {
@@ -2732,13 +2861,14 @@ router.get('/export-csv/:templateId', requireAuth, async (req, res) => {
     console.log('🔢 Batch number:', batchNumber);
     console.log('🆔 Batch ID:', batchId);
     
-    // Mark listings as downloaded
+    // Mark listings as downloaded (also clears pendingRedownload flag)
     const updateResult = await TemplateListing.updateMany(
       filter,
       {
         downloadBatchId: batchId,
         downloadedAt: new Date(),
-        downloadBatchNumber: batchNumber
+        downloadBatchNumber: batchNumber,
+        pendingRedownload: false
       }
     );
     

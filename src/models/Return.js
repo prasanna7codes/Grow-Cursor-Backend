@@ -45,7 +45,10 @@ const ReturnSchema = new mongoose.Schema(
     rawData: Object,
     
     // Manual logs field for internal notes
-    logs: { type: String, default: '' }
+    logs: { type: String, default: '' },
+
+    // Manual SNAD override — counts this return in the BBE calculation even if the reason code is not SNAD
+    markedAsSNAD: { type: Boolean, default: false }
   },
   { timestamps: true }
 );

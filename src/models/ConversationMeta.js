@@ -22,7 +22,7 @@ const ConversationMetaSchema = new mongoose.Schema(
     },
 
     // Management Status
-    status: { type: String, enum: ['Open', 'Resolved'], default: 'Open' },
+    status: { type: String, enum: ['Open', 'In Progress', 'Resolved'], default: 'Open' },
     
     // Resolution Details
     notes: { type: String, default: '' },

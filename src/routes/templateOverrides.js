@@ -12,6 +12,25 @@ import {
 } from '../utils/templateMerger.js';
 
 /**
+ * Get count of sellers who have overridden a template
+ * GET /api/template-overrides/:templateId/count
+ */
+router.get('/:templateId/count', requireAuth, async (req, res) => {
+  try {
+    const { templateId } = req.params;
+    
+    const count = await TemplateOverride.countDocuments({
+      baseTemplateId: templateId
+    });
+    
+    res.json({ count, templateId });
+  } catch (error) {
+    console.error('Error counting overrides:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
  * Get effective template for seller (base + overrides merged)
  * GET /api/template-overrides/:templateId/effective?sellerId=xxx
  */

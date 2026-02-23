@@ -4,6 +4,7 @@ import { requireAuth, requireRole } from '../middleware/auth.js';
 import User from '../models/User.js';
 import Seller from '../models/Seller.js';
 import EmployeeProfile from '../models/EmployeeProfile.js';
+import Attendance from '../models/Attendance.js';
 
 const router = Router();
 
@@ -73,7 +74,17 @@ router.post('/', requireAuth, async (req, res) => {
   // Compatibility admins and creating compatibility editors default to Compatibility
   if (role === 'compatibilityadmin' || newUserRole === 'compatibilityeditor') finalDepartment = 'Compatibility';
 
-  const user = await User.create({ email, username, passwordHash, role: newUserRole, department: finalDepartment });
+  // Set isStrictTimer to false for superadmin, true for all others
+  const isStrictTimer = newUserRole !== 'superadmin';
+
+  const user = await User.create({
+    email,
+    username,
+    passwordHash,
+    role: newUserRole,
+    department: finalDepartment,
+    isStrictTimer
+  });
 
   // Create an EmployeeProfile for the new user so they appear on admin pages immediately
   await EmployeeProfile.create({ user: user._id, email: user.email });
@@ -142,6 +153,54 @@ router.get('/check-exists', async (req, res) => {
     res.json({ exists });
   } catch (e) {
     res.status(500).json({ error: 'Error checking existence' });
+  }
+});
+
+// PUT /:id/strict-timer - Toggle strict timer for a user (Superadmin only)
+router.put('/:id/strict-timer', requireAuth, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { isStrictTimer } = req.body;
+
+    if (typeof isStrictTimer !== 'boolean') {
+      return res.status(400).json({ error: 'isStrictTimer must be a boolean' });
+    }
+
+    // New logic: If disabling strict timer, stop any active timer for this user
+    if (isStrictTimer === false) {
+      const activeAttendance = await Attendance.findOne({ user: id, status: 'active' });
+
+      if (activeAttendance) {
+        if (activeAttendance.sessions.length > 0) {
+          const lastSession = activeAttendance.sessions[activeAttendance.sessions.length - 1];
+          if (!lastSession.endTime) {
+            lastSession.endTime = new Date();
+          }
+        }
+        activeAttendance.status = 'completed'; // Changed from 'stopped' to 'completed' to match enum
+        activeAttendance.calculateTotalWorkTime();
+        await activeAttendance.save();
+        console.log(`Auto-stopped timer for user ${id} because strict timer was disabled`);
+      }
+    }
+
+    const user = await User.findByIdAndUpdate(
+      id,
+      { isStrictTimer },
+      { new: true, select: 'username email role isStrictTimer' }
+    );
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      message: `Strict timer ${isStrictTimer ? 'enabled' : 'disabled'} for ${user.username}`,
+      user
+    });
+  } catch (error) {
+    console.error('Error updating strict timer:', error);
+    res.status(500).json({ error: 'Failed to update strict timer setting' });
   }
 });
 

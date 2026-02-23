@@ -97,6 +97,44 @@ router.put('/action-field/:templateId', requireAuth, async (req, res) => {
   }
 });
 
+// Bulk reset overrides for a template (apply base template to all sellers)
+router.delete('/:id/bulk-reset-overrides', requireAuth, async (req, res) => {
+  try {
+    const { id: templateId } = req.params;
+    
+    // Verify template exists
+    const template = await ListingTemplate.findById(templateId);
+    if (!template) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    
+    // Get affected sellers before deletion for logging
+    const affectedOverrides = await TemplateOverride.find({ 
+      baseTemplateId: templateId 
+    }).select('sellerId');
+    
+    const affectedSellerIds = affectedOverrides.map(o => o.sellerId);
+    
+    // Perform bulk deletion
+    const result = await TemplateOverride.deleteMany({ 
+      baseTemplateId: templateId 
+    });
+    
+    console.log(`[BULK RESET] Template "${template.name}" (${templateId}): Deleted ${result.deletedCount} overrides for sellers:`, affectedSellerIds);
+    
+    res.json({ 
+      success: true,
+      deletedCount: result.deletedCount,
+      affectedSellers: affectedSellerIds,
+      templateName: template.name,
+      message: `Successfully reset ${result.deletedCount} seller customizations. All sellers will now use the base template.`
+    });
+  } catch (error) {
+    console.error('Error in bulk reset overrides:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Get all templates
 router.get('/', requireAuth, async (req, res) => {
   try {

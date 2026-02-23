@@ -7,8 +7,397 @@ import Return from '../models/Return.js';
 import Case from '../models/Case.js';
 import PaymentDispute from '../models/PaymentDispute.js';
 import Message from '../models/Message.js';
+import MarketMetric from '../models/MarketMetric.js';
 
 const router = Router();
+
+const PT_TIMEZONE = 'America/Los_Angeles';
+const SNAD_RETURN_REASONS = [
+  'NOT_AS_DESCRIBED',
+  'DEFECTIVE_ITEM',
+  'WRONG_ITEM',
+  'MISSING_PARTS',
+  'ARRIVED_DAMAGED',
+  'DOESNT_MATCH',
+  'NOT_AUTHENTIC',
+  'DOES_NOT_FIT'
+];
+
+function getPtDateString(date = new Date()) {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone: PT_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  });
+  return formatter.format(date);
+}
+
+function getPtDayRange(dateStr) {
+  const PST_OFFSET_HOURS = 8;
+  const start = new Date(dateStr);
+  start.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0);
+
+  const end = new Date(dateStr);
+  end.setDate(end.getDate() + 1);
+  end.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999);
+  return { start, end };
+}
+
+function getMonthUtcRange(monthStr) {
+  const [yearText, monthText] = String(monthStr).split('-');
+  const year = Number(yearText);
+  const monthIndex = Number(monthText) - 1;
+  const start = new Date(Date.UTC(year, monthIndex, 1, 0, 0, 0, 0));
+  const end = new Date(Date.UTC(year, monthIndex + 1, 0, 23, 59, 59, 999));
+  return { start, end };
+}
+
+function getPreviousMonth(monthStr) {
+  const [yearText, monthText] = String(monthStr).split('-');
+  const d = new Date(Date.UTC(Number(yearText), Number(monthText) - 1, 1));
+  d.setUTCMonth(d.getUTCMonth() - 1);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  return `${y}-${m}`;
+}
+
+function getCurrentAccountHealthWindow() {
+  const now = new Date();
+  const currentWindowEnd = new Date(now);
+  const dayOfWeek = currentWindowEnd.getDay();
+  if (dayOfWeek !== 0) {
+    currentWindowEnd.setDate(currentWindowEnd.getDate() - dayOfWeek);
+  }
+  currentWindowEnd.setHours(23, 59, 59, 999);
+
+  const calculationEnd = new Date(currentWindowEnd);
+  calculationEnd.setDate(calculationEnd.getDate() - 1);
+  calculationEnd.setHours(23, 59, 59, 999);
+
+  const windowStart = new Date(calculationEnd);
+  windowStart.setDate(windowStart.getDate() - 83);
+  windowStart.setHours(0, 0, 0, 0);
+
+  return { windowStart, calculationEnd };
+}
+
+async function getCurrentNonCompliantSellerSet(optionalSellerId) {
+  const { windowStart, calculationEnd } = getCurrentAccountHealthWindow();
+  const sellerMatch = optionalSellerId ? { seller: new mongoose.Types.ObjectId(optionalSellerId) } : {};
+
+  const [latestMarketMetric, salesBySeller, snadCasesBySeller, snadReturnsBySeller] = await Promise.all([
+    MarketMetric.findOne({
+      type: 'bbe_market_avg',
+      $or: [{ seller: { $exists: false } }, { seller: null }]
+    }).sort({ effectiveDate: -1 }).lean(),
+    Order.aggregate([
+      { $match: { ...sellerMatch, dateSold: { $gte: windowStart, $lte: calculationEnd } } },
+      { $group: { _id: '$seller', totalSales: { $sum: 1 } } }
+    ]),
+    Case.aggregate([
+      { $match: { ...sellerMatch, caseType: 'SNAD', creationDate: { $gte: windowStart, $lte: calculationEnd } } },
+      { $group: { _id: '$seller', snadCases: { $sum: 1 } } }
+    ]),
+    Return.aggregate([
+      {
+        $match: {
+          ...sellerMatch,
+          returnReason: { $in: SNAD_RETURN_REASONS },
+          creationDate: { $gte: windowStart, $lte: calculationEnd }
+        }
+      },
+      { $group: { _id: '$seller', snadReturns: { $sum: 1 } } }
+    ])
+  ]);
+
+  const marketAvg = Number(latestMarketMetric?.value) || 1.1;
+  const map = new Map();
+
+  salesBySeller.forEach((row) => {
+    map.set(String(row._id), {
+      sellerId: String(row._id),
+      totalSales: row.totalSales || 0,
+      snadCount: 0
+    });
+  });
+  snadCasesBySeller.forEach((row) => {
+    const key = String(row._id);
+    const current = map.get(key) || { sellerId: key, totalSales: 0, snadCount: 0 };
+    current.snadCount += row.snadCases || 0;
+    map.set(key, current);
+  });
+  snadReturnsBySeller.forEach((row) => {
+    const key = String(row._id);
+    const current = map.get(key) || { sellerId: key, totalSales: 0, snadCount: 0 };
+    current.snadCount += row.snadReturns || 0;
+    map.set(key, current);
+  });
+
+  const nonCompliant = new Map();
+  for (const entry of map.values()) {
+    const bbeRate = entry.totalSales > 0 ? (entry.snadCount / entry.totalSales) * 100 : 0;
+    if (bbeRate > marketAvg) {
+      nonCompliant.set(entry.sellerId, {
+        ...entry,
+        bbeRate: Number(bbeRate.toFixed(2)),
+        marketAvg: Number(marketAvg.toFixed(2))
+      });
+    }
+  }
+
+  return nonCompliant;
+}
+
+router.get('/dashboard/monthly-delta', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'hoc', 'compliancemanager'), async (req, res) => {
+  try {
+    const month = req.query.month || getPtDateString(new Date()).slice(0, 7);
+    const previousMonth = getPreviousMonth(month);
+    const { sellerId } = req.query;
+
+    const currentRange = getMonthUtcRange(month);
+    const previousRange = getMonthUtcRange(previousMonth);
+
+    const sellerMatch = sellerId ? { seller: new mongoose.Types.ObjectId(sellerId) } : {};
+    const baseMatch = req.query.excludeLowValue === 'true'
+      ? {
+          ...sellerMatch,
+          $or: [{ subtotalUSD: { $gte: 3 } }, { subtotal: { $gte: 3 } }]
+        }
+      : sellerMatch;
+
+    const [currentRows, previousRows, sellers] = await Promise.all([
+      Order.aggregate([
+        {
+          $match: {
+            ...baseMatch,
+            dateSold: { $gte: currentRange.start, $lte: currentRange.end }
+          }
+        },
+        { $group: { _id: '$seller', count: { $sum: 1 } } }
+      ]),
+      Order.aggregate([
+        {
+          $match: {
+            ...baseMatch,
+            dateSold: { $gte: previousRange.start, $lte: previousRange.end }
+          }
+        },
+        { $group: { _id: '$seller', count: { $sum: 1 } } }
+      ]),
+      Seller.find(sellerId ? { _id: new mongoose.Types.ObjectId(sellerId) } : {})
+        .populate('user', 'username email')
+        .lean()
+    ]);
+
+    const sellerNameMap = new Map(
+      sellers.map((s) => [String(s._id), s.user?.username || s.user?.email || 'Unknown'])
+    );
+    const currentMap = new Map(currentRows.map((r) => [String(r._id), r.count || 0]));
+    const previousMap = new Map(previousRows.map((r) => [String(r._id), r.count || 0]));
+    const sellerIds = new Set([...currentMap.keys(), ...previousMap.keys()]);
+
+    const rows = Array.from(sellerIds).map((id) => {
+      const currentMonthOrders = currentMap.get(id) || 0;
+      const previousMonthOrders = previousMap.get(id) || 0;
+      const delta = currentMonthOrders - previousMonthOrders;
+      const deltaPct = previousMonthOrders > 0 ? (delta / previousMonthOrders) * 100 : (currentMonthOrders > 0 ? 100 : 0);
+      return {
+        sellerId: id,
+        sellerName: sellerNameMap.get(id) || 'Unknown',
+        currentMonthOrders,
+        previousMonthOrders,
+        delta,
+        deltaPct: Number(deltaPct.toFixed(2))
+      };
+    }).sort((a, b) => b.currentMonthOrders - a.currentMonthOrders);
+
+    return res.json({ month, previousMonth, rows });
+  } catch (error) {
+    console.error('Error fetching monthly delta dashboard data:', error);
+    return res.status(500).json({ error: 'Failed to fetch monthly delta data' });
+  }
+});
+
+router.get('/dashboard/overview', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'hoc', 'compliancemanager'), async (req, res) => {
+  try {
+    const date = req.query.date || getPtDateString(new Date());
+    const { sellerId } = req.query;
+    const { start, end } = getPtDayRange(date);
+    const sellerMatch = sellerId ? { seller: new mongoose.Types.ObjectId(sellerId) } : {};
+    const lowValueClause = req.query.excludeLowValue === 'true'
+      ? { $or: [{ subtotalUSD: { $gte: 3 } }, { subtotal: { $gte: 3 } }] }
+      : {};
+    const maybeAnd = (...parts) => {
+      const active = parts.filter((p) => p && Object.keys(p).length > 0);
+      if (active.length === 0) return {};
+      if (active.length === 1) return active[0];
+      return { $and: active };
+    };
+
+    const todayOrdersMatch = maybeAnd(
+      sellerMatch,
+      { dateSold: { $gte: start, $lte: end } },
+      lowValueClause
+    );
+
+    const awaitingMatch = maybeAnd(
+      sellerMatch,
+      {
+        shipByDate: { $gte: start, $lte: end },
+        cancelState: { $in: ['NONE_REQUESTED', 'IN_PROGRESS', null, ''] }
+      },
+      { $or: [{ trackingNumber: { $exists: false } }, { trackingNumber: null }, { trackingNumber: '' }] },
+      lowValueClause
+    );
+
+    const arrivalsMatch = maybeAnd(
+      sellerMatch,
+      { arrivingDate: date },
+      lowValueClause
+    );
+
+    const [todayOrdersCount, awaitingCount, arrivalsCount, unreadMessagesCount, todayOrdersTable, topSellersRaw, awaitingBySellerRaw, arrivalsBySellerRaw, unreadBySellerRaw, nonCompliantSet] = await Promise.all([
+      Order.countDocuments(todayOrdersMatch),
+      Order.countDocuments(awaitingMatch),
+      Order.countDocuments(arrivalsMatch),
+      Message.countDocuments({
+        ...sellerMatch,
+        sender: 'BUYER',
+        read: false,
+        messageDate: { $gte: start, $lte: end }
+      }),
+      Order.find(todayOrdersMatch)
+        .populate({ path: 'seller', populate: { path: 'user', select: 'username email' } })
+        .sort({ dateSold: -1 })
+        .limit(25)
+        .lean(),
+      Order.aggregate([
+        { $match: todayOrdersMatch },
+        { $group: { _id: '$seller', count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+        { $limit: 10 }
+      ]),
+      Order.aggregate([
+        { $match: awaitingMatch },
+        { $group: { _id: '$seller', count: { $sum: 1 } } },
+        { $sort: { count: -1 } }
+      ]),
+      Order.aggregate([
+        { $match: arrivalsMatch },
+        { $group: { _id: '$seller', count: { $sum: 1 } } },
+        { $sort: { count: -1 } }
+      ]),
+      Message.aggregate([
+        {
+          $match: {
+            ...sellerMatch,
+            sender: 'BUYER',
+            read: false,
+            messageDate: { $gte: start, $lte: end }
+          }
+        },
+        { $group: { _id: '$seller', count: { $sum: 1 } } },
+        { $sort: { count: -1 } }
+      ]),
+      getCurrentNonCompliantSellerSet(sellerId)
+    ]);
+
+    const allSellerIds = new Set([
+      ...topSellersRaw.map((r) => String(r._id)),
+      ...awaitingBySellerRaw.map((r) => String(r._id)),
+      ...arrivalsBySellerRaw.map((r) => String(r._id)),
+      ...unreadBySellerRaw.map((r) => String(r._id)),
+      ...Array.from(nonCompliantSet.keys())
+    ]);
+
+    const sellerDocs = await Seller.find({ _id: { $in: Array.from(allSellerIds).map((id) => new mongoose.Types.ObjectId(id)) } })
+      .populate('user', 'username email')
+      .lean();
+    const sellerNameMap = new Map(
+      sellerDocs.map((s) => [String(s._id), s.user?.username || s.user?.email || 'Unknown'])
+    );
+
+    const toSellerRows = (rows) =>
+      rows.map((row) => ({
+        sellerId: String(row._id),
+        sellerName: sellerNameMap.get(String(row._id)) || 'Unknown',
+        count: row.count || 0
+      }));
+
+    const nonCompliantSellerList = Array.from(nonCompliantSet.values()).map((row) => ({
+      sellerId: row.sellerId,
+      sellerName: sellerNameMap.get(row.sellerId) || 'Unknown',
+      bbeRate: row.bbeRate,
+      marketAvg: row.marketAvg
+    })).sort((a, b) => b.bbeRate - a.bbeRate);
+
+    const awaitingRows = toSellerRows(awaitingBySellerRaw);
+    const unreadRows = toSellerRows(unreadBySellerRaw);
+    const topBlockerMap = new Map();
+    awaitingRows.forEach((r) => {
+      topBlockerMap.set(r.sellerId, { sellerId: r.sellerId, sellerName: r.sellerName, awaiting: r.count, unread: 0 });
+    });
+    unreadRows.forEach((r) => {
+      const current = topBlockerMap.get(r.sellerId) || { sellerId: r.sellerId, sellerName: r.sellerName, awaiting: 0, unread: 0 };
+      current.unread = r.count;
+      topBlockerMap.set(r.sellerId, current);
+    });
+    const topBlockers = Array.from(topBlockerMap.values())
+      .sort((a, b) => (b.awaiting + b.unread) - (a.awaiting + a.unread))
+      .slice(0, 5);
+
+    const month = date.slice(0, 7);
+    const previousMonth = getPreviousMonth(month);
+    const currentRange = getMonthUtcRange(month);
+    const previousRange = getMonthUtcRange(previousMonth);
+    const [currentMonthCount, previousMonthCount] = await Promise.all([
+      Order.countDocuments(maybeAnd(sellerMatch, { dateSold: { $gte: currentRange.start, $lte: currentRange.end } }, lowValueClause)),
+      Order.countDocuments(maybeAnd(sellerMatch, { dateSold: { $gte: previousRange.start, $lte: previousRange.end } }, lowValueClause))
+    ]);
+
+    res.json({
+      date,
+      timezone: PT_TIMEZONE,
+      kpis: {
+        todayOrders: todayOrdersCount,
+        monthlyDeltaNet: currentMonthCount - previousMonthCount,
+        awaitingToday: awaitingCount,
+        arrivalsToday: arrivalsCount,
+        unreadBuyerMessagesToday: unreadMessagesCount,
+        nonCompliantAccounts: nonCompliantSet.size
+      },
+      topSellers: toSellerRows(topSellersRaw),
+      todayOrdersTable: todayOrdersTable.map((o) => ({
+        id: o._id,
+        sellerId: o.seller?._id ? String(o.seller._id) : String(o.seller),
+        sellerName: o.seller?.user?.username || o.seller?.user?.email || 'Unknown',
+        orderId: o.orderId,
+        dateSold: o.dateSold,
+        purchaseMarketplaceId: o.purchaseMarketplaceId,
+        shipByDate: o.shipByDate,
+        trackingNumber: o.trackingNumber || o.manualTrackingNumber || ''
+      })),
+      riskQueues: {
+        nonCompliantSellerList,
+        unreadBySeller: toSellerRows(unreadBySellerRaw),
+        awaitingBySeller: awaitingRows,
+        arrivalsBySeller: toSellerRows(arrivalsBySellerRaw),
+        topBlockers
+      },
+      quickLinksMeta: {
+        fulfillment: '/admin/fulfillment',
+        awaitingSheet: `/admin/awaiting-sheet?date=${date}`,
+        amazonArrivals: `/admin/amazon-arrivals?arrivalDateFrom=${date}&arrivalDateTo=${date}`,
+        accountHealth: '/admin/account-health',
+        buyerMessages: '/admin/message-received'
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching orders dashboard overview:', error);
+    res.status(500).json({ error: 'Failed to fetch dashboard overview' });
+  }
+});
 
 // Get daily order statistics for all sellers
 router.get('/daily-statistics', requireAuth, requireRole('fulfillmentadmin', 'superadmin', 'hoc', 'compliancemanager'), async (req, res) => {
