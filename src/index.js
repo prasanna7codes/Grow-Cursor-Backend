@@ -57,6 +57,7 @@ import extraExpensesRoutes from './routes/extraExpenses.js';
 import leavesRoutes from './routes/leaves.js';
 import asinDirectoryRoutes from './routes/asinDirectory.js';
 import attendanceRoutes from './routes/attendance.js';
+import permissionsRoutes from './routes/permissions.js';
 import { initializeScheduledJobs } from './scheduledJobs.js';
 
 const app = express();
@@ -136,6 +137,7 @@ app.use('/api/asin-directory', asinDirectoryRoutes);
 // `/api/attendance` is a legacy endpoint name kept for compatibility;
 // it serves working-hours tracking behavior (timer sessions), not traditional attendance management.
 app.use('/api/attendance', attendanceRoutes);
+app.use('/api/permissions', permissionsRoutes);
 
 
 const port = process.env.PORT || 5000;

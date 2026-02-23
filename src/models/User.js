@@ -26,6 +26,7 @@ const UserSchema = new mongoose.Schema(
       ],
       required: true
     },
+    permissions: { type: [String], default: [] },
     department: { type: String, trim: true },
     active: { type: Boolean, default: true },
     isStrictTimer: { type: Boolean, default: true } // Mandatory timer tracking (false for superadmin by default)
