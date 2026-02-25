@@ -9,10 +9,7 @@ import path from 'path';
 
 // Set DNS to use Google's DNS servers to resolve MongoDB Atlas
 //setServers(['8.8.8.8', '8.8.4.4']);
-<<<<<<< HEAD
-=======
 
->>>>>>> 6cf0d93 (Disable DNS server settings in index.js)
 // Load environment variables FIRST before any other imports
 dotenv.config();
 
@@ -62,11 +59,8 @@ import accountHealthRoutes from './routes/accountHealth.js';
 import chatTemplatesRoutes from './routes/chatTemplates.js';
 import remarkTemplatesRoutes from './routes/remarkTemplates.js';
 import extraExpensesRoutes from './routes/extraExpenses.js';
-<<<<<<< HEAD
-=======
 
 import announcementsRoutes from './routes/announcements.js';
->>>>>>> bc5e119 (Made Required Changes for Backend)
 import leavesRoutes from './routes/leaves.js';
 
 
