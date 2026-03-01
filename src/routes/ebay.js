@@ -974,29 +974,23 @@ async function processEbayMessage(msg, seller) {
     if (!question) return false;
 
     const msgID = question.MessageID?.[0];
-    const senderID = question.SenderID?.[0];
+    const senderID = question.SenderID?.[0]; // Always the buyer (Question is always buyer-initiated)
     const senderEmail = question.SenderEmail?.[0];
     const body = question.Body?.[0];
     const subject = question.Subject?.[0];
     const itemID = msg.Item?.[0]?.ItemID?.[0];
     const itemTitle = msg.Item?.[0]?.Title?.[0];
 
-    // --- EXTRACT IMAGES (NEW) ---
+    // --- EXTRACT IMAGES from Question ---
     const mediaUrls = [];
-    // Check if MessageMedia exists and is an array
     if (msg.MessageMedia && Array.isArray(msg.MessageMedia)) {
       msg.MessageMedia.forEach(media => {
-        if (media.MediaURL && media.MediaURL[0]) {
-          mediaUrls.push(media.MediaURL[0]);
-        }
+        if (media.MediaURL && media.MediaURL[0]) mediaUrls.push(media.MediaURL[0]);
       });
     }
-    // Sometimes it's inside the Question tag as well
     if (question.MessageMedia && Array.isArray(question.MessageMedia)) {
       question.MessageMedia.forEach(media => {
-        if (media.MediaURL && media.MediaURL[0]) {
-          mediaUrls.push(media.MediaURL[0]);
-        }
+        if (media.MediaURL && media.MediaURL[0]) mediaUrls.push(media.MediaURL[0]);
       });
     }
     // ----------------------------
@@ -1009,11 +1003,7 @@ async function processEbayMessage(msg, seller) {
       if (!isNaN(parsedDate.getTime())) messageDate = parsedDate;
     }
 
-    // 1. Prevent Duplicates
-    const exists = await Message.findOne({ externalMessageId: msgID });
-    if (exists) return false;
-
-    // 2. Determine Message Type (ORDER, INQUIRY, or DIRECT)
+    // 1. Determine Message Type (ORDER, INQUIRY, or DIRECT) — needed for both question & responses
     let orderId = null;
     let messageType = 'INQUIRY'; // Default
     let finalItemId = itemID;
@@ -1041,24 +1031,75 @@ async function processEbayMessage(msg, seller) {
       console.log(`[Message] DIRECT message from ${senderID}: ${subject}`);
     }
 
-    // 3. Save to DB
-    await Message.create({
-      seller: seller._id,
-      orderId,
-      itemId: finalItemId,
-      itemTitle: finalItemTitle,
-      buyerUsername: senderID,
-      externalMessageId: msgID,
-      sender: 'BUYER',
-      subject: subject,
-      body: body,
-      mediaUrls: mediaUrls,
-      read: false,
-      messageType,
-      messageDate: messageDate
-    });
+    let savedNew = false;
 
-    return true;
+    // 2. Save buyer Question (prevent duplicates)
+    const exists = await Message.findOne({ externalMessageId: msgID });
+    if (!exists) {
+      await Message.create({
+        seller: seller._id,
+        orderId,
+        itemId: finalItemId,
+        itemTitle: finalItemTitle,
+        buyerUsername: senderID,
+        externalMessageId: msgID,
+        sender: 'BUYER',
+        subject: subject,
+        body: body,
+        mediaUrls: mediaUrls,
+        read: false,
+        messageType,
+        messageDate: messageDate
+      });
+      savedNew = true;
+    }
+
+    // 3. Save seller Responses (eBay embeds seller replies in Response[] within each exchange)
+    const responses = msg.Response || [];
+    for (const resp of responses) {
+      const respMsgID = resp.MessageID?.[0];
+      if (!respMsgID) continue;
+
+      const respExists = await Message.findOne({ externalMessageId: respMsgID });
+      if (respExists) continue;
+
+      const respBody = resp.Body?.[0];
+      const respRawDate = resp.CreationDate?.[0];
+      let respMessageDate = new Date();
+      if (respRawDate) {
+        const parsedRespDate = new Date(respRawDate);
+        if (!isNaN(parsedRespDate.getTime())) respMessageDate = parsedRespDate;
+      }
+
+      // Extract images from response
+      const respMediaUrls = [];
+      if (resp.MessageMedia && Array.isArray(resp.MessageMedia)) {
+        resp.MessageMedia.forEach(media => {
+          if (media.MediaURL && media.MediaURL[0]) respMediaUrls.push(media.MediaURL[0]);
+        });
+      }
+
+      await Message.create({
+        seller: seller._id,
+        orderId,
+        itemId: finalItemId,
+        itemTitle: finalItemTitle,
+        buyerUsername: senderID, // Link to buyer's thread
+        externalMessageId: respMsgID,
+        sender: 'SELLER',
+        subject: subject,
+        body: respBody,
+        mediaUrls: respMediaUrls,
+        read: true, // Seller is already aware of their own replies
+        messageType,
+        messageDate: respMessageDate
+      });
+
+      savedNew = true;
+      console.log(`[Message] Saved SELLER response ${respMsgID} for thread with ${senderID}`);
+    }
+
+    return savedNew;
   } catch (err) {
     console.error('Error processing message:', err.message);
     return false;
