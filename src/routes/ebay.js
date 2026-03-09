@@ -26,6 +26,9 @@ import { parseStringPromise } from 'xml2js';
 import imageCache from '../lib/imageCache.js';
 import multer from 'multer';
 import FeedUpload from '../models/FeedUpload.js';
+import UserSellerAssignment from '../models/UserSellerAssignment.js';
+import UserDailyQuantity from '../models/UserDailyQuantity.js';
+import User from '../models/User.js';
 
 const upload = multer({ storage: multer.memoryStorage() });
 const router = express.Router();
@@ -212,15 +215,46 @@ router.get('/feed/tasks', requireAuth, async (req, res) => {
 
           // Update local DB if status changed
           if (ebayTask.status !== task.status || ebayTask.uploadSummary) {
+            const oldStatus = task.status;
             task.status = ebayTask.status;
+            let newlyCompletedSuccessCount = 0;
+
             if (ebayTask.uploadSummary) {
+              const previousSuccess = task.uploadSummary?.successCount || 0;
               task.uploadSummary = {
                 successCount: ebayTask.uploadSummary.successCount,
                 failureCount: ebayTask.uploadSummary.failureCount
               };
+
+              // Calculate any newly added successful uploads if task was already somewhat processed
+              // Or if status changed to COMPLETED/COMPLETED_WITH_ERROR, process the new count
+              if ((ebayTask.status === 'COMPLETED' || ebayTask.status === 'COMPLETED_WITH_ERROR') &&
+                oldStatus !== 'COMPLETED' && oldStatus !== 'COMPLETED_WITH_ERROR') {
+                newlyCompletedSuccessCount = ebayTask.uploadSummary.successCount;
+              }
             }
             task.lastUpdated = new Date();
             await task.save();
+
+            // Track user performance based on Feed Upload
+            if (newlyCompletedSuccessCount > 0) {
+              try {
+                const assignment = await UserSellerAssignment.findOne({ seller: sellerId });
+                if (assignment) {
+                  const dateString = moment().format('YYYY-MM-DD'); // Local time
+                  await UserDailyQuantity.findOneAndUpdate(
+                    { user: assignment.user, seller: sellerId, dateString },
+                    { $inc: { quantity: newlyCompletedSuccessCount } },
+                    { upsert: true, new: true, setDefaultsOnInsert: true }
+                  );
+                  console.log(`[User Performance] Added ${newlyCompletedSuccessCount} to user ${assignment.user} for seller ${sellerId} on ${dateString}`);
+                } else {
+                  console.log(`[User Performance] No user assigned to seller ${sellerId}, skipping quantity update`);
+                }
+              } catch (perfErr) {
+                console.error('[User Performance] Error updating daily quantity:', perfErr.message);
+              }
+            }
           }
         } catch (err) {
           console.error(`[Feed Tasks] Failed to sync task ${task.taskId}:`, err.message);
@@ -934,6 +968,54 @@ async function sendAutoWelcomeMessage(seller, order) {
   }
 }
 
+// HELPER: Extract clean text from HTML email bodies
+function extractTextFromHtml(html) {
+  if (!html) return '';
+  
+  // Check if it's actually HTML (contains tags)
+  if (!/<[^>]+>/.test(html)) {
+    return html.trim();
+  }
+
+  let cleanText = '';
+
+  // Strategy 1: Try to extract from UserInputtedText div (buyer's actual message)
+  const userInputMatch = html.match(/<div\s+id=["']UserInputtedText["'][^>]*>(.*?)<\/div>/is);
+  if (userInputMatch && userInputMatch[1]) {
+    cleanText = userInputMatch[1];
+  } else {
+    // Strategy 2: Try to extract from V4PrimaryMessage hidden div
+    const v4Match = html.match(/<div\s+id=["']V4PrimaryMessage["'][^>]*>.*?<strong>Dear[^<]*<\/strong>\s*(?:<br\s*\/?>)*\s*(.*?)\s*(?:<br\s*\/?>)*\s*<\/font>/is);
+    if (v4Match && v4Match[1]) {
+      cleanText = v4Match[1];
+    } else {
+      // Strategy 3: Strip all HTML tags
+      cleanText = html;
+    }
+  }
+
+  // Remove all HTML tags
+  cleanText = cleanText.replace(/<[^>]+>/g, ' ');
+  
+  // Decode common HTML entities
+  cleanText = cleanText
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'");
+  
+  // Clean up whitespace
+  cleanText = cleanText
+    .replace(/\s+/g, ' ')  // Multiple spaces to single space
+    .replace(/\n\s*\n/g, '\n')  // Multiple newlines to single
+    .trim();
+
+  return cleanText;
+}
+
 // HELPER: Process a single eBay XML Message and save to DB
 async function processEbayMessage(msg, seller) {
   try {
@@ -943,7 +1025,8 @@ async function processEbayMessage(msg, seller) {
     const msgID = question.MessageID?.[0];
     const senderID = question.SenderID?.[0];
     const senderEmail = question.SenderEmail?.[0];
-    const body = question.Body?.[0];
+    const rawBody = question.Body?.[0];
+    const body = extractTextFromHtml(rawBody); // Clean HTML if present
     const subject = question.Subject?.[0];
     const itemID = msg.Item?.[0]?.ItemID?.[0];
     const itemTitle = msg.Item?.[0]?.Title?.[0];
@@ -1484,7 +1567,7 @@ router.get('/order/:orderId', requireAuth, requireRole('fulfillmentadmin', 'supe
 
 // Get stored orders from database with pagination support
 router.get('/stored-orders', async (req, res) => {
-  const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchItemId, searchMarketplace, paymentStatus, startDate, endDate, awaitingShipment, hasFulfillmentNotes, amazonArriving, arrivalSort, amazonAccount, arrivalStartDate, arrivalEndDate, productName } = req.query;
+  const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchItemId, searchMarketplace, paymentStatus, startDate, endDate, awaitingShipment, hasFulfillmentNotes, amazonArriving, arrivalSort, amazonAccount, arrivalStartDate, arrivalEndDate, arrivalDateFrom, arrivalDateTo, productName } = req.query;
 
   try {
     let query = {};
@@ -1512,6 +1595,9 @@ router.get('/stored-orders', async (req, res) => {
       query.fulfillmentNotes = { $exists: true, $nin: ['', null] };
     }
 
+    const arrivalRangeStart = arrivalDateFrom || arrivalStartDate;
+    const arrivalRangeEnd = arrivalDateTo || arrivalEndDate;
+
     // --- Amazon Arrivals Filter ---
     if (amazonArriving === 'true') {
       // Only show orders with arrivingDate in ISO format (YYYY-MM-DD)
@@ -1526,10 +1612,16 @@ router.get('/stored-orders', async (req, res) => {
       query.remark = { $ne: 'Delivered' };
 
       // Optional arrival date range filter (string compare is safe for YYYY-MM-DD)
-      if (arrivalStartDate || arrivalEndDate) {
-        if (arrivalStartDate) query.arrivingDate.$gte = arrivalStartDate;
-        if (arrivalEndDate) query.arrivingDate.$lte = arrivalEndDate;
+      if (arrivalRangeStart || arrivalRangeEnd) {
+        if (arrivalRangeStart) query.arrivingDate.$gte = arrivalRangeStart;
+        if (arrivalRangeEnd) query.arrivingDate.$lte = arrivalRangeEnd;
       }
+    } else if (arrivalRangeStart || arrivalRangeEnd) {
+      // Arrival date range filter for non-Amazon-Arrivals views (e.g. Awaiting Shipment)
+      query.arrivingDate = {
+        ...(arrivalRangeStart ? { $gte: arrivalRangeStart } : {}),
+        ...(arrivalRangeEnd ? { $lte: arrivalRangeEnd } : {})
+      };
     }
 
     // Amazon Account Filter
@@ -4066,6 +4158,40 @@ const QUANTITY_UPDATE_EXCLUDED_ITEMS = new Set([
   '127632527199',
   '127632535240',
   '127632517576',
+  '397653418688',
+  '397653430223',
+  '397653431626',
+  '397653432958',
+  '397653434997',
+  '389697500304',
+  '389697505524',
+  '389697519189',
+  '389697527530',
+  '389697527648',
+  '389707394803',
+  '389707398007',
+  '389707398167',
+  '406742433098',
+  '406742435500',
+  '406742435984',
+  '177927320888',
+  '177927336580',
+  '177927336724',
+  '389707470348',
+  '389707471563',
+  '389707471798',
+  '177933876674',
+  '177933879168',
+  '177933879217',
+  '389711830316',
+  '389711827996',
+  '389711828096',
+  '389707470348',
+  '389707471563',
+  '389707471798',
+
+
+
 ]);
 
 // ============================================
@@ -5795,11 +5921,39 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
         unreadCount: 1,
         buyerName: { $arrayElemAt: ["$orderDetails.buyer.buyerRegistrationAddress.fullName", 0] },
         // NEW: Get Marketplace ID from Order
-        orderMarketplaceId: { $arrayElemAt: ["$orderDetails.purchaseMarketplaceId", 0] }
+        orderMarketplaceId: { $arrayElemAt: ["$orderDetails.purchaseMarketplaceId", 0] },
+        // Extract image URL from order lineItems as fallback
+        orderImageUrl: {
+          $let: {
+            vars: {
+              lineItems: { $arrayElemAt: ["$orderDetails.lineItems", 0] },
+              currentItemId: "$_id.item"
+            },
+            in: {
+              $let: {
+                vars: {
+                  matchedItem: {
+                    $arrayElemAt: [
+                      {
+                        $filter: {
+                          input: { $ifNull: ["$$lineItems", []] },
+                          as: "item",
+                          cond: { $eq: ["$$item.legacyItemId", "$$currentItemId"] }
+                        }
+                      },
+                      0
+                    ]
+                  }
+                },
+                in: { $ifNull: ["$$matchedItem.imageUrl", null] }
+              }
+            }
+          }
+        }
       }
     });
 
-    // 5.0 LOOKUP LISTING DETAILS (For Currency -> Marketplace fallback)
+    // 5.0 LOOKUP LISTING DETAILS (For Currency -> Marketplace fallback AND Product Image)
     pipeline.push({
       $lookup: {
         from: 'listings',
@@ -5809,10 +5963,38 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
       }
     });
 
-    // 5.1 COMPUTE MARKETPLACE ID
+    // 5.1 COMPUTE MARKETPLACE ID & EXTRACT IMAGE URL & FIX MESSAGE TYPE
     pipeline.push({
       $addFields: {
-        listingCurrency: { $arrayElemAt: ["$listingDetails.currency", 0] }
+        listingCurrency: { $arrayElemAt: ["$listingDetails.currency", 0] },
+        // Extract product thumbnail for display (try listing first, then order lineItem as fallback)
+        productImageUrl: {
+          $ifNull: [
+            { $arrayElemAt: ["$listingDetails.mainImageUrl", 0] },
+            "$orderImageUrl"
+          ]
+        },
+        // Compute actual message type based on current order existence (fixes mismatches)
+        // Logic: ORDER if orderId exists, DIRECT if no itemId, INQUIRY if itemId exists without order
+        actualMessageType: {
+          $cond: {
+            if: { $ne: ["$orderId", null] },
+            then: "ORDER",
+            else: {
+              $cond: {
+                if: {
+                  $or: [
+                    { $eq: ["$itemId", "DIRECT_MESSAGE"] },
+                    { $eq: ["$itemId", null] },
+                    { $eq: ["$itemId", ""] }
+                  ]
+                },
+                then: "DIRECT",
+                else: "INQUIRY"
+              }
+            }
+          }
+        }
       }
     });
 
@@ -5877,6 +6059,61 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
       });
     }
 
+    // 5.5 FILTER OUT RESOLVED CONVERSATIONS (Lookup ConversationMeta)
+    pipeline.push({
+      $lookup: {
+        from: 'conversationmetas',
+        let: {
+          orderId: '$orderId',
+          buyerUsername: '$buyerUsername',
+          itemId: '$itemId',
+          sellerId: '$sellerId'
+        },
+        pipeline: [
+          {
+            $match: {
+              $expr: {
+                $and: [
+                  { $eq: ['$seller', '$$sellerId'] },
+                  {
+                    $or: [
+                      // Order conversation: matched by orderId
+                      {
+                        $and: [
+                          { $ne: ['$$orderId', null] },
+                          { $eq: ['$orderId', '$$orderId'] }
+                        ]
+                      },
+                      // Inquiry: matched by buyerUsername + itemId + orderId is null
+                      {
+                        $and: [
+                          { $eq: ['$$orderId', null] },
+                          { $eq: ['$orderId', null] },
+                          { $eq: ['$buyerUsername', '$$buyerUsername'] },
+                          { $eq: ['$itemId', '$$itemId'] }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        ],
+        as: 'conversationMeta'
+      }
+    });
+
+    // Exclude threads where ConversationMeta exists and status is 'Resolved'
+    pipeline.push({
+      $match: {
+        $or: [
+          { 'conversationMeta': { $size: 0 } },          // No meta record → not resolved
+          { 'conversationMeta.0.status': { $ne: 'Resolved' } } // Meta exists but not resolved
+        ]
+      }
+    });
+
     // 6. SEARCH FILTER (Applied AFTER grouping so we search distinct threads)
     if (search && search.trim() !== '') {
       const regex = new RegExp(search.trim(), 'i'); // Case-insensitive
@@ -5909,8 +6146,73 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
 
     const result = await Message.aggregate(facetedPipeline);
 
-    const threads = result[0].data;
-    const total = result[0].metadata[0] ? result[0].metadata[0].total : 0;
+    let threads = result[0].data;
+    let total = result[0].metadata[0] ? result[0].metadata[0].total : 0;
+
+    // --- ORDER FALLBACK SEARCH ---
+    // If a search term is provided, also look up matching Orders directly.
+    // This handles the case where an order exists but has never had a message synced.
+    if (search && search.trim() !== '') {
+      const searchTrim = search.trim();
+      const regex = new RegExp(searchTrim, 'i');
+
+      // Build order query
+      const orderQuery = {
+        $or: [
+          { orderId: regex },
+          { legacyOrderId: regex },
+          { 'buyer.username': regex },
+          { 'buyer.buyerRegistrationAddress.fullName': regex }
+        ]
+      };
+      if (sellerId) {
+        orderQuery.seller = new mongoose.Types.ObjectId(sellerId);
+      }
+
+      const matchingOrders = await Order.find(orderQuery).limit(20).lean();
+
+      // Get the set of orderIds already in message threads
+      const existingOrderIds = new Set(threads.map(t => t.orderId).filter(Boolean));
+
+      // For each matching order not already in threads, create a synthetic thread
+      for (const order of matchingOrders) {
+        if (!existingOrderIds.has(order.orderId)) {
+          const itemId = order.lineItems?.[0]?.legacyItemId || null;
+          
+          // Look up product image for this item (try listing first, then order lineItem)
+          let productImageUrl = null;
+          if (itemId) {
+            const listing = await Listing.findOne({ itemId }).select('mainImageUrl').lean();
+            productImageUrl = listing?.mainImageUrl || null;
+            
+            // Fallback: Check if order lineItem has imageUrl
+            if (!productImageUrl && order.lineItems?.[0]?.imageUrl) {
+              productImageUrl = order.lineItems[0].imageUrl;
+            }
+          }
+
+          threads.push({
+            orderId: order.orderId,
+            buyerUsername: order.buyer?.username || '',
+            buyerName: order.buyer?.buyerRegistrationAddress?.fullName || '',
+            itemId: itemId,
+            itemTitle: order.lineItems?.[0]?.title || order.productName || '',
+            lastMessage: '(No messages yet)',
+            lastDate: order.lastModifiedDate || order.creationDate,
+            sender: null,
+            unreadCount: 0,
+            sellerId: order.seller,
+            orderMarketplaceId: order.purchaseMarketplaceId,
+            computedMarketplaceId: order.purchaseMarketplaceId || 'Unknown',
+            productImageUrl: productImageUrl, // Add product image
+            actualMessageType: 'ORDER', // Synthetic threads are always orders
+            _isSyntheticOrder: true
+          });
+          total += 1;
+        }
+      }
+    }
+
 
     // --- NEW: MARKETPLACE RESOLUTION LOGIC ---
     // Process threads to add 'marketplaceId'
@@ -7341,8 +7643,8 @@ router.post('/compatibility/values', requireAuth, async (req, res) => {
 router.post('/conversation-meta', requireAuth, async (req, res) => {
   const { sellerId, buyerUsername, orderId, itemId, category, caseStatus, status, pickedUpBy } = req.body;
 
-  if (!category || !caseStatus) {
-    return res.status(400).json({ error: 'Category and Case Status are required' });
+  if (!caseStatus) {
+    return res.status(400).json({ error: 'Case Status is required' });
   }
 
   try {
@@ -7656,7 +7958,7 @@ router.patch('/orders/:orderId/manual-fields', requireAuth, async (req, res) => 
   const { orderId } = req.params;
   const updates = req.body;
 
-  const allowedFields = ['amazonAccount', 'arrivingDate', 'beforeTax', 'estimatedTax', 'azOrderId', 'amazonRefund', 'cardName', 'remark', 'alreadyInUse', 'remarkMessageSent'];
+  const allowedFields = ['amazonAccount', 'arrivingDate', 'beforeTax', 'estimatedTax', 'azOrderId', 'amazonRefund', 'cardName', 'resolution', 'remark', 'alreadyInUse', 'remarkMessageSent'];
   const updateData = {};
 
   Object.keys(updates).forEach(key => {
@@ -8050,6 +8352,54 @@ router.patch('/returns/:returnId/worksheet-status', requireAuth, async (req, res
     res.json({ success: true, return: returnDoc });
   } catch (err) {
     console.error('Error updating return worksheet status:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update manual eBay/Amazon statuses for a return
+router.patch('/returns/:returnId/marketplace-statuses', requireAuth, async (req, res) => {
+  try {
+    const { returnId } = req.params;
+    const { ebayStatus, amazonStatus } = req.body;
+
+    const allowedEbayStatuses = [
+      '',
+      'Fully Refunded',
+      'Partially Refunded',
+      'To be returned',
+      'Received Item',
+      'Awaiting Return Shipment'
+    ];
+
+    const allowedAmazonStatuses = [
+      '',
+      'Received',
+      'Refund Issued',
+      'Replacement Delivered',
+      'Dropped Off'
+    ];
+
+    if (typeof ebayStatus !== 'string' || !allowedEbayStatuses.includes(ebayStatus)) {
+      return res.status(400).json({ error: 'Invalid eBay status' });
+    }
+
+    if (typeof amazonStatus !== 'string' || !allowedAmazonStatuses.includes(amazonStatus)) {
+      return res.status(400).json({ error: 'Invalid Amazon status' });
+    }
+
+    const returnDoc = await Return.findOneAndUpdate(
+      { returnId },
+      { ebayStatus, amazonStatus },
+      { new: true }
+    );
+
+    if (!returnDoc) {
+      return res.status(404).json({ error: 'Return not found' });
+    }
+
+    res.json({ success: true, return: returnDoc });
+  } catch (err) {
+    console.error('Error updating return marketplace statuses:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -8783,6 +9133,429 @@ router.get('/selling/summary', requireAuth, async (req, res) => {
 
 // Export for optional external schedulers
 export { sendPolicyMessage, processPendingPolicyMessages, getPolicyEligibilityDate };
+
+// ============================================
+// FEED UPLOAD SUCCESS STATS (aggregated day-wise by seller)
+// GET /api/ebay/feed/upload-stats?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&sellerId=...
+// ============================================
+router.get('/feed/upload-stats', requireAuth, requireRole('superadmin', 'listingadmin'), async (req, res) => {
+  try {
+    const { startDate, endDate, sellerId } = req.query;
+
+    const matchStage = {
+      status: { $in: ['COMPLETED', 'COMPLETED_WITH_ERROR'] },
+      'uploadSummary.successCount': { $gt: 0 }
+    };
+    if (sellerId) matchStage.seller = new mongoose.Types.ObjectId(sellerId);
+    if (startDate || endDate) {
+      matchStage.creationDate = {};
+      if (startDate) matchStage.creationDate.$gte = new Date(startDate);
+      if (endDate) {
+        const end = new Date(endDate);
+        end.setHours(23, 59, 59, 999);
+        matchStage.creationDate.$lte = end;
+      }
+    }
+
+    const rows = await FeedUpload.aggregate([
+      { $match: matchStage },
+      {
+        $group: {
+          _id: {
+            seller: '$seller',
+            date: { $dateToString: { format: '%Y-%m-%d', date: '$creationDate' } }
+          },
+          totalSuccess: { $sum: '$uploadSummary.successCount' },
+          totalFailure: { $sum: { $ifNull: ['$uploadSummary.failureCount', 0] } },
+          taskCount: { $sum: 1 }
+        }
+      },
+      { $sort: { '_id.date': -1, '_id.seller': 1 } }
+    ]);
+
+    // Collect unique seller IDs and populate usernames
+    const sellerIds = [...new Set(rows.map(r => r._id.seller.toString()))];
+    const sellers = await Seller.find({ _id: { $in: sellerIds } })
+      .populate('user', 'username')
+      .lean();
+    const sellerMap = {};
+    sellers.forEach(s => {
+      sellerMap[s._id.toString()] = s.user?.username || s._id.toString();
+    });
+
+    const result = rows.map(r => ({
+      sellerId: r._id.seller,
+      sellerName: sellerMap[r._id.seller.toString()] || r._id.seller.toString(),
+      date: r._id.date,
+      totalSuccess: r.totalSuccess,
+      totalFailure: r.totalFailure,
+      taskCount: r.taskCount
+    }));
+
+    res.json(result);
+  } catch (err) {
+    console.error('[Feed Upload Stats] Error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch feed upload stats' });
+  }
+});
+// ============================================
+// SELLER FUNDS SUMMARY (All connected sellers)
+// ============================================
+router.get('/seller-funds-summary', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+  try {
+    // Get all sellers with eBay tokens
+    const sellers = await Seller.find({
+      'ebayTokens.access_token': { $exists: true, $ne: null },
+      'ebayTokens.refresh_token': { $exists: true, $ne: null }
+    }).populate('user', 'username email');
+
+    const results = [];
+
+    for (const seller of sellers) {
+      const sellerName = seller.user?.username || seller._id.toString();
+      try {
+        const accessToken = await ensureValidToken(seller);
+
+        const response = await axios.get('https://apiz.ebay.com/sell/finances/v1/seller_funds_summary', {
+          headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+            'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
+          }
+        });
+
+        results.push({
+          sellerId: seller._id,
+          sellerName,
+          totalFunds: response.data.totalFunds || { value: '0.00', currency: 'USD' },
+          availableFunds: response.data.availableFunds || { value: '0.00', currency: 'USD' },
+          processingFunds: response.data.processingFunds || { value: '0.00', currency: 'USD' },
+          fundsOnHold: response.data.fundsOnHold || { value: '0.00', currency: 'USD' },
+          error: null
+        });
+      } catch (err) {
+        // 204 No Content means no funds
+        if (err.response?.status === 204) {
+          results.push({
+            sellerId: seller._id,
+            sellerName,
+            totalFunds: { value: '0.00', currency: 'USD' },
+            availableFunds: { value: '0.00', currency: 'USD' },
+            processingFunds: { value: '0.00', currency: 'USD' },
+            fundsOnHold: { value: '0.00', currency: 'USD' },
+            error: null
+          });
+        } else {
+          console.error(`[Seller Funds] Error for ${sellerName}:`, err.response?.data || err.message);
+          results.push({
+            sellerId: seller._id,
+            sellerName,
+            totalFunds: null,
+            availableFunds: null,
+            processingFunds: null,
+            fundsOnHold: null,
+            error: err.response?.data?.errors?.[0]?.message || err.message
+          });
+        }
+      }
+    }
+
+    res.json(results);
+  } catch (err) {
+    console.error('[Seller Funds Summary] Error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch seller funds summary' });
+  }
+});
+
+// ============================================
+// PROCESSING TRANSACTIONS for a specific seller
+// ============================================
+router.get('/processing-transactions/:sellerId', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+  try {
+    const seller = await Seller.findById(req.params.sellerId).populate('user', 'username');
+    if (!seller) return res.status(404).json({ error: 'Seller not found' });
+    if (!seller.ebayTokens?.access_token) return res.status(400).json({ error: 'Seller not connected to eBay' });
+
+    const accessToken = await ensureValidToken(seller);
+    const sellerName = (seller.user?.username || '').toLowerCase();
+
+    // Available date rules per seller
+    // 'txn+Xd' = X days after transaction date
+    // 'delivery+Xd' = X days after delivery date (from local order)
+    const availableDateRules = {
+      'actus_corp': { base: 'txn', days: 1 },
+      'truxi': { base: 'txn', days: 12 },
+      'raveoli_cart': { base: 'txn', days: 1 },
+      'phoenix': { base: 'delivery', days: 1 },
+      'rolexstore': { base: 'txn', days: 1 },
+      'mindverge': { base: 'txn', days: 1 },
+      'dominex': { base: 'txn', days: 2 },
+      'brightvision': { base: 'txn', days: 1 },
+      'elevate': { base: 'txn', days: 1 },
+      'techmania': { base: 'txn', days: 2 },
+      'mind_matrix': { base: 'txn', days: 15 },
+      'capitalcrest': { base: 'txn', days: 1 },
+      'ultimate': { base: 'txn', days: 15 },
+      'valueventure': { base: 'delivery', days: 3 },
+      'techvista': { base: 'txn', days: 15 },
+      'edgevolution': { base: 'delivery', days: 1 },
+      'sanddbro': { base: 'delivery', days: 1 },
+    };
+
+    const rule = availableDateRules[sellerName] || { base: 'txn', days: 1 }; // default 24hrs after txn
+
+    let allTransactions = [];
+    let offset = 0;
+    const limit = 200;
+    let hasMore = true;
+
+    while (hasMore) {
+      const response = await axios.get('https://apiz.ebay.com/sell/finances/v1/transaction', {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
+        },
+        params: {
+          filter: 'transactionStatus:{FUNDS_PROCESSING}',
+          limit,
+          offset
+        }
+      });
+
+      const transactions = response.data?.transactions || [];
+      allTransactions = allTransactions.concat(transactions);
+
+      if (transactions.length < limit) {
+        hasMore = false;
+      } else {
+        offset += limit;
+      }
+    }
+
+    // Extract order-level info
+    const orderMap = new Map();
+    for (const txn of allTransactions) {
+      const orderId = txn.orderId || null;
+      const orderRef = txn.references?.find(r => r.referenceType === 'ORDER_ID');
+      const effectiveOrderId = orderId || orderRef?.referenceId || txn.transactionId;
+
+      if (!orderMap.has(effectiveOrderId)) {
+        orderMap.set(effectiveOrderId, {
+          orderId: effectiveOrderId,
+          amount: parseFloat(txn.amount?.value || 0),
+          currency: txn.amount?.currency || 'USD',
+          transactionDate: txn.transactionDate,
+          transactionType: txn.transactionType,
+          transactionStatus: txn.transactionStatus,
+          buyer: txn.buyer?.username || 'N/A',
+          payoutId: txn.payoutId || null
+        });
+      } else {
+        const existing = orderMap.get(effectiveOrderId);
+        existing.amount += parseFloat(txn.amount?.value || 0);
+      }
+    }
+
+    // Get local orders for delivery dates (needed for delivery-based rules)
+    const orderIds = [...orderMap.keys()];
+    const localOrders = await Order.find({ orderId: { $in: orderIds }, seller: seller._id })
+      .select('orderId estimatedDelivery')
+      .lean();
+
+    const localOrderMap = {};
+    for (const lo of localOrders) {
+      localOrderMap[lo.orderId] = lo;
+    }
+
+    // Calculate available date based on seller rule
+    const calcAvailableDate = (txnDate, orderId) => {
+      let baseDate;
+      if (rule.base === 'delivery') {
+        const local = localOrderMap[orderId];
+        if (local?.estimatedDelivery) {
+          baseDate = new Date(local.estimatedDelivery);
+        } else {
+          // Fallback to transaction date if no delivery date found
+          baseDate = txnDate ? new Date(txnDate) : null;
+        }
+      } else {
+        baseDate = txnDate ? new Date(txnDate) : null;
+      }
+      if (!baseDate) return null;
+      const result = new Date(baseDate);
+      result.setDate(result.getDate() + rule.days);
+      return result.toISOString();
+    };
+
+    const result = [...orderMap.values()].map(o => {
+      const local = localOrderMap[o.orderId];
+      return {
+        ...o,
+        amount: parseFloat(o.amount.toFixed(2)),
+        availableDate: calcAvailableDate(o.transactionDate, o.orderId),
+        deliveryDate: local?.estimatedDelivery || null
+      };
+    });
+
+    // Sort by transaction date descending
+    result.sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate));
+
+    res.json({
+      sellerId: seller._id,
+      sellerName: seller.user?.username || seller._id.toString(),
+      availableDateRule: rule,
+      totalProcessingTransactions: result.length,
+      transactions: result
+    });
+  } catch (err) {
+    console.error('[Processing Transactions] Error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to fetch processing transactions' });
+  }
+});
+
+// ============================================
+// UPCOMING PAYOUTS for a specific seller
+// ============================================
+router.get('/upcoming-payouts/:sellerId', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+  try {
+    const seller = await Seller.findById(req.params.sellerId).populate('user', 'username');
+    if (!seller) return res.status(404).json({ error: 'Seller not found' });
+    if (!seller.ebayTokens?.access_token) return res.status(400).json({ error: 'Seller not connected to eBay' });
+
+    const accessToken = await ensureValidToken(seller);
+
+    // Fetch upcoming and recent payouts
+    const payoutsRes = await axios.get('https://apiz.ebay.com/sell/finances/v1/payout', {
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json',
+        'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
+      },
+      params: {
+        sort: '-payoutDate',
+        limit: 50
+      }
+    });
+
+    const allPayouts = payoutsRes.data?.payouts || [];
+    
+    // Filter for upcoming and recent payouts (INITIATED, or recent SUCCEEDED within 30 days)
+    const now = new Date();
+    const thirtyDaysAgo = new Date(now);
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+    const payouts = allPayouts
+      .filter(p => {
+        if (p.payoutStatus === 'INITIATED') return true;
+        if (p.payoutStatus === 'SUCCEEDED' && p.payoutDate) {
+          const payoutDate = new Date(p.payoutDate);
+          return payoutDate >= thirtyDaysAgo;
+        }
+        return false;
+      })
+      .map(p => ({
+        payoutId: p.payoutId,
+        payoutDate: p.payoutDate,
+        payoutStatus: p.payoutStatus,
+        amount: p.amount || { value: '0.00', currency: 'USD' },
+        lastAttemptedPayoutDate: p.lastAttemptedPayoutDate,
+        payoutInstrument: p.payoutInstrument
+      }))
+      .sort((a, b) => new Date(b.payoutDate) - new Date(a.payoutDate));
+
+    res.json({
+      sellerId: seller._id,
+      sellerName: seller.user?.username || seller._id.toString(),
+      totalPayouts: payouts.length,
+      payouts
+    });
+  } catch (err) {
+    console.error('[Upcoming Payouts] Error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to fetch upcoming payouts' });
+  }
+});
+
+// ============================================
+// ON HOLD TRANSACTIONS for a specific seller
+// ============================================
+router.get('/onhold-transactions/:sellerId', requireAuth, requireRole('fulfillmentadmin', 'superadmin'), async (req, res) => {
+  try {
+    const seller = await Seller.findById(req.params.sellerId).populate('user', 'username');
+    if (!seller) return res.status(404).json({ error: 'Seller not found' });
+    if (!seller.ebayTokens?.access_token) return res.status(400).json({ error: 'Seller not connected to eBay' });
+
+    const accessToken = await ensureValidToken(seller);
+
+    let allTransactions = [];
+    let offset = 0;
+    const limit = 200;
+    let hasMore = true;
+
+    while (hasMore) {
+      const response = await axios.get('https://apiz.ebay.com/sell/finances/v1/transaction', {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
+        },
+        params: {
+          filter: 'transactionStatus:{FUNDS_ON_HOLD}',
+          limit,
+          offset
+        }
+      });
+
+      const transactions = response.data?.transactions || [];
+      allTransactions = allTransactions.concat(transactions);
+
+      if (transactions.length < limit) {
+        hasMore = false;
+      } else {
+        offset += limit;
+      }
+    }
+
+    // Extract order-level info
+    const orderMap = new Map();
+    for (const txn of allTransactions) {
+      const orderId = txn.orderId || null;
+      const orderRef = txn.references?.find(r => r.referenceType === 'ORDER_ID');
+      const effectiveOrderId = orderId || orderRef?.referenceId || txn.transactionId;
+
+      if (!orderMap.has(effectiveOrderId)) {
+        orderMap.set(effectiveOrderId, {
+          orderId: effectiveOrderId,
+          amount: parseFloat(txn.amount?.value || 0),
+          currency: txn.amount?.currency || 'USD',
+          transactionDate: txn.transactionDate,
+          buyer: txn.buyer?.username || 'N/A',
+          transactionMemo: txn.transactionMemo || null
+        });
+      } else {
+        const existing = orderMap.get(effectiveOrderId);
+        existing.amount += parseFloat(txn.amount?.value || 0);
+      }
+    }
+
+    const result = [...orderMap.values()].map(o => ({
+      ...o,
+      amount: parseFloat(o.amount.toFixed(2))
+    }));
+
+    result.sort((a, b) => new Date(b.transactionDate) - new Date(a.transactionDate));
+
+    res.json({
+      sellerId: seller._id,
+      sellerName: seller.user?.username || seller._id.toString(),
+      totalOnHoldTransactions: result.length,
+      transactions: result
+    });
+  } catch (err) {
+    console.error('[On Hold Transactions] Error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to fetch on hold transactions' });
+  }
+});
 
 export default router;
 

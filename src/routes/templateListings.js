@@ -5,7 +5,7 @@ import ListingTemplate from '../models/ListingTemplate.js';
 import Seller from '../models/Seller.js';
 import SellerPricingConfig from '../models/SellerPricingConfig.js';
 import { fetchAmazonData, applyFieldConfigs } from '../utils/asinAutofill.js';
-import { generateSKUFromASIN } from '../utils/skuGenerator.js';
+import { generateSKUFromASIN, generateSKUWithCount } from '../utils/skuGenerator.js';
 import { getEffectiveTemplate } from '../utils/templateMerger.js';
 import { getUsageStats, getFieldExtractionStats, getRecentErrors, checkQuotaStatus } from '../utils/apiUsageTracker.js';
 import { getAsinCacheStats, clearAsinCache, invalidateAsinCache } from '../utils/asinCache.js';
@@ -16,7 +16,7 @@ const router = express.Router();
 // Get all listings for a template
 router.get('/', requireAuth, async (req, res) => {
   try {
-    const { templateId, sellerId, page = 1, limit = 50, batchFilter = 'active', batchId, status = 'active' } = req.query;
+    const { templateId, sellerId, page = 1, limit = 50, batchFilter = 'active', batchId, status = 'active', minPrice, maxPrice, search } = req.query;
     
     if (!templateId) {
       return res.status(400).json({ error: 'Template ID is required' });
@@ -35,6 +35,19 @@ router.get('/', requireAuth, async (req, res) => {
       filter.status = status;
     }
     
+    // Price range filter
+    if (minPrice || maxPrice) {
+      filter.startPrice = {};
+      if (minPrice) filter.startPrice.$gte = parseFloat(minPrice);
+      if (maxPrice) filter.startPrice.$lte = parseFloat(maxPrice);
+    }
+    
+    // Keyword / ASIN search
+    if (search && search.trim()) {
+      const rx = { $regex: search.trim(), $options: 'i' };
+      filter.$or = [{ title: rx }, { customLabel: rx }];
+    }
+    
     // Apply batch filtering
     if (batchId) {
       // Specific batch
@@ -48,6 +61,7 @@ router.get('/', requireAuth, async (req, res) => {
     
     const [listings, total] = await Promise.all([
       TemplateListing.find(filter)
+        .select('+_asinReference')
         .populate('createdBy', 'name email')
         .populate({
           path: 'sellerId',
@@ -386,7 +400,7 @@ router.get('/analytics', requireAuth, async (req, res) => {
 // Bulk preview with SSE streaming (real-time updates) - MUST be before /:id route
 router.get('/bulk-preview-stream', requireAuth, async (req, res) => {
   try {
-    const { templateId, sellerId, asins: asinsParam } = req.query;
+    const { templateId, sellerId, asins: asinsParam, region = 'US' } = req.query;
     
     if (!templateId || !sellerId || !asinsParam) {
       return res.status(400).json({ error: 'Template ID, Seller ID, and ASINs are required' });
@@ -496,18 +510,21 @@ router.get('/bulk-preview-stream', requireAuth, async (req, res) => {
         // will have the same SKU and should be updateable, not blocked
         if (asinInCurrentTemplate.has(asin)) {
           const existingListing = asinInCurrentTemplate.get(asin);
-          const sku = generateSKUFromASIN(asin);
-          
+
           // Get existing customFields (already an object from .lean())
           const existingCustomFields = existingListing.customFields || {};
-          
+
+          // Compute future SKU based on current listing count
+          const asinCountDoc = await AsinDirectory.findOne({ asin }).select('listingCount').lean();
+          const futureSKU = generateSKUWithCount(asin, asinCountDoc?.listingCount || 0);
+
           // Return existing listing data for editing (no re-fetch)
           const item = {
             id: `preview-${asin}`,
             asin,
-            sku: existingListing.customLabel || sku,
+            sku: futureSKU,
             status: 'duplicate_updateable',
-            
+
             // Return existing data as generatedListing so modal can display it
             generatedListing: {
               title: existingListing.title,
@@ -519,21 +536,21 @@ router.get('/bulk-preview-stream', requireAuth, async (req, res) => {
               format: existingListing.format || '',
               duration: existingListing.duration || '',
               location: existingListing.location || '',
-              customLabel: existingListing.customLabel,
+              customLabel: futureSKU,
               customFields: existingCustomFields,
               _asinReference: asin,
               _existingListingId: existingListing._id // Track which listing to update
             },
-            
+
             warnings: [
               `This ASIN already exists in this template.`,
-              existingListing.duplicateCount > 0 
+              existingListing.duplicateCount > 0
                 ? `Previously updated ${existingListing.duplicateCount} time(s).`
                 : `First time editing this ASIN.`
             ],
             errors: []
           };
-          
+
           res.write(`data: ${JSON.stringify({ type: 'item', item, progress: ++completed, total: asins.length })}\n\n`);
           return;
         }
@@ -556,7 +573,7 @@ router.get('/bulk-preview-stream', requireAuth, async (req, res) => {
         }
         
         // Fetch and process ASIN (new listing case)
-        const amazonData = await fetchAmazonData(asin);
+        const amazonData = await fetchAmazonData(asin, region);
         const { coreFields, customFields, pricingCalculation } = 
           await applyFieldConfigs(amazonData, template.asinAutomation.fieldConfigs, pricingConfig);
         
@@ -587,11 +604,15 @@ router.get('/bulk-preview-stream', requireAuth, async (req, res) => {
         if (!mergedCoreFields.description) {
           warnings.push('Missing description');
         }
-        
+
+        // Compute count-based SKU for new listing preview
+        const countDoc = await AsinDirectory.findOne({ asin }).select('listingCount').lean();
+        const finalSKU = generateSKUWithCount(asin, countDoc?.listingCount || 0);
+
         const item = {
           id: `preview-${asin}`,
           asin,
-          sku,
+          sku: finalSKU,
           sourceData: {
             title: amazonData.title,
             brand: amazonData.brand,
@@ -603,7 +624,7 @@ router.get('/bulk-preview-stream', requireAuth, async (req, res) => {
           },
           generatedListing: {
             ...mergedCoreFields,
-            customLabel: sku,
+            customLabel: finalSKU,
             customFields,
             _asinReference: asin
           },
@@ -612,10 +633,10 @@ router.get('/bulk-preview-stream', requireAuth, async (req, res) => {
           errors: validationErrors,
           status: validationErrors.length > 0 ? 'error' : (warnings.length > 0 ? 'warning' : 'success')
         };
-        
+
         // Stream the completed item
         res.write(`data: ${JSON.stringify({ type: 'item', item, progress: ++completed, total: asins.length })}\n\n`);
-        
+
       } catch (error) {
         console.error(`❌ Error processing ASIN ${asin}:`, error);
         const item = {
@@ -628,17 +649,17 @@ router.get('/bulk-preview-stream', requireAuth, async (req, res) => {
         res.write(`data: ${JSON.stringify({ type: 'item', item, progress: ++completed, total: asins.length })}\n\n`);
       }
     });
-    
+
     // Wait for all to complete
     await Promise.allSettled(processPromises);
-    
+
     // Send completion event
     res.write(`data: ${JSON.stringify({ type: 'complete', total: completed })}\n\n`);
     res.write('data: [DONE]\n\n');
-    
+
     console.log(`📡 [SSE Stream] Completed: ${completed}/${asins.length} ASINs`);
     res.end();
-    
+
   } catch (error) {
     console.error('SSE Stream error:', error);
     res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
@@ -744,10 +765,12 @@ router.get('/bulk-preview-from-directory-stream', requireAuth, async (req, res) 
         // Duplicate in current template — updateable
         if (asinInCurrentTemplate.has(asin)) {
           const existingListing = asinInCurrentTemplate.get(asin);
-          const sku = generateSKUFromASIN(asin);
+          // Compute future SKU based on current listing count
+          const asinCountDoc = await AsinDirectory.findOne({ asin }).select('listingCount').lean();
+          const futureSKU = generateSKUWithCount(asin, asinCountDoc?.listingCount || 0);
           const item = {
             id: `preview-${asin}`, asin,
-            sku: existingListing.customLabel || sku,
+            sku: futureSKU,
             status: 'duplicate_updateable',
             generatedListing: {
               title: existingListing.title,
@@ -759,7 +782,7 @@ router.get('/bulk-preview-from-directory-stream', requireAuth, async (req, res) 
               format: existingListing.format || '',
               duration: existingListing.duration || '',
               location: existingListing.location || '',
-              customLabel: existingListing.customLabel,
+              customLabel: futureSKU,
               customFields: existingListing.customFields || {},
               _asinReference: asin,
               _existingListingId: existingListing._id
@@ -846,10 +869,13 @@ router.get('/bulk-preview-from-directory-stream', requireAuth, async (req, res) 
         }
         if (!mergedCoreFields.description) warnings.push('Missing description');
 
+        // Compute count-based SKU using the already-fetched directory doc
+        const finalSKU = generateSKUWithCount(asin, doc?.listingCount || 0);
+
         const item = {
           id: `preview-${asin}`,
           asin,
-          sku,
+          sku: finalSKU,
           sourceData: {
             title: amazonData.title,
             brand: amazonData.brand,
@@ -861,7 +887,7 @@ router.get('/bulk-preview-from-directory-stream', requireAuth, async (req, res) 
           },
           generatedListing: {
             ...mergedCoreFields,
-            customLabel: sku,
+            customLabel: finalSKU,
             customFields,
             _asinReference: asin
           },
@@ -1026,6 +1052,45 @@ router.post('/', requireAuth, async (req, res) => {
   }
 });
 
+// Bulk update listings
+router.put('/bulk-update', requireAuth, async (req, res) => {
+  try {
+    const { listings } = req.body;
+
+    if (!listings || !Array.isArray(listings) || listings.length === 0) {
+      return res.status(400).json({ error: 'Listings array is required' });
+    }
+
+    const EDITABLE_FIELDS = [
+      'action', 'customLabel', 'title', 'startPrice',
+      'categoryId', 'categoryName', 'relationship', 'relationshipDetails',
+      'scheduleTime', 'customFields', 'description', 'condition',
+      'conditionDescription', 'quantity', 'format', 'duration',
+    ];
+
+    let updated = 0;
+    for (const listing of listings) {
+      const id = listing._existingListingId || listing._id;
+      if (!id) continue;
+
+      const patch = {};
+      for (const field of EDITABLE_FIELDS) {
+        if (listing[field] !== undefined) patch[field] = listing[field];
+      }
+
+      if (Object.keys(patch).length > 0) {
+        await TemplateListing.findByIdAndUpdate(id, { $set: patch });
+        updated++;
+      }
+    }
+
+    res.json({ updated });
+  } catch (error) {
+    console.error('Bulk update error:', error);
+    res.status(500).json({ error: error.message || 'Failed to bulk update listings' });
+  }
+});
+
 // Update listing
 router.put('/:id', requireAuth, async (req, res) => {
   try {
@@ -1079,7 +1144,7 @@ router.delete('/:id', requireAuth, async (req, res) => {
 // ASIN Autofill endpoint
 router.post('/autofill-from-asin', requireAuth, async (req, res) => {
   try {
-    const { asin, templateId, sellerId } = req.body;
+    const { asin, templateId, sellerId, region = 'US' } = req.body;
     
     if (!asin || !templateId) {
       return res.status(400).json({ 
@@ -1113,8 +1178,8 @@ router.post('/autofill-from-asin', requireAuth, async (req, res) => {
     }
     
     // 2. Fetch fresh Amazon data
-    console.log(`Fetching Amazon data for ASIN: ${asin}`);
-    const amazonData = await fetchAmazonData(asin);
+    console.log(`Fetching Amazon data for ASIN: ${asin} (${region})`);
+    const amazonData = await fetchAmazonData(asin, region);
     
     // 3. Apply field configurations (AI + direct mappings)
     console.log(`Processing ${template.asinAutomation.fieldConfigs.length} field configs`);
@@ -1152,7 +1217,7 @@ router.post('/autofill-from-asin', requireAuth, async (req, res) => {
 // Bulk auto-fill from multiple ASINs
 router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
   try {
-    const { asins, templateId, sellerId } = req.body;
+    const { asins, templateId, sellerId, region = 'US' } = req.body;
     
     if (!asins || !Array.isArray(asins) || asins.length === 0) {
       return res.status(400).json({ 
@@ -1338,7 +1403,7 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
         
         try {
           // Fetch Amazon data
-          const amazonData = await fetchAmazonData(asin);
+          const amazonData = await fetchAmazonData(asin, region);
           
           // Apply field configurations
           const { coreFields, customFields, pricingCalculation } = await applyFieldConfigs(
@@ -1434,6 +1499,7 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
   }
 });
 
+// Bulk update existing listings (used by Proof Read → List Directly flow)
 // Bulk delete listings
 router.post('/bulk-delete', requireAuth, async (req, res) => {
   try {
@@ -1776,7 +1842,7 @@ router.post('/bulk-create', requireAuth, async (req, res) => {
 // Bulk preview: Process ASINs and return preview data (no save to database)
 router.post('/bulk-preview', requireAuth, async (req, res) => {
   try {
-    const { templateId, sellerId, asins } = req.body;
+    const { templateId, sellerId, asins, region = 'US' } = req.body;
     
     if (!templateId) {
       return res.status(400).json({ error: 'Template ID is required' });
@@ -1967,7 +2033,7 @@ router.post('/bulk-preview', requireAuth, async (req, res) => {
         }
         
         // Fetch Amazon data
-        const amazonData = await fetchAmazonData(asin);
+        const amazonData = await fetchAmazonData(asin, region);
         
         // Apply field configurations
         const { coreFields, customFields, pricingCalculation } = 
@@ -2278,11 +2344,16 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
           const customFieldsMap = listingData.customFields && typeof listingData.customFields === 'object'
             ? new Map(Object.entries(listingData.customFields))
             : new Map();
-          
+
+          // Compute new count-based SKU fresh at save time
+          const dupAsinDoc = await AsinDirectory.findOne({ asin: listingData._asinReference }).select('listingCount').lean();
+          const newSKU = generateSKUWithCount(listingData._asinReference, dupAsinDoc?.listingCount || 0);
+
           // Update existing listing with new data
           // Build update object - only overwrite fields that are explicitly provided
           // (guards against undefined wiping values that weren't sent from the frontend)
           const updateData = {
+            customLabel: newSKU,
             customFields: customFieldsMap,
             pendingRedownload: true,
             duplicateCount: (existingListing.duplicateCount || 0) + 1,
@@ -2296,18 +2367,21 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
             }
           }
           Object.assign(existingListing, updateData);
-          
+
           await existingListing.save();
-          
+
+          // Increment AsinDirectory listing count
+          await AsinDirectory.updateOne({ asin: listingData._asinReference }, { $inc: { listingCount: 1 } });
+
           results.push({
             status: 'updated',
             listing: existingListing.toObject(),
             asin: listingData._asinReference,
-            sku: listingData.customLabel,
+            sku: newSKU,
             duplicateCount: existingListing.duplicateCount
           });
-          
-          console.log(`✅ Updated duplicate ASIN ${listingData._asinReference} (count: ${existingListing.duplicateCount})`);
+
+          console.log(`✅ Updated duplicate ASIN ${listingData._asinReference} (count: ${existingListing.duplicateCount}, newSKU: ${newSKU})`);
           continue;
         }
         
@@ -2338,8 +2412,13 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
           continue;
         }
         
-        const sku = listingData.customLabel;
-        
+        // Compute count-based SKU fresh at save time
+        let sku = listingData.customLabel;
+        if (listingData._asinReference) {
+          const newAsinDoc = await AsinDirectory.findOne({ asin: listingData._asinReference }).select('listingCount').lean();
+          sku = generateSKUWithCount(listingData._asinReference, newAsinDoc?.listingCount || 0);
+        }
+
         if (!sku) {
           errors.push({
             asin: listingData._asinReference,
@@ -2352,7 +2431,7 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
           });
           continue;
         }
-        
+
         console.log(`🔍 Saving SKU: ${sku}`);
         
         // Check if SKU already exists (from ASIN imports or SKU imports)
@@ -2456,19 +2535,24 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
         
         await listing.save();
         skuSet.add(sku);
-        
+
+        // Increment AsinDirectory listing count
+        if (listingData._asinReference) {
+          await AsinDirectory.updateOne({ asin: listingData._asinReference }, { $inc: { listingCount: 1 } });
+        }
+
         results.push({
           status: 'created',
           listing: listing.toObject(),
           asin: listingData._asinReference,
           sku
         });
-        
+
         console.log(`✅ Created: ${sku}`);
-        
+
       } catch (error) {
         console.error('Error saving listing:', error);
-        
+
         if (error.code === 11000) {
           skippedCount++;
           results.push({
@@ -2489,7 +2573,7 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
         }
       }
     }
-    
+
     const created = results.filter(r => r.status === 'created').length;
     const updated = results.filter(r => r.status === 'updated').length;
     const reactivated = results.filter(r => r.status === 'reactivated').length;
@@ -3064,25 +3148,32 @@ router.post('/bulk-import', requireAuth, async (req, res) => {
 router.get('/export-csv/:templateId', requireAuth, async (req, res) => {
   try {
     const { templateId } = req.params;
-    const { sellerId } = req.query;
+    const { sellerId, listingIds } = req.query;
     
-    // Build filter for ACTIVE listings only that haven't been downloaded yet
-    // Inactive listings (deactivated by user) are excluded from CSV downloads
-    // even if they have downloadBatchId=null, ensuring consistency with UI
-    const filter = { 
-      templateId,
-      $or: [{ downloadBatchId: null }, { pendingRedownload: true }], // Active batch: not downloaded yet OR flagged for re-download
-      status: 'active'       // Only active listings (exclude inactive/draft/sold/ended)
-    };
-    if (sellerId) {
-      filter.sellerId = sellerId;
+    // When specific listingIds are provided, filter only by those IDs —
+    // status, downloadBatchId, and sellerId filters are skipped since the
+    // user has explicitly chosen which listings to export.
+    // Otherwise, filter for ACTIVE listings that haven't been downloaded yet.
+    let filter;
+    if (listingIds) {
+      const ids = listingIds.split(',').map(id => id.trim()).filter(Boolean);
+      filter = { _id: { $in: ids } };
+    } else {
+      filter = {
+        templateId,
+        $or: [{ downloadBatchId: null }, { pendingRedownload: true }], // not downloaded yet OR flagged for re-download
+        status: 'active',       // Only active listings (exclude inactive/draft/sold/ended)
+      };
+      if (sellerId) {
+        filter.sellerId = sellerId;
+      }
     }
     
     // Fetch effective template (includes seller overrides), seller, and filtered listings
     const [template, seller, listings] = await Promise.all([
       getEffectiveTemplate(templateId, sellerId),
       sellerId ? Seller.findById(sellerId).populate('user', 'username email') : null,
-      TemplateListing.find(filter).sort({ createdAt: -1 })
+      TemplateListing.find(filter).select('+_asinReference').sort({ createdAt: -1 })
     ]);
     
     console.log('📊 Export CSV - Seller info:', seller?.user?.username || seller?.user?.email || 'No seller');
@@ -3283,9 +3374,312 @@ router.get('/export-csv/:templateId', requireAuth, async (req, res) => {
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
     res.send(csvContent);
+
+    // Snapshot: if this is a real (non-Testing) seller, upsert TemplateListing records
+    // for that seller so Template Directory can show what was listed for them.
+    // Fire-and-forget — any failure must not affect the already-sent CSV response.
+    try {
+      const isTestingSeller = seller?.user?.username?.toLowerCase() === 'testing';
+      if (sellerId && !isTestingSeller) {
+        const upsertOps = listings.map(listing => ({
+          updateOne: {
+            filter: { templateId, sellerId, customLabel: listing.customLabel },
+            update: {
+              $set: {
+                templateId,
+                sellerId,
+                action: listing.action || 'Add',
+                customLabel: listing.customLabel,
+                categoryId: listing.categoryId,
+                categoryName: listing.categoryName,
+                title: listing.title,
+                relationship: listing.relationship,
+                relationshipDetails: listing.relationshipDetails,
+                scheduleTime: listing.scheduleTime,
+                upc: listing.upc,
+                epid: listing.epid,
+                startPrice: listing.startPrice,
+                quantity: listing.quantity,
+                itemPhotoUrl: listing.itemPhotoUrl,
+                videoId: listing.videoId,
+                conditionId: listing.conditionId,
+                description: listing.description,
+                format: listing.format,
+                duration: listing.duration,
+                buyItNowPrice: listing.buyItNowPrice,
+                bestOfferEnabled: listing.bestOfferEnabled,
+                bestOfferAutoAcceptPrice: listing.bestOfferAutoAcceptPrice,
+                minimumBestOfferPrice: listing.minimumBestOfferPrice,
+                immediatePayRequired: listing.immediatePayRequired,
+                location: listing.location,
+                shippingService1Option: listing.shippingService1Option,
+                shippingService1Cost: listing.shippingService1Cost,
+                shippingService1Priority: listing.shippingService1Priority,
+                shippingService2Option: listing.shippingService2Option,
+                shippingService2Cost: listing.shippingService2Cost,
+                shippingService2Priority: listing.shippingService2Priority,
+                maxDispatchTime: listing.maxDispatchTime,
+                returnsAcceptedOption: listing.returnsAcceptedOption,
+                returnsWithinOption: listing.returnsWithinOption,
+                refundOption: listing.refundOption,
+                returnShippingCostPaidBy: listing.returnShippingCostPaidBy,
+                shippingProfileName: listing.shippingProfileName,
+                returnProfileName: listing.returnProfileName,
+                paymentProfileName: listing.paymentProfileName,
+                customFields: listing.customFields,
+                amazonLink: listing.amazonLink,
+                _asinReference: listing._asinReference,
+                status: 'active',
+                updatedAt: new Date(),
+              },
+              $setOnInsert: { createdAt: new Date(), downloadBatchId: null, pendingRedownload: false },
+            },
+            upsert: true,
+          },
+        }));
+        await TemplateListing.bulkWrite(upsertOps, { ordered: false });
+        console.log(`📋 Snapshot: upserted ${upsertOps.length} listing(s) for seller ${seller?.user?.username}`);
+      }
+    } catch (snapshotErr) {
+      console.error('Snapshot upsert failed (non-fatal):', snapshotErr.message);
+    }
     
   } catch (error) {
     console.error('Error exporting CSV:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Export CSV using inline listing data (no DB read for field values — used by Proof Read → List Directly)
+// Edits made in the review modal are carried into the CSV without being persisted to the database.
+router.post('/export-csv-direct/:templateId', requireAuth, async (req, res) => {
+  try {
+    const { templateId } = req.params;
+    const { sellerId, listings } = req.body;
+
+    if (!listings || !Array.isArray(listings) || listings.length === 0) {
+      return res.status(400).json({ error: 'listings array is required' });
+    }
+
+    const [template, seller] = await Promise.all([
+      getEffectiveTemplate(templateId, sellerId),
+      sellerId ? Seller.findById(sellerId).populate('user', 'username email') : null,
+    ]);
+
+    if (!template) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+
+    // Generate batch ID and get next batch number
+    const crypto = await import('crypto');
+    const batchId = crypto.randomUUID();
+
+    const latestBatch = await TemplateListing.findOne({
+      templateId,
+      sellerId: sellerId || { $exists: true },
+      downloadBatchNumber: { $ne: null }
+    }).sort({ downloadBatchNumber: -1 });
+
+    const batchNumber = (latestBatch?.downloadBatchNumber || 0) + 1;
+
+    // Mark the underlying TemplateListing docs as downloaded (batch tracking only — field values are NOT updated)
+    const existingIds = listings.map(l => l._existingListingId).filter(Boolean);
+    if (existingIds.length > 0) {
+      await TemplateListing.updateMany(
+        { _id: { $in: existingIds } },
+        {
+          downloadBatchId: batchId,
+          downloadedAt: new Date(),
+          downloadBatchNumber: batchNumber,
+          pendingRedownload: false
+        }
+      );
+    }
+
+    // Build CSV — identical structure to GET /export-csv
+    const actionField = template.customActionField || '*Action(SiteID=US|Country=US|Currency=USD|Version=1193)';
+
+    const coreHeaders = [
+      actionField, 'Custom label (SKU)', 'Category ID', 'Category name', 'Title',
+      'Relationship', 'Relationship details', 'Schedule Time', 'P:UPC', 'P:EPID',
+      'Start price', 'Quantity', 'Item photo URL', 'VideoID', 'Condition ID',
+      'Description', 'Format', 'Duration', 'Buy It Now price', 'Best Offer Enabled',
+      'Best Offer Auto Accept Price', 'Minimum Best Offer Price', 'Immediate pay required',
+      'Location', 'Shipping service 1 option', 'Shipping service 1 cost',
+      'Shipping service 1 priority', 'Shipping service 2 option', 'Shipping service 2 cost',
+      'Shipping service 2 priority', 'Max dispatch time', 'Returns accepted option',
+      'Returns within option', 'Refund option', 'Return shipping cost paid by',
+      'Shipping profile name', 'Return profile name', 'Payment profile name'
+    ];
+
+    const customHeaders = template.customColumns
+      .sort((a, b) => a.order - b.order)
+      .map(col => col.name);
+
+    const allHeaders = [...coreHeaders, ...customHeaders];
+    const columnCount = allHeaders.length;
+
+    const infoLine1 = ['#INFO', `Created=${Date.now()}`, '', '', '', '',
+      ' Indicates missing required fields', '', '', '', '',
+      ' Indicates missing field that will be required soon',
+      ...new Array(columnCount - 12).fill('')];
+
+    const infoLine2 = ['#INFO', 'Version=1.0', '',
+      'Template=fx_category_template_EBAY_US', '', '',
+      ' Indicates missing recommended field', '', '', '', '',
+      ' Indicates field does not apply to this item/category',
+      ...new Array(columnCount - 12).fill('')];
+
+    const infoLine3 = new Array(columnCount).fill('');
+    infoLine3[0] = '#INFO';
+
+    const dataRows = listings.map(listing => {
+      let categoryName = listing.categoryName || '';
+      if (categoryName && !categoryName.startsWith('/')) {
+        categoryName = '/' + categoryName;
+      }
+
+      // customFields may be a plain object (from frontend) or a Map (from DB doc)
+      const getCustomField = (name) => {
+        if (!listing.customFields) return '';
+        if (typeof listing.customFields.get === 'function') return listing.customFields.get(name) || '';
+        return listing.customFields[name] || '';
+      };
+
+      const coreValues = [
+        listing.action || 'Add', listing.customLabel || '', listing.categoryId || '',
+        categoryName, listing.title || '', listing.relationship || '',
+        listing.relationshipDetails || '', listing.scheduleTime || '',
+        listing.upc || '', listing.epid || '', listing.startPrice || '',
+        listing.quantity || '', listing.itemPhotoUrl || '', listing.videoId || '',
+        listing.conditionId || '1000-New', listing.description || '',
+        listing.format || 'FixedPrice', listing.duration || 'GTC',
+        listing.buyItNowPrice || '', listing.bestOfferEnabled || '',
+        listing.bestOfferAutoAcceptPrice || '', listing.minimumBestOfferPrice || '',
+        listing.immediatePayRequired || '', listing.location || 'UnitedStates',
+        listing.shippingService1Option || '', listing.shippingService1Cost || '',
+        listing.shippingService1Priority || '', listing.shippingService2Option || '',
+        listing.shippingService2Cost || '', listing.shippingService2Priority || '',
+        listing.maxDispatchTime || '', listing.returnsAcceptedOption || '',
+        listing.returnsWithinOption || '', listing.refundOption || '',
+        listing.returnShippingCostPaidBy || '', listing.shippingProfileName || '',
+        listing.returnProfileName || '', listing.paymentProfileName || ''
+      ];
+
+      const customValues = template.customColumns
+        .sort((a, b) => a.order - b.order)
+        .map(col => getCustomField(col.name));
+
+      return [...coreValues, ...customValues];
+    });
+
+    const allRows = [infoLine1, infoLine2, infoLine3, allHeaders, ...dataRows];
+
+    const csvContent = allRows.map(row =>
+      row.map(cell => {
+        const value = String(cell || '');
+        if (value.includes(',') || value.includes('"') || value.includes('\n')) {
+          return `"${value.replace(/"/g, '""')}"`;
+        }
+        return value;
+      }).join(',')
+    ).join('\n');
+
+    const dateStr = new Date().toISOString().split('T')[0];
+    const sellerName = seller?.user?.username || seller?.user?.email || 'seller';
+    const templateName = template.name.replace(/\s+/g, '_');
+    const filename = `${templateName}_${sellerName}_batch_${batchNumber}_${dateStr}.csv`;
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csvContent);
+
+    // Snapshot: upsert TemplateListing records for the chosen real seller.
+    // Uses inline-edited field values (what actually went into the CSV).
+    try {
+      const isTestingSeller = seller?.user?.username?.toLowerCase() === 'testing';
+      if (sellerId && !isTestingSeller) {
+        const upsertOps = listings.map(listing => {
+          const getField = (name) => {
+            if (!listing.customFields) return undefined;
+            if (typeof listing.customFields.get === 'function') return listing.customFields.get(name);
+            return listing.customFields[name];
+          };
+          // Rebuild customFields as a plain object for storage
+          const customFieldsObj = {};
+          if (listing.customFields) {
+            if (typeof listing.customFields.get === 'function') {
+              for (const [k, v] of listing.customFields) customFieldsObj[k] = v;
+            } else {
+              Object.assign(customFieldsObj, listing.customFields);
+            }
+          }
+          return {
+            updateOne: {
+              filter: { templateId, sellerId, customLabel: listing.customLabel },
+              update: {
+                $set: {
+                  templateId,
+                  sellerId,
+                  action: listing.action || 'Add',
+                  customLabel: listing.customLabel,
+                  categoryId: listing.categoryId,
+                  categoryName: listing.categoryName,
+                  title: listing.title,
+                  relationship: listing.relationship,
+                  relationshipDetails: listing.relationshipDetails,
+                  scheduleTime: listing.scheduleTime,
+                  upc: listing.upc,
+                  epid: listing.epid,
+                  startPrice: listing.startPrice,
+                  quantity: listing.quantity,
+                  itemPhotoUrl: listing.itemPhotoUrl,
+                  videoId: listing.videoId,
+                  conditionId: listing.conditionId,
+                  description: listing.description,
+                  format: listing.format,
+                  duration: listing.duration,
+                  buyItNowPrice: listing.buyItNowPrice,
+                  bestOfferEnabled: listing.bestOfferEnabled,
+                  bestOfferAutoAcceptPrice: listing.bestOfferAutoAcceptPrice,
+                  minimumBestOfferPrice: listing.minimumBestOfferPrice,
+                  immediatePayRequired: listing.immediatePayRequired,
+                  location: listing.location,
+                  shippingService1Option: listing.shippingService1Option,
+                  shippingService1Cost: listing.shippingService1Cost,
+                  shippingService1Priority: listing.shippingService1Priority,
+                  shippingService2Option: listing.shippingService2Option,
+                  shippingService2Cost: listing.shippingService2Cost,
+                  shippingService2Priority: listing.shippingService2Priority,
+                  maxDispatchTime: listing.maxDispatchTime,
+                  returnsAcceptedOption: listing.returnsAcceptedOption,
+                  returnsWithinOption: listing.returnsWithinOption,
+                  refundOption: listing.refundOption,
+                  returnShippingCostPaidBy: listing.returnShippingCostPaidBy,
+                  shippingProfileName: listing.shippingProfileName,
+                  returnProfileName: listing.returnProfileName,
+                  paymentProfileName: listing.paymentProfileName,
+                  customFields: customFieldsObj,
+                  amazonLink: listing.amazonLink,
+                  _asinReference: listing._asinReference,
+                  status: 'active',
+                  updatedAt: new Date(),
+                },
+                $setOnInsert: { createdAt: new Date(), downloadBatchId: null, pendingRedownload: false },
+              },
+              upsert: true,
+            },
+          };
+        });
+        await TemplateListing.bulkWrite(upsertOps, { ordered: false });
+        console.log(`📋 Snapshot (direct): upserted ${upsertOps.length} listing(s) for seller ${seller?.user?.username}`);
+      }
+    } catch (snapshotErr) {
+      console.error('Snapshot upsert (direct) failed (non-fatal):', snapshotErr.message);
+    }
+
+  } catch (error) {
+    console.error('Error exporting CSV (direct):', error);
     res.status(500).json({ error: error.message });
   }
 });

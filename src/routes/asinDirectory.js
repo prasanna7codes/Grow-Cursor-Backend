@@ -4,11 +4,11 @@ import { requireAuth } from '../middleware/auth.js';
 import { fetchAmazonData } from '../utils/asinAutofill.js';
 
 // Scrape a batch of ASINs in parallel (max 5 at a time) and return enrichment map
-async function scrapeAsinsBatched(asinList, batchSize = 5) {
+async function scrapeAsinsBatched(asinList, region = 'US', batchSize = 5) {
   const enrichmentMap = new Map();
   for (let i = 0; i < asinList.length; i += batchSize) {
     const batch = asinList.slice(i, i + batchSize);
-    const results = await Promise.allSettled(batch.map(asin => fetchAmazonData(asin)));
+    const results = await Promise.allSettled(batch.map(asin => fetchAmazonData(asin, region)));
     results.forEach((result, idx) => {
       const asin = batch[idx];
       if (result.status === 'fulfilled') {
@@ -41,7 +41,13 @@ router.get('/', requireAuth, async (req, res) => {
     }
     if (listProductId) {
       query.listProductId = listProductId;
+    } else if (req.query.showMoved !== 'true') {
+      // Default: hide ASINs already moved to a list
+      query.listProductId = null;
     }
+
+    const region = req.query.region || '';
+    if (region) query.region = region;
 
     // Get total count
     const total = await AsinDirectory.countDocuments(query);
@@ -65,10 +71,25 @@ router.get('/', requireAuth, async (req, res) => {
   }
 });
 
+// Get multiple ASINs by exact ASIN list (used by Proof Read flow)
+router.get('/by-asins', requireAuth, async (req, res) => {
+  try {
+    const { asins } = req.query; // comma-separated ASIN strings
+    if (!asins) return res.status(400).json({ error: 'asins query param required' });
+    const asinList = asins.split(',').map(a => a.trim().toUpperCase()).filter(Boolean);
+    const docs = await AsinDirectory.find({ asin: { $in: asinList } }).lean();
+    res.json(docs);
+  } catch (error) {
+    console.error('Error fetching ASINs by list:', error);
+    res.status(500).json({ error: 'Failed to fetch ASINs' });
+  }
+});
+
 // Get statistics
 router.get('/stats', requireAuth, async (req, res) => {
   try {
     const total = await AsinDirectory.countDocuments();
+    const unassigned = await AsinDirectory.countDocuments({ listProductId: null });
 
     const now = new Date();
     const todayStart = new Date(now.setHours(0, 0, 0, 0));
@@ -81,6 +102,8 @@ router.get('/stats', requireAuth, async (req, res) => {
 
     res.json({
       total,
+      unassigned,
+      assigned: total - unassigned,
       recentlyAdded: {
         today,
         thisWeek,
@@ -96,7 +119,7 @@ router.get('/stats', requireAuth, async (req, res) => {
 // Bulk add ASINs manually
 router.post('/bulk-manual', requireAuth, async (req, res) => {
   try {
-    const { asins } = req.body;
+    const { asins, region = 'US' } = req.body;
 
     if (!asins || !Array.isArray(asins)) {
       return res.status(400).json({ error: 'ASINs array is required' });
@@ -124,8 +147,8 @@ router.post('/bulk-manual', requireAuth, async (req, res) => {
     }
 
     // Scrape all valid ASINs in parallel batches
-    console.log(`🔍 Scraping ${validAsins.length} ASINs for directory enrichment...`);
-    const enrichmentMap = await scrapeAsinsBatched(validAsins);
+    console.log(`🔍 Scraping ${validAsins.length} ASINs for directory enrichment (${region})...`);
+    const enrichmentMap = await scrapeAsinsBatched(validAsins, region);
 
     // Insert ASINs with enrichment data
     for (const asin of validAsins) {
@@ -153,6 +176,7 @@ router.post('/bulk-manual', requireAuth, async (req, res) => {
           doc.scraped = false;
           doc.scrapeError = enrichment?.error || 'Scrape failed';
         }
+        doc.region = region;
 
         await AsinDirectory.create(doc);
         results.added++;
@@ -176,7 +200,7 @@ router.post('/bulk-manual', requireAuth, async (req, res) => {
 // Bulk add from CSV
 router.post('/bulk-csv', requireAuth, async (req, res) => {
   try {
-    const { csvData } = req.body;
+    const { csvData, region = 'US' } = req.body;
 
     if (!csvData) {
       return res.status(400).json({ error: 'CSV data is required' });
@@ -228,8 +252,8 @@ router.post('/bulk-csv', requireAuth, async (req, res) => {
 
     // Scrape all valid ASINs in parallel batches
     const asinStrings = asins.map(a => a.asin);
-    console.log(`🔍 Scraping ${asinStrings.length} ASINs for directory enrichment...`);
-    const enrichmentMap = await scrapeAsinsBatched(asinStrings);
+    console.log(`🔍 Scraping ${asinStrings.length} ASINs for directory enrichment (${region})...`);
+    const enrichmentMap = await scrapeAsinsBatched(asinStrings, region);
 
     // Insert ASINs with enrichment data
     for (const { asin, row } of asins) {
@@ -257,6 +281,7 @@ router.post('/bulk-csv', requireAuth, async (req, res) => {
           doc.scraped = false;
           doc.scrapeError = enrichment?.error || 'Scrape failed';
         }
+        doc.region = region;
 
         await AsinDirectory.create(doc);
         results.added++;
@@ -301,6 +326,38 @@ router.get('/export-csv', requireAuth, async (req, res) => {
   } catch (error) {
     console.error('Error exporting CSV:', error);
     res.status(500).json({ error: 'Failed to export CSV' });
+  }
+});
+
+// Manually update price and/or description for a single ASIN
+router.patch('/:id', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { price, description } = req.body;
+
+    if (price === undefined && description === undefined) {
+      return res.status(400).json({ error: 'At least one of price or description must be provided' });
+    }
+
+    const update = { manuallyEdited: true, manuallyEditedAt: new Date() };
+    if (price !== undefined) update.price = String(price).trim();
+    if (description !== undefined) update.description = String(description).trim();
+
+    const doc = await AsinDirectory.findByIdAndUpdate(
+      id,
+      { $set: update },
+      { new: true, runValidators: false }
+    );
+
+    if (!doc) {
+      return res.status(404).json({ error: 'ASIN not found' });
+    }
+
+    console.log(`✏️ [ASIN Directory] Manually edited ${doc.asin} (price: ${update.price ?? '—'}, description: ${description !== undefined ? 'updated' : '—'})`);
+    res.json(doc);
+  } catch (error) {
+    console.error('Error updating ASIN:', error);
+    res.status(500).json({ error: 'Failed to update ASIN' });
   }
 });
 

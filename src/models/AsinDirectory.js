@@ -39,11 +39,30 @@ const asinDirectorySchema = new mongoose.Schema({
   scrapedAt: { type: Date, default: null },
   scrapeError: { type: String, default: null },
 
+  // Manual edit tracking
+  manuallyEdited: { type: Boolean, default: false },
+  manuallyEditedAt: { type: Date, default: null },
+
+  // Listing count — increments every time this ASIN is listed in any template/seller
+  listingCount: {
+    type: Number,
+    default: 0,
+    min: 0
+  },
+
   // Assignment to a product list (Category → Range → Product)
   listProductId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'AsinListProduct',
     default: null,
+    index: true
+  },
+
+  // Marketplace / region this ASIN was scraped from
+  region: {
+    type: String,
+    default: 'US',
+    enum: ['US', 'UK', 'CA', 'AU'],
     index: true
   }
 });

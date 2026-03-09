@@ -199,6 +199,19 @@ const listingTemplateSchema = new mongoose.Schema({
     type: String,
     default: '*Action(SiteID=US|Country=US|Currency=USD|Version=1193)'
   },
+  // Assignment to the hierarchy: Range (required for directory page) + Product (optional sub-link)
+  rangeId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'AsinListRange',
+    default: null,
+    index: true
+  },
+  listProductId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'AsinListProduct',
+    default: null,
+    index: true
+  },
   createdBy: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'

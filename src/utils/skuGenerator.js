@@ -17,6 +17,21 @@ export const generateSKUFromASIN = (asin) => {
 };
 
 /**
+ * Generates SKU with count suffix for repeat listings of the same ASIN.
+ * count = 0 → first listing  → no suffix   (GRW25XXXXX)
+ * count = 1 → second listing → GRW25XXXXX-1
+ * count = N →                → GRW25XXXXX-N
+ * @param {string} asin - Amazon Standard Identification Number
+ * @param {number} currentCount - Current value of listingCount (read before increment)
+ * @returns {string} SKU with optional count suffix
+ */
+export const generateSKUWithCount = (asin, currentCount) => {
+  const base = generateSKUFromASIN(asin);
+  if (!currentCount || currentCount === 0) return base;
+  return `${base}-${currentCount}`;
+};
+
+/**
  * Validates if a string is a valid ASIN format
  * @param {string} asin - String to validate
  * @returns {boolean} True if valid ASIN format

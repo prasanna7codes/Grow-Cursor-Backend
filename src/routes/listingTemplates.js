@@ -138,7 +138,11 @@ router.delete('/:id/bulk-reset-overrides', requireAuth, async (req, res) => {
 // Get all templates
 router.get('/', requireAuth, async (req, res) => {
   try {
-    const templates = await ListingTemplate.find()
+    const { listProductId, rangeId } = req.query;
+    const filter = {};
+    if (rangeId) filter.rangeId = rangeId;
+    if (listProductId) filter.listProductId = listProductId;
+    const templates = await ListingTemplate.find(filter)
       .populate('createdBy', 'name email')
       .sort({ createdAt: -1 });
     
@@ -169,7 +173,7 @@ router.get('/:id', requireAuth, async (req, res) => {
 // Create new template
 router.post('/', requireAuth, async (req, res) => {
   try {
-    const { name, description, category, ebayCategory, customColumns, asinAutomation, pricingConfig, coreFieldDefaults } = req.body;
+    const { name, description, category, ebayCategory, customColumns, asinAutomation, pricingConfig, coreFieldDefaults, rangeId, listProductId } = req.body;
     
     if (!name) {
       return res.status(400).json({ error: 'Template name is required' });
@@ -190,6 +194,10 @@ router.post('/', requireAuth, async (req, res) => {
     if (coreFieldDefaults !== undefined) {
       templateData.coreFieldDefaults = coreFieldDefaults;
     }
+
+    // Add hierarchy assignment if provided
+    if (rangeId) templateData.rangeId = rangeId;
+    if (listProductId) templateData.listProductId = listProductId;
     
     const template = new ListingTemplate(templateData);
     
@@ -275,7 +283,7 @@ router.post('/:id/duplicate', requireAuth, async (req, res) => {
 // Update template
 router.put('/:id', requireAuth, async (req, res) => {
   try {
-    const { name, description, category, ebayCategory, customColumns, asinAutomation, pricingConfig, coreFieldDefaults, customActionField } = req.body;
+    const { name, description, category, ebayCategory, customColumns, asinAutomation, pricingConfig, coreFieldDefaults, customActionField, rangeId, listProductId } = req.body;
     
     const updateData = { 
       name, 
@@ -297,6 +305,10 @@ router.put('/:id', requireAuth, async (req, res) => {
     if (customActionField !== undefined) {
       updateData.customActionField = customActionField;
     }
+
+    // Add hierarchy assignment (allow explicit null to clear)
+    if (rangeId !== undefined) updateData.rangeId = rangeId || null;
+    if (listProductId !== undefined) updateData.listProductId = listProductId || null;
     
     const template = await ListingTemplate.findByIdAndUpdate(
       req.params.id,

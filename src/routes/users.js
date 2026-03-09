@@ -156,6 +156,16 @@ router.get('/check-exists', async (req, res) => {
   }
 });
 
+// GET / - fetch all active users
+router.get('/', requireAuth, async (req, res) => {
+  try {
+    const users = await User.find({ active: true }).select('username email role department');
+    res.json(users);
+  } catch (e) {
+    res.status(500).json({ error: 'Error fetching users' });
+  }
+});
+
 // PUT /:id/strict-timer - Toggle strict timer for a user (Superadmin only)
 router.put('/:id/strict-timer', requireAuth, requireRole('superadmin'), async (req, res) => {
   try {

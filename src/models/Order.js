@@ -93,6 +93,7 @@ const OrderSchema = new mongoose.Schema(
     azOrderId: String,
     amazonRefund: Number,
     cardName: String, // Reference to credit card name
+    resolution: { type: String, default: null },
     remark: {
       type: String,
       enum: [
@@ -152,6 +153,20 @@ const OrderSchema = new mongoose.Schema(
 
     // Tracks whether a message was sent to the buyer when the remark was last updated
     remarkMessageSent: { type: Boolean, default: false },
+
+    // Sourcing / Affiliate fields (used in the Affiliate Orders daily tracking page)
+    affiliateLink: { type: String, default: '' },
+    sourcingStatus: {
+      type: String,
+      enum: ['Done', 'Not Yet', 'Added to cart', 'Cancelled order'],
+      default: 'Not Yet'
+    },
+    purchaser: { type: String, default: '' },
+    sourcingMessageStatus: {
+      type: String,
+      enum: ['Being Processed', 'Late Message', 'Cancellation Message', 'Alternative Message', 'Confirmation Message'],
+      default: 'Being Processed'
+    },
   },
   { timestamps: true }
 );

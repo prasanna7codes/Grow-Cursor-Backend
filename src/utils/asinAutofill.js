@@ -10,22 +10,22 @@ import { getCachedAsinData, setCachedAsinData } from './asinCache.js';
  * Uses ScraperAPI for ALL product data (Title, Brand, Description, Images, Price)
  * Replaces PAAPI entirely
  */
-export async function fetchAmazonData(asin) {
+export async function fetchAmazonData(asin, region = 'US') {
   const startTime = Date.now();
   
   try {
-    console.log(`[fetchAmazonData] 🔍 Fetching product data for ASIN: ${asin}`);
+    console.log(`[fetchAmazonData] 🔍 Fetching product data for ASIN: ${asin} (${region})`);
     
     // Check cache first
-    const cached = getCachedAsinData(asin);
+    const cached = getCachedAsinData(asin, region);
     if (cached) {
       const cacheTime = Date.now() - startTime;
-      console.log(`[fetchAmazonData] ⚡ Cache hit for ${asin} (${cacheTime}ms)`);
+      console.log(`[fetchAmazonData] ⚡ Cache hit for ${asin} (${region}, ${cacheTime}ms)`);
       return cached;
     }
     
     // Single ScraperAPI call for ALL data
-    const scrapedData = await scrapeAmazonProductWithScraperAPI(asin, 'US');
+    const scrapedData = await scrapeAmazonProductWithScraperAPI(asin, region);
     
     const responseTime = Date.now() - startTime;
     
@@ -63,7 +63,7 @@ export async function fetchAmazonData(asin) {
     };
     
     // Cache the result for future requests
-    setCachedAsinData(asin, result);
+    setCachedAsinData(asin, result, region);
     
     return result;
   } catch (error) {

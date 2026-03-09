@@ -27,14 +27,16 @@ console.log(`[ASIN Cache] 🗄️ Initialized: ${CACHE_ENABLED ? 'ENABLED' : 'DI
 /**
  * Get cached ASIN data
  * @param {string} asin - Amazon ASIN
+ * @param {string} [region='US'] - Marketplace region
  * @returns {Object|null} - Cached data or null if not found
  */
-export function getCachedAsinData(asin) {
+export function getCachedAsinData(asin, region = 'US') {
   if (!CACHE_ENABLED) return null;
   
-  const cached = asinCache.get(`asin:${asin}`);
+  const key = `asin:${asin}_${region}`;
+  const cached = asinCache.get(key);
   if (cached) {
-    console.log(`[ASIN Cache] ✅ HIT: ${asin}`);
+    console.log(`[ASIN Cache] ✅ HIT: ${asin} (${region})`);
   }
   return cached || null;
 }
@@ -43,24 +45,30 @@ export function getCachedAsinData(asin) {
  * Store ASIN data in cache
  * @param {string} asin - Amazon ASIN
  * @param {Object} data - Product data to cache
+ * @param {string} [region='US'] - Marketplace region
  */
-export function setCachedAsinData(asin, data) {
+export function setCachedAsinData(asin, data, region = 'US') {
   if (!CACHE_ENABLED) return;
   
-  const success = asinCache.set(`asin:${asin}`, data);
+  const key = `asin:${asin}_${region}`;
+  const success = asinCache.set(key, data);
   if (success) {
-    console.log(`[ASIN Cache] 💾 STORED: ${asin}`);
+    console.log(`[ASIN Cache] 💾 STORED: ${asin} (${region})`);
   }
 }
 
 /**
- * Invalidate cache for specific ASIN
+ * Invalidate cache for specific ASIN (all regions)
  * @param {string} asin - Amazon ASIN
  */
 export function invalidateAsinCache(asin) {
-  const deleted = asinCache.del(`asin:${asin}`);
+  const regions = ['US', 'UK', 'CA', 'AU'];
+  let deleted = 0;
+  regions.forEach(region => {
+    deleted += asinCache.del(`asin:${asin}_${region}`);
+  });
   if (deleted) {
-    console.log(`[ASIN Cache] 🗑️ INVALIDATED: ${asin}`);
+    console.log(`[ASIN Cache] 🗑️ INVALIDATED: ${asin} (${deleted} region(s))`);
   }
   return deleted > 0;
 }

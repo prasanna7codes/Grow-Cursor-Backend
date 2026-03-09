@@ -82,6 +82,74 @@ router.post('/move', requireAuth, async (req, res) => {
   }
 });
 
+// Rename a product
+router.put('/:id', requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name } = req.body;
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: 'Product name is required' });
+    }
+    const updated = await AsinListProduct.findByIdAndUpdate(
+      id,
+      { name: name.trim() },
+      { new: true, runValidators: true }
+    );
+    if (!updated) return res.status(404).json({ error: 'Product not found' });
+    res.json(updated);
+  } catch (error) {
+    if (error.code === 11000) {
+      return res.status(409).json({ error: 'A product with that name already exists in this range' });
+    }
+    console.error('Error renaming product:', error);
+    res.status(500).json({ error: 'Failed to rename product' });
+  }
+});
+
+// Copy selected products (by id) into a target range
+router.post('/copy-to-range', requireAuth, async (req, res) => {
+  try {
+    const { productIds, targetRangeId } = req.body;
+    if (!productIds || !Array.isArray(productIds) || productIds.length === 0) {
+      return res.status(400).json({ error: 'productIds array is required' });
+    }
+    if (!targetRangeId) {
+      return res.status(400).json({ error: 'targetRangeId is required' });
+    }
+
+    // Import range model to get categoryId of target range
+    const AsinListRange = (await import('../models/AsinListRange.js')).default;
+    const targetRange = await AsinListRange.findById(targetRangeId).lean();
+    if (!targetRange) return res.status(404).json({ error: 'Target range not found' });
+
+    const sourceProducts = await AsinListProduct.find({ _id: { $in: productIds } }).lean();
+
+    let copied = 0;
+    const skippedNames = [];
+    for (const src of sourceProducts) {
+      try {
+        await AsinListProduct.create({
+          name: src.name,
+          rangeId: targetRangeId,
+          categoryId: targetRange.categoryId
+        });
+        copied++;
+      } catch (err) {
+        if (err.code === 11000) {
+          skippedNames.push(src.name);
+        } else {
+          throw err;
+        }
+      }
+    }
+
+    res.json({ copied, skipped: skippedNames.length, skippedNames });
+  } catch (error) {
+    console.error('Error copying products to range:', error);
+    res.status(500).json({ error: 'Failed to copy products' });
+  }
+});
+
 // Delete a product and orphan its assigned ASINs
 router.delete('/:id', requireAuth, async (req, res) => {
   try {

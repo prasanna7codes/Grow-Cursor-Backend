@@ -41,6 +41,7 @@ import ordersRoutes from './routes/orders.js';
 import uploadRoutes from './routes/upload.js';
 import creditCardRoutes from './routes/creditCards.js';
 import creditCardNameRoutes from './routes/creditCardNames.js';
+import resolutionOptionsRoutes from './routes/resolutionOptions.js';
 import exchangeRatesRoutes from './routes/exchangeRates.js';
 import internalMessagesRoutes from './routes/internalMessages.js';
 import payoneerRoutes from './routes/payoneer.js';
@@ -67,7 +68,14 @@ import leavesRoutes from './routes/leaves.js';
 
 import asinDirectoryRoutes from './routes/asinDirectory.js';
 import attendanceRoutes from './routes/attendance.js';
+import userSellersRoutes from './routes/userSellers.js';
+import salaryRoutes from './routes/salary.js';
+import aiRoutes from './routes/ai.js';
+import affiliateOrdersRoutes from './routes/affiliateOrders.js';
 import { initializeScheduledJobs } from './scheduledJobs.js';
+import swaggerUi from 'swagger-ui-express';
+import { swaggerSpec } from './swagger.js';
+import imageCache from './lib/imageCache.js';
 
 const app = express();
 
@@ -96,6 +104,13 @@ app.get('/health', (req, res) => {
   res.json({ ok: true });
 });
 
+// API Documentation
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
+  customSiteTitle: 'Grow – Buyer Chat API Docs',
+  swaggerOptions: { persistAuthorization: true }
+}));
+app.get('/api-docs.json', (req, res) => res.json(swaggerSpec));;
+
 
 
 app.use('/api/auth', authRoutes);
@@ -122,6 +137,7 @@ app.use('/api/orders', ordersRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/credit-cards', creditCardRoutes);
 app.use('/api/credit-card-names', creditCardNameRoutes);
+app.use('/api/resolution-options', resolutionOptionsRoutes);
 app.use('/api/exchange-rates', exchangeRatesRoutes);
 app.use('/api/internal-messages', internalMessagesRoutes);
 app.use('/api/payoneer', payoneerRoutes);
@@ -148,7 +164,10 @@ app.use('/api/asin-directory', asinDirectoryRoutes);
 // `/api/attendance` is a legacy endpoint name kept for compatibility;
 // it serves working-hours tracking behavior (timer sessions), not traditional attendance management.
 app.use('/api/attendance', attendanceRoutes);
-
+app.use('/api/user-sellers', userSellersRoutes);
+app.use('/api/salary', salaryRoutes);
+app.use('/api/ai', aiRoutes);
+app.use('/api/affiliate-orders', affiliateOrdersRoutes);
 
 const port = process.env.PORT || 5000;
 
@@ -169,6 +188,9 @@ connectToDatabase()
 
     // Initialize scheduled jobs (e.g., daily timer auto-stop)
     initializeScheduledJobs();
+
+    // Start image cache auto-cleanup (removes expired entries every 10 minutes)
+    imageCache.startAutoCleanup();
 
     app.listen(port, () => {
       console.log(`API listening on :${port}`);
