@@ -5,6 +5,7 @@ import AmazonAccountDailyBalance from '../models/AmazonAccountDailyBalance.js';
 import { requireAuth } from '../middleware/auth.js';
 
 const router = express.Router();
+const MAX_ORDERS_PER_AMAZON_ACCOUNT_PER_DAY = 9;
 
 // All routes require authentication
 router.use(requireAuth);
@@ -77,6 +78,10 @@ router.patch('/:id/sourcing', async (req, res) => {
             'purchaser',
             'sourcingMessageStatus',
             'amazonAccount',
+            'arrivingDate',
+            'beforeTax',
+            'estimatedTax',
+            'azOrderId',
             'beforeTaxUSD',
             'fulfillmentNotes',
         ];
@@ -92,13 +97,35 @@ router.patch('/:id/sourcing', async (req, res) => {
             return res.status(400).json({ error: 'No valid fields provided' });
         }
 
+        const existingOrder = await Order.findById(req.params.id).select('dateSold amazonAccount').lean();
+        if (!existingOrder) return res.status(404).json({ error: 'Order not found' });
+
+        // Enforce daily cap when assigning/changing amazon account.
+        if (update.amazonAccount !== undefined && update.amazonAccount !== null && update.amazonAccount !== '') {
+            const soldDate = existingOrder.dateSold;
+            const normalizedDate = soldDate instanceof Date
+                ? soldDate.toISOString().slice(0, 10)
+                : new Date(soldDate).toISOString().slice(0, 10);
+            const { start, end } = buildDayRange(normalizedDate);
+
+            const assignedCount = await Order.countDocuments({
+                _id: { $ne: req.params.id },
+                dateSold: { $gte: start, $lte: end },
+                amazonAccount: update.amazonAccount,
+            });
+
+            if (assignedCount >= MAX_ORDERS_PER_AMAZON_ACCOUNT_PER_DAY) {
+                return res.status(400).json({
+                    error: `Cannot assign more than ${MAX_ORDERS_PER_AMAZON_ACCOUNT_PER_DAY} orders to ${update.amazonAccount} for this day`,
+                });
+            }
+        }
+
         const order = await Order.findByIdAndUpdate(
             req.params.id,
             { $set: update },
             { new: true, runValidators: true }
         ).lean();
-
-        if (!order) return res.status(404).json({ error: 'Order not found' });
 
         res.json(order);
     } catch (err) {
@@ -143,7 +170,14 @@ router.get('/balances', async (req, res) => {
             {
                 $group: {
                     _id: '$amazonAccount',
-                    totalExpense: { $sum: { $ifNull: ['$beforeTaxUSD', 0] } },
+                    totalExpense: {
+                        $sum: {
+                            $multiply: [
+                                { $ifNull: ['$beforeTaxUSD', 0] },
+                                1.1,
+                            ],
+                        },
+                    },
                     orderCount: { $sum: 1 },
                 },
             },
@@ -165,19 +199,21 @@ router.get('/balances', async (req, res) => {
         const rows = accounts.map((acc) => {
             const bal = balanceMap[acc.name] || {};
             const exp = expenseMap[acc.name] || { totalExpense: 0, orderCount: 0 };
-            const availableBalance = bal.availableBalance ?? 0;
-            const addedBalance = bal.addedBalance ?? 0;
-            const difference = availableBalance + addedBalance - exp.totalExpense;
+            const availableBalance = Number(bal.availableBalance ?? 0);
+            const addedBalance = Number(bal.addedBalance ?? 0);
+            const totalExpense = Number(exp.totalExpense ?? 0);
+            const difference = availableBalance + addedBalance - totalExpense;
 
             return {
                 _id: bal._id || null,
                 amazonAccountName: acc.name,
                 date,
-                totalExpense: exp.totalExpense,
+                totalExpense,
                 orderCount: exp.orderCount,
                 availableBalance,
                 addedBalance,
-                giftCardStatus: bal.giftCardStatus ?? false,
+                // Auto-driven status: checked when this account has positive remaining balance.
+                giftCardStatus: difference > 0,
                 note: bal.note ?? '',
                 difference,
             };
@@ -234,7 +270,8 @@ router.get('/summary', async (req, res) => {
         const { start, end } = buildDayRange(date);
 
         // Build query
-        const query = { dateSold: { $gte: start, $lte: end } };
+        const dayQuery = { dateSold: { $gte: start, $lte: end } };
+        const query = { ...dayQuery };
         if (excludeLowValue === 'true') {
             query.$and = [
                 {
@@ -249,7 +286,7 @@ router.get('/summary', async (req, res) => {
 
         // All orders that day
         const orders = await Order.find(query)
-            .select('purchaser sourcingStatus beforeTaxUSD amazonExchangeRate')
+            .select('purchaser sourcingStatus beforeTaxUSD amazonExchangeRate amazonAccount')
             .lean();
 
         const totalOrders = orders.length;
@@ -270,6 +307,36 @@ router.get('/summary', async (req, res) => {
         }
         const byPurchaser = Object.entries(purchaserMap).map(([name, count]) => ({ name, count }));
 
+        // Per-Amazon-account assignment counts (always full day, independent of low-value filter).
+        const accountOrders = await Order.find(dayQuery).select('amazonAccount').lean();
+        const accountMap = {};
+        for (const o of accountOrders) {
+            const accountName = o.amazonAccount || '(Unassigned)';
+            accountMap[accountName] = (accountMap[accountName] || 0) + 1;
+        }
+
+        const accounts = await AmazonAccount.find().select('name').sort({ name: 1 }).lean();
+        const byAmazonAccount = accounts.map((acc) => {
+            const count = accountMap[acc.name] || 0;
+            return {
+                name: acc.name,
+                count,
+                max: MAX_ORDERS_PER_AMAZON_ACCOUNT_PER_DAY,
+                remaining: Math.max(0, MAX_ORDERS_PER_AMAZON_ACCOUNT_PER_DAY - count),
+                isFull: count >= MAX_ORDERS_PER_AMAZON_ACCOUNT_PER_DAY,
+            };
+        });
+
+        if (accountMap['(Unassigned)']) {
+            byAmazonAccount.push({
+                name: '(Unassigned)',
+                count: accountMap['(Unassigned)'],
+                max: null,
+                remaining: null,
+                isFull: false,
+            });
+        }
+
         // Total added balance across all accounts that day
         const balances = await AmazonAccountDailyBalance.find({ date }).lean();
         const totalAmountAdded = balances.reduce((s, b) => s + (b.addedBalance || 0), 0);
@@ -283,6 +350,8 @@ router.get('/summary', async (req, res) => {
             ordersNotDone,
             totalAmountAdded,
             byPurchaser,
+            byAmazonAccount,
+            maxOrdersPerAmazonAccount: MAX_ORDERS_PER_AMAZON_ACCOUNT_PER_DAY,
         });
     } catch (err) {
         console.error('GET /affiliate-orders/summary error:', err);
