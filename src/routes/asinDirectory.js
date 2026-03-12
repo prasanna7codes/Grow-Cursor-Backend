@@ -37,7 +37,10 @@ router.get('/', requireAuth, async (req, res) => {
     // Build query
     let query = {};
     if (search) {
-      query.asin = { $regex: search.toUpperCase(), $options: 'i' };
+      query.$or = [
+        { asin: { $regex: search, $options: 'i' } },
+        { title: { $regex: search, $options: 'i' } },
+      ];
     }
     if (listProductId) {
       query.listProductId = listProductId;

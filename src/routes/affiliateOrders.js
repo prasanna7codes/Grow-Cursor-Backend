@@ -72,12 +72,13 @@ router.patch('/:id/sourcing', async (req, res) => {
     try {
         const ALLOWED_FIELDS = [
             'affiliateLink',
+            'affiliateLinks',
             'sourcingStatus',
             'purchaser',
             'sourcingMessageStatus',
             'amazonAccount',
             'beforeTaxUSD',
-            'notes',
+            'fulfillmentNotes',
         ];
 
         const update = {};

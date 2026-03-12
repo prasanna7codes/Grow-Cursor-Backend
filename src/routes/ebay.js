@@ -28,6 +28,7 @@ import multer from 'multer';
 import FeedUpload from '../models/FeedUpload.js';
 import UserSellerAssignment from '../models/UserSellerAssignment.js';
 import UserDailyQuantity from '../models/UserDailyQuantity.js';
+import CompatibilityBatchLog from '../models/CompatibilityBatchLog.js';
 import User from '../models/User.js';
 
 const upload = multer({ storage: multer.memoryStorage() });
@@ -971,7 +972,7 @@ async function sendAutoWelcomeMessage(seller, order) {
 // HELPER: Extract clean text from HTML email bodies
 function extractTextFromHtml(html) {
   if (!html) return '';
-  
+
   // Check if it's actually HTML (contains tags)
   if (!/<[^>]+>/.test(html)) {
     return html.trim();
@@ -996,7 +997,7 @@ function extractTextFromHtml(html) {
 
   // Remove all HTML tags
   cleanText = cleanText.replace(/<[^>]+>/g, ' ');
-  
+
   // Decode common HTML entities
   cleanText = cleanText
     .replace(/&nbsp;/g, ' ')
@@ -1006,7 +1007,7 @@ function extractTextFromHtml(html) {
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
     .replace(/&apos;/g, "'");
-  
+
   // Clean up whitespace
   cleanText = cleanText
     .replace(/\s+/g, ' ')  // Multiple spaces to single space
@@ -1567,7 +1568,7 @@ router.get('/order/:orderId', requireAuth, requireRole('fulfillmentadmin', 'supe
 
 // Get stored orders from database with pagination support
 router.get('/stored-orders', async (req, res) => {
-  const { sellerId, page = 1, limit = 50, searchOrderId, searchBuyerName, searchItemId, searchMarketplace, paymentStatus, startDate, endDate, awaitingShipment, hasFulfillmentNotes, amazonArriving, arrivalSort, amazonAccount, arrivalStartDate, arrivalEndDate, arrivalDateFrom, arrivalDateTo, productName } = req.query;
+  const { sellerId, page = 1, limit = 50, searchOrderId, searchAzOrderId, searchBuyerName, searchItemId, searchMarketplace, paymentStatus, startDate, endDate, awaitingShipment, hasFulfillmentNotes, amazonArriving, arrivalSort, amazonAccount, arrivalStartDate, arrivalEndDate, arrivalDateFrom, arrivalDateTo, productName } = req.query;
 
   try {
     let query = {};
@@ -1635,6 +1636,10 @@ router.get('/stored-orders', async (req, res) => {
       query.orderId = { $regex: searchOrderId, $options: 'i' };
     }
 
+    if (searchAzOrderId) {
+      query.azOrderId = { $regex: searchAzOrderId, $options: 'i' };
+    }
+
     if (searchBuyerName) {
       query['buyer.buyerRegistrationAddress.fullName'] = { $regex: searchBuyerName, $options: 'i' };
     }
@@ -1667,22 +1672,46 @@ router.get('/stored-orders', async (req, res) => {
       }
     }
 
-    // Timezone-Aware Date Range Logic
+    // Timezone-Aware Date Range Logic (Pacific Time)
+    // Note: Pacific Time observes DST, so it's UTC-8 (PST) or UTC-7 (PDT)
+    // In March 2026, DST starts March 8, so after that date it's PDT (UTC-7)
     if (startDate || endDate) {
       query.dateSold = {};
-      const PST_OFFSET_HOURS = 8;
 
       if (startDate) {
-        const start = new Date(startDate);
-        start.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0);
-        query.dateSold.$gte = start;
+        // Midnight PT on start date
+        // Parse the date and determine if it falls in DST period
+        const refDate = new Date(startDate + 'T12:00:00Z'); // noon UTC as reference
+        const year = refDate.getUTCFullYear();
+        
+        // DST in US: Second Sunday in March to First Sunday in November
+        // For simplification, check if month is March-November
+        const month = refDate.getUTCMonth(); // 0-indexed: 0=Jan, 2=Mar, 10=Nov
+        const isDST = month >= 2 && month <= 10; // March(2) through November(10)
+        
+        // But need more precision for March and November
+        // For now, use simple logic: if March and day >= 8, use PDT
+        const day = refDate.getUTCDate();
+        const usePDT = (month > 2 && month < 10) || (month === 2 && day >= 8) || (month === 10 && day < 2);
+        
+        // Midnight PT = 07:00 UTC (PDT) or 08:00 UTC (PST)
+        const startUTC = new Date(startDate + 'T00:00:00Z');
+        startUTC.setUTCHours(usePDT ? 7 : 8, 0, 0, 0);
+        query.dateSold.$gte = startUTC;
       }
 
       if (endDate) {
-        const end = new Date(endDate);
-        end.setDate(end.getDate() + 1);
-        end.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999);
-        query.dateSold.$lte = end;
+        // 23:59:59.999 PT on end date
+        const refDate = new Date(endDate + 'T12:00:00Z');
+        const month = refDate.getUTCMonth();
+        const day = refDate.getUTCDate();
+        const usePDT = (month > 2 && month < 10) || (month === 2 && day >= 8) || (month === 10 && day < 2);
+        
+        // End of day PT: 06:59:59.999 UTC next day (PDT) or 07:59:59.999 UTC next day (PST)
+        const endUTC = new Date(endDate + 'T00:00:00Z');
+        endUTC.setUTCDate(endUTC.getUTCDate() + 1);
+        endUTC.setUTCHours(usePDT ? 6 : 7, 59, 59, 999);
+        query.dateSold.$lte = endUTC;
       }
     }
 
@@ -1695,37 +1724,45 @@ router.get('/stored-orders', async (req, res) => {
       query.orderPaymentStatus = paymentStatus;
     }
 
-    // Ship By Date Filter
+    // Ship By Date Filter (Pacific Time - handles DST)
     if (req.query.shipByDate) {
       const shipByDate = req.query.shipByDate;
-      const PST_OFFSET_HOURS = 8;
+      
+      const refDate = new Date(shipByDate + 'T12:00:00Z');
+      const month = refDate.getUTCMonth();
+      const day = refDate.getUTCDate();
+      const usePDT = (month > 2 && month < 10) || (month === 2 && day >= 8) || (month === 10 && day < 2);
 
-      // Start of ship-by date in UTC (midnight PST = 8am UTC)
-      const startOfDay = new Date(shipByDate);
-      startOfDay.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0);
+      // Start of ship-by date in PT (midnight)
+      const startOfDay = new Date(shipByDate + 'T00:00:00Z');
+      startOfDay.setUTCHours(usePDT ? 7 : 8, 0, 0, 0);
 
-      // End of ship-by date in UTC (11:59:59 PM PST = 7:59:59 AM UTC next day)
-      const endOfDay = new Date(shipByDate);
-      endOfDay.setDate(endOfDay.getDate() + 1);
-      endOfDay.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999);
+      // End of ship-by date in PT (23:59:59.999)
+      const endOfDay = new Date(shipByDate + 'T00:00:00Z');
+      endOfDay.setUTCDate(endOfDay.getUTCDate() + 1);
+      endOfDay.setUTCHours(usePDT ? 6 : 7, 59, 59, 999);
 
       query.shipByDate = { $gte: startOfDay, $lte: endOfDay };
     }
 
-    // Date Sold Specific Day Filter (req.query.dateSold)
+    // Date Sold Specific Day Filter (req.query.dateSold) - Pacific Time
     // This is different from startDate/endDate range, it targets a single specific day
     if (req.query.dateSold) {
       const dateSold = req.query.dateSold;
-      const PST_OFFSET_HOURS = 8;
+      
+      const refDate = new Date(dateSold + 'T12:00:00Z');
+      const month = refDate.getUTCMonth();
+      const day = refDate.getUTCDate();
+      const usePDT = (month > 2 && month < 10) || (month === 2 && day >= 8) || (month === 10 && day < 2);
 
-      // Start of sold date in UTC (midnight PST = 8am UTC)
-      const startOfDay = new Date(dateSold);
-      startOfDay.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0);
+      // Start of sold date in PT (midnight)
+      const startOfDay = new Date(dateSold + 'T00:00:00Z');
+      startOfDay.setUTCHours(usePDT ? 7 : 8, 0, 0, 0);
 
-      // End of sold date in UTC (11:59:59 PM PST = 7:59:59 AM UTC next day)
-      const endOfDay = new Date(dateSold);
-      endOfDay.setDate(endOfDay.getDate() + 1);
-      endOfDay.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999);
+      // End of sold date in PT (23:59:59.999)
+      const endOfDay = new Date(dateSold + 'T00:00:00Z');
+      endOfDay.setUTCDate(endOfDay.getUTCDate() + 1);
+      endOfDay.setUTCHours(usePDT ? 6 : 7, 59, 59, 999);
 
       // If startDate/endDate were already set, this specific date filter overrides or intersects
       // For simplicity in this specific "Awaiting Shipment" context, we'll let this take precedence if set
@@ -1852,22 +1889,31 @@ router.get('/all-orders-usd', async (req, res) => {
       query['buyer.buyerRegistrationAddress.fullName'] = { $regex: searchBuyerName, $options: 'i' };
     }
 
-    // Timezone-Aware Date Range Logic
+    // Timezone-Aware Date Range Logic (Pacific Time - handles DST)
     if (startDate || endDate) {
       query.dateSold = {};
-      const PST_OFFSET_HOURS = 8;
 
       if (startDate) {
-        const start = new Date(startDate);
-        start.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0);
-        query.dateSold.$gte = start;
+        const refDate = new Date(startDate + 'T12:00:00Z');
+        const month = refDate.getUTCMonth();
+        const day = refDate.getUTCDate();
+        const usePDT = (month > 2 && month < 10) || (month === 2 && day >= 8) || (month === 10 && day < 2);
+        
+        const startUTC = new Date(startDate + 'T00:00:00Z');
+        startUTC.setUTCHours(usePDT ? 7 : 8, 0, 0, 0);
+        query.dateSold.$gte = startUTC;
       }
 
       if (endDate) {
-        const end = new Date(endDate);
-        end.setDate(end.getDate() + 1);
-        end.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999);
-        query.dateSold.$lte = end;
+        const refDate = new Date(endDate + 'T12:00:00Z');
+        const month = refDate.getUTCMonth();
+        const day = refDate.getUTCDate();
+        const usePDT = (month > 2 && month < 10) || (month === 2 && day >= 8) || (month === 10 && day < 2);
+        
+        const endUTC = new Date(endDate + 'T00:00:00Z');
+        endUTC.setUTCDate(endUTC.getUTCDate() + 1);
+        endUTC.setUTCHours(usePDT ? 6 : 7, 59, 59, 999);
+        query.dateSold.$lte = endUTC;
       }
     }
 
@@ -4189,6 +4235,9 @@ const QUANTITY_UPDATE_EXCLUDED_ITEMS = new Set([
   '389707470348',
   '389707471563',
   '389707471798',
+  '389719944291',
+  '389719946273',
+  '389719946325',
 
 
 
@@ -6178,13 +6227,13 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
       for (const order of matchingOrders) {
         if (!existingOrderIds.has(order.orderId)) {
           const itemId = order.lineItems?.[0]?.legacyItemId || null;
-          
+
           // Look up product image for this item (try listing first, then order lineItem)
           let productImageUrl = null;
           if (itemId) {
             const listing = await Listing.findOne({ itemId }).select('mainImageUrl').lean();
             productImageUrl = listing?.mainImageUrl || null;
-            
+
             // Fallback: Check if order lineItem has imageUrl
             if (!productImageUrl && order.lineItems?.[0]?.imageUrl) {
               productImageUrl = order.lineItems[0].imageUrl;
@@ -7162,6 +7211,173 @@ router.post('/update-compatibility', requireAuth, async (req, res) => {
 
     res.json({ success: true, warning: warningMessage });
 
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// BULK UPDATE COMPATIBILITY (Batch Send)
+// POST /api/ebay/bulk-update-compatibility
+// Body: { sellerId, items: [{ itemId, title, sku, compatibilityList }] }
+// Processes items sequentially to avoid rate limits.
+// Returns per-item results and creates a CompatibilityBatchLog.
+// ============================================
+router.post('/bulk-update-compatibility', requireAuth, async (req, res) => {
+  const { sellerId, items, totalItems: clientTotalItems, skippedCount: clientSkippedCount } = req.body;
+  if (!sellerId || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ error: 'sellerId and non-empty items array required' });
+  }
+
+  try {
+    const seller = await Seller.findById(sellerId);
+    if (!seller) return res.status(404).json({ error: 'Seller not found' });
+    const token = await ensureValidToken(seller);
+
+    const results = [];
+    let successCount = 0;
+    let failureCount = 0;
+
+    // Process items sequentially to respect eBay rate limits
+    for (const entry of items) {
+      const { itemId, title, sku, compatibilityList } = entry;
+      try {
+        let itemInnerContent = `<ItemID>${itemId}</ItemID>`;
+
+        if (!compatibilityList || compatibilityList.length === 0) {
+          itemInnerContent += `<ItemCompatibilityList><ReplaceAll>true</ReplaceAll></ItemCompatibilityList>`;
+        } else {
+          let compatXml = '<ItemCompatibilityList><ReplaceAll>true</ReplaceAll>';
+          compatibilityList.forEach(c => {
+            compatXml += '<Compatibility>';
+            if (c.notes) compatXml += `<CompatibilityNotes>${escapeXml(c.notes)}</CompatibilityNotes>`;
+            c.nameValueList.forEach(nv => {
+              compatXml += `<NameValueList><Name>${escapeXml(nv.name)}</Name><Value>${escapeXml(nv.value)}</Value></NameValueList>`;
+            });
+            compatXml += '</Compatibility>';
+          });
+          compatXml += '</ItemCompatibilityList>';
+          itemInnerContent += compatXml;
+        }
+
+        const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+          <ReviseFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+            <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
+            <ErrorLanguage>en_US</ErrorLanguage>
+            <WarningLevel>High</WarningLevel>
+            <Item>${itemInnerContent}</Item>
+          </ReviseFixedPriceItemRequest>`;
+
+        const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
+          headers: { 'X-EBAY-API-SITEID': '100', 'X-EBAY-API-COMPATIBILITY-LEVEL': '1423', 'X-EBAY-API-CALL-NAME': 'ReviseFixedPriceItem', 'Content-Type': 'text/xml' }
+        });
+
+        const result = await parseStringPromise(response.data);
+        const ack = result.ReviseFixedPriceItemResponse.Ack[0];
+
+        if (ack === 'Failure') {
+          const errors = result.ReviseFixedPriceItemResponse.Errors || [];
+          const errorMessage = errors.map(e => e.LongMessage[0]).join('; ');
+
+          // If rate limited, stop processing remaining items
+          const isRateLimitError = errorMessage.includes('exceeded usage limit') || errorMessage.includes('call limit');
+          if (isRateLimitError) {
+            results.push({ itemId, title, sku, status: 'failure', error: 'Rate limit reached', compatibilityCount: compatibilityList?.length || 0 });
+            failureCount++;
+            // Mark all remaining items as failed due to rate limit
+            const currentIdx = items.indexOf(entry);
+            for (let i = currentIdx + 1; i < items.length; i++) {
+              results.push({ itemId: items[i].itemId, title: items[i].title, sku: items[i].sku, status: 'failure', error: 'Skipped - rate limit reached on earlier item', compatibilityCount: items[i].compatibilityList?.length || 0 });
+              failureCount++;
+            }
+            break;
+          }
+
+          results.push({ itemId, title, sku, status: 'failure', error: errorMessage, compatibilityCount: compatibilityList?.length || 0 });
+          failureCount++;
+        } else {
+          // Success or Warning — update local DB
+          await Listing.findOneAndUpdate({ itemId }, { compatibility: compatibilityList });
+          let warning = null;
+          if (ack === 'Warning') {
+            const warnings = result.ReviseFixedPriceItemResponse.Errors || [];
+            const meaningful = warnings.filter(err => {
+              const msg = err.LongMessage[0];
+              return !msg.includes("If this item sells by a Best Offer") && !msg.includes("Funds from your sales may be unavailable");
+            });
+            if (meaningful.length > 0) warning = meaningful.map(e => e.LongMessage[0]).join('; ');
+          }
+          results.push({ itemId, title, sku, status: 'success', error: warning || null, compatibilityCount: compatibilityList?.length || 0 });
+          successCount++;
+        }
+      } catch (itemErr) {
+        results.push({ itemId, title, sku, status: 'failure', error: itemErr.message, compatibilityCount: compatibilityList?.length || 0 });
+        failureCount++;
+      }
+    }
+
+    // Save batch log
+    const now = new Date();
+    const dateStr = now.toISOString().slice(0, 10);
+    const batchLog = await CompatibilityBatchLog.create({
+      user: req.user.userId,
+      seller: sellerId,
+      totalItems: clientTotalItems || items.length,
+      correctCount: items.length,
+      skippedCount: clientSkippedCount || 0,
+      successCount,
+      failureCount,
+      status: 'completed',
+      items: results,
+      date: dateStr,
+    });
+
+    res.json({ success: true, batchLogId: batchLog._id, successCount, failureCount, results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================
+// COMPATIBILITY BATCH HISTORY
+// GET /api/ebay/compatibility-batch-history
+// Query: ?sellerId=...&startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&page=1&limit=20
+// ============================================
+router.get('/compatibility-batch-history', requireAuth, async (req, res) => {
+  try {
+    const { sellerId, startDate, endDate, page = 1, limit = 20 } = req.query;
+    const filter = {};
+    if (sellerId) filter.seller = sellerId;
+    if (startDate || endDate) {
+      filter.date = {};
+      if (startDate) filter.date.$gte = startDate;
+      if (endDate) filter.date.$lte = endDate;
+    }
+
+    const total = await CompatibilityBatchLog.countDocuments(filter);
+    const logs = await CompatibilityBatchLog.find(filter)
+      .sort({ createdAt: -1 })
+      .skip((Number(page) - 1) * Number(limit))
+      .limit(Number(limit))
+      .populate('user', 'username name')
+      .populate('seller')
+      .lean();
+
+    // Populate seller username via seller.user
+    const sellerUserIds = logs.filter(l => l.seller?.user).map(l => l.seller.user);
+    let sellerUserMap = {};
+    if (sellerUserIds.length > 0) {
+      const User = mongoose.model('User');
+      const users = await User.find({ _id: { $in: sellerUserIds } }, { username: 1 }).lean();
+      users.forEach(u => { sellerUserMap[u._id.toString()] = u.username; });
+    }
+
+    const enriched = logs.map(log => ({
+      ...log,
+      sellerUsername: log.seller?.user ? (sellerUserMap[log.seller.user.toString()] || 'Unknown') : 'Unknown',
+    }));
+
+    res.json({ logs: enriched, total, pages: Math.ceil(total / Number(limit)) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -8207,17 +8423,26 @@ router.get('/seller-analytics', requireAuth, requireRole('fulfillmentadmin', 'su
       ]
     };
 
-    // Timezone-Aware Date Range Logic (PST - same as FulfillmentDashboard)
-    const PST_OFFSET_HOURS = 8;
+    // Timezone-Aware Date Range Logic (Pacific Time - handles DST)
     matchQuery.dateSold = {};
 
-    const start = new Date(startDate);
-    start.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0);
+    const startRefDate = new Date(startDate + 'T12:00:00Z');
+    const startMonth = startRefDate.getUTCMonth();
+    const startDay = startRefDate.getUTCDate();
+    const startUsePDT = (startMonth > 2 && startMonth < 10) || (startMonth === 2 && startDay >= 8) || (startMonth === 10 && startDay < 2);
+    
+    const start = new Date(startDate + 'T00:00:00Z');
+    start.setUTCHours(startUsePDT ? 7 : 8, 0, 0, 0);
     matchQuery.dateSold.$gte = start;
 
-    const end = new Date(endDate);
-    end.setDate(end.getDate() + 1);
-    end.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999);
+    const endRefDate = new Date(endDate + 'T12:00:00Z');
+    const endMonth = endRefDate.getUTCMonth();
+    const endDay = endRefDate.getUTCDate();
+    const endUsePDT = (endMonth > 2 && endMonth < 10) || (endMonth === 2 && endDay >= 8) || (endMonth === 10 && endDay < 2);
+    
+    const end = new Date(endDate + 'T00:00:00Z');
+    end.setUTCDate(end.getUTCDate() + 1);
+    end.setUTCHours(endUsePDT ? 6 : 7, 59, 59, 999);
     matchQuery.dateSold.$lte = end;
 
     if (sellerId) {
@@ -9439,7 +9664,7 @@ router.get('/upcoming-payouts/:sellerId', requireAuth, requireRole('fulfillmenta
     });
 
     const allPayouts = payoutsRes.data?.payouts || [];
-    
+
     // Filter for upcoming and recent payouts (INITIATED, or recent SUCCEEDED within 30 days)
     const now = new Date();
     const thirtyDaysAgo = new Date(now);
