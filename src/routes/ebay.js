@@ -7426,13 +7426,228 @@ const purgeInvalidFromCache = async (errorMessage) => {
   }
 };
 
+// Helper: Update compatibility using eBay Inventory REST API
+// PUT /sell/inventory/v1/inventory_item/{sku}/product_compatibility
+// This avoids the "duplicate listing" error from the Trading API (ReviseItem)
+// when the same SKU already has an active listing on eBay.
+// marketplaceId is required for eBay Motors listings (EBAY_MOTORS) — without it
+// the API returns a generic 500/25001 because it can't route the request correctly.
+async function updateCompatibilityViaInventoryAPI(token, sku, compatibilityList, marketplaceId = 'EBAY_MOTORS') {
+  const encodedSku = encodeURIComponent(sku);
+  const baseUrl = `https://api.ebay.com/sell/inventory/v1/inventory_item/${encodedSku}/product_compatibility`;
+
+  const baseHeaders = {
+    'Authorization': `Bearer ${token}`,
+    'X-EBAY-C-MARKETPLACE-ID': marketplaceId
+  };
+
+  // Clearing all compatibility → DELETE endpoint
+  if (!compatibilityList || compatibilityList.length === 0) {
+    const response = await axios.delete(baseUrl, { headers: baseHeaders });
+    return { statusCode: response.status, warnings: [] };
+  }
+
+  // Build Inventory API payload — compatibilityProperties uses lowercase names
+  const compatibleProducts = compatibilityList.map(c => {
+    const entry = {
+      compatibilityProperties: c.nameValueList.map(nv => ({
+        name: nv.name.toLowerCase(),
+        value: nv.value
+      }))
+    };
+    if (c.notes) entry.notes = c.notes;
+    return entry;
+  });
+
+  const response = await axios.put(
+    baseUrl,
+    { compatibleProducts },
+    {
+      headers: {
+        ...baseHeaders,
+        'Content-Type': 'application/json',
+        'Content-Language': 'en-US'
+      }
+    }
+  );
+  return { statusCode: response.status, warnings: response.data?.warnings || [] };
+}
+
+// Helper: Migrate a Trading-API listing into eBay's Inventory system, then set compatibility.
+// When a listing was created via the Trading API its SKU doesn't exist in the Inventory system,
+// so createOrReplaceProductCompatibility returns 404/25702.  Migrating it first registers the
+// SKU so the Inventory API can manage it.  Migration is transparent to buyers — the live listing
+// URL, feedback, and sales history are all preserved.  After migration, ReviseItem/
+// ReviseFixedPriceItem will no longer work for this listing, but since they were already
+// failing with the "duplicate listing" error this is no loss.
+async function migrateListingAndSetCompatibility(token, sku, itemId, compatibilityList) {
+  const migrateResponse = await axios.post(
+    'https://api.ebay.com/sell/inventory/v1/bulk_migrate_listing',
+    { requests: [{ listingId: String(itemId) }] },
+    { headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' } }
+  );
+
+  const responses = migrateResponse.data?.responses || [];
+  const migrated = responses.find(r => r.listingId === String(itemId));
+
+  if (!migrated) {
+    throw new Error(`Migration returned no response for listing ${itemId}`);
+  }
+
+  // Log full migration response for diagnostics
+  console.log(`[Compatibility] Migration response for listing ${itemId}:`, JSON.stringify(migrated, null, 2));
+
+  if (migrated.statusCode !== 200) {
+    const errMsg = (migrated.errors || migrated.warnings || [])
+      .map(e => e.longMessage || e.message).join('; ') || `Migration statusCode: ${migrated.statusCode}`;
+    throw new Error(errMsg);
+  }
+
+  // Use the SKU eBay assigned during migration (may differ from our local record)
+  const effectiveSku = migrated.sku || sku;
+  // Use the marketplace eBay confirmed for this listing — required for the compatibility endpoint
+  const effectiveMarketplace = migrated.marketplaceId || 'EBAY_MOTORS';
+  if (effectiveSku !== sku) {
+    console.log(`[Compatibility] Migration assigned SKU "${effectiveSku}" (local record had "${sku}")`);
+  }
+
+  console.log(`[Compatibility] Successfully migrated listing ${itemId} (SKU "${effectiveSku}") to Inventory API`);
+
+  // Verify the inventory item exists before trying compatibility
+  // eBay needs time to propagate the migration; poll the inventory item endpoint
+  // until it appears or we time out.
+  const pollDelays = [3000, 5000, 10000, 15000];
+  let inventoryItemReady = false;
+
+  for (let i = 0; i < pollDelays.length; i++) {
+    await new Promise(r => setTimeout(r, pollDelays[i]));
+    try {
+      await axios.get(
+        `https://api.ebay.com/sell/inventory/v1/inventory_item/${encodeURIComponent(effectiveSku)}`,
+        { headers: { 'Authorization': `Bearer ${token}` } }
+      );
+      inventoryItemReady = true;
+      console.log(`[Compatibility] Inventory item "${effectiveSku}" confirmed ready (poll ${i + 1})`);
+      break;
+    } catch (pollErr) {
+      if (pollErr.response?.status === 404) {
+        console.log(`[Compatibility] Inventory item "${effectiveSku}" not yet visible (poll ${i + 1}), waiting...`);
+      } else {
+        // Non-404 error from the poll itself — proceed and let compatibility call reveal true status
+        console.log(`[Compatibility] Inventory item poll ${i + 1} returned ${pollErr.response?.status} — proceeding`);
+        inventoryItemReady = true;
+        break;
+      }
+    }
+  }
+
+  if (!inventoryItemReady) {
+    const err = new Error(`Listing ${itemId} was migrated but inventory item "${effectiveSku}" never became visible after polling. eBay may need more time — please retry in a few minutes.`);
+    err.postMigrationFailure = true;
+    throw err;
+  }
+
+  // Now set compatibility using the effective SKU.
+  // Error 25001 is eBay's APPLICATION-level internal error — transient, retryable.
+  // Retry up to 4 times with increasing delays (5s → 10s → 20s → 30s).
+  const compatRetryDelays = [5000, 10000, 20000, 30000];
+  let lastCompatErr;
+
+  for (let attempt = 0; attempt <= compatRetryDelays.length; attempt++) {
+    if (attempt > 0) {
+      const delay = compatRetryDelays[attempt - 1];
+      console.log(`[Compatibility] Compatibility retry ${attempt} for SKU "${effectiveSku}" after ${delay}ms...`);
+      await new Promise(r => setTimeout(r, delay));
+    }
+    try {
+      const result = await updateCompatibilityViaInventoryAPI(token, effectiveSku, compatibilityList, effectiveMarketplace);
+      console.log(`[Compatibility] Compatibility set successfully for SKU "${effectiveSku}" on attempt ${attempt + 1}`);
+      return result;
+    } catch (compatErr) {
+      lastCompatErr = compatErr;
+      const errData = compatErr.response?.data;
+      const errorIds = errData?.errors?.map(e => e.errorId) || [];
+      const isTransient = compatErr.response?.status === 500 || errorIds.includes(25001);
+
+      console.log(`[Compatibility] Compatibility attempt ${attempt + 1} failed for SKU "${effectiveSku}" (errorIds: [${errorIds.join(', ')}], status: ${compatErr.response?.status})`);
+
+      if (!isTransient) {
+        // Non-retryable error (e.g. 25023 invalid compatibility data) — fail immediately
+        console.log(`[Compatibility] Non-retryable error, giving up:`, JSON.stringify(errData, null, 2));
+        compatErr.postMigrationFailure = true;
+        throw compatErr;
+      }
+    }
+  }
+
+  // All retries exhausted
+  console.log(`[Compatibility] All retries exhausted for SKU "${effectiveSku}":`,
+    JSON.stringify(lastCompatErr.response?.data, null, 2));
+  lastCompatErr.postMigrationFailure = true;
+  throw lastCompatErr;
+}
+
 router.post('/update-compatibility', requireAuth, async (req, res) => {
-  const { sellerId, itemId, compatibilityList: rawCompatibilityList } = req.body;
+  const { sellerId, itemId, sku, compatibilityList: rawCompatibilityList } = req.body;
   try {
     const seller = await Seller.findById(sellerId);
     const token = await ensureValidToken(seller);
     const compatibilityList = sanitizeCompatibilityList(rawCompatibilityList);
 
+    // ── Strategy 1: Inventory REST API (avoids "duplicate listing" error) ──
+    if (sku) {
+      try {
+        const invResult = await updateCompatibilityViaInventoryAPI(token, sku, compatibilityList);
+
+        // Save to DB regardless of warnings (Inventory API accepted the full list)
+        await Listing.findOneAndUpdate(
+          { itemId: itemId },
+          { compatibility: compatibilityList }
+        );
+
+        const warningMsg = invResult.warnings.length > 0
+          ? invResult.warnings.map(w => w.longMessage || w.message).join('; ')
+          : null;
+
+        return res.json({ success: true, warning: warningMsg, strippedCount: 0 });
+      } catch (invErr) {
+        const errData = invErr.response?.data;
+        // 25702 = SKU not found in eBay's inventory system → fall through to Trading API
+        const isSkuNotFound = invErr.response?.status === 404 ||
+          (errData?.errors && errData.errors.some(e => e.errorId === 25702));
+
+        if (!isSkuNotFound) {
+          const errMsg = errData?.errors?.map(e => e.longMessage || e.message).join('; ')
+            || invErr.message;
+          return res.status(invErr.response?.status || 500).json({ error: errMsg });
+        }
+
+        // SKU not in inventory system → try migrating the listing first
+        console.log(`[Compatibility] SKU "${sku}" not found in Inventory API — attempting listing migration...`);
+        try {
+          const migResult = await migrateListingAndSetCompatibility(token, sku, itemId, compatibilityList);
+          await Listing.findOneAndUpdate({ itemId }, { compatibility: compatibilityList });
+          const warningMsg = migResult.warnings.length > 0
+            ? migResult.warnings.map(w => w.longMessage || w.message).join('; ')
+            : null;
+          return res.json({ success: true, warning: warningMsg, strippedCount: 0 });
+        } catch (migErr) {
+          if (migErr.postMigrationFailure) {
+            // Migration succeeded but Inventory API still refuses — Trading API is now also
+            // disabled for this listing.  There is no programmatic path; user must do it manually.
+            const ebayMsg = migErr.response?.data?.errors?.map(e => e.longMessage || e.message).join('; ') || '';
+            return res.status(422).json({
+              error: `eBay could not apply compatibility to this listing via API even after migration. Please update it manually in eBay Seller Hub.${ebayMsg ? ' eBay said: ' + ebayMsg : ''}`,
+              requiresManualUpdate: true
+            });
+          }
+          // Migration itself failed → fall through to Trading API below
+          console.log(`[Compatibility] Migration failed for SKU "${sku}": ${migErr.message} — falling back to Trading API`);
+        }
+      }
+    }
+
+    // ── Strategy 3: Trading API (ReviseItem) — last resort fallback ────────
     let itemInnerContent = `<ItemID>${itemId}</ItemID>`;
 
     // CASE 1: Clearing all vehicles (Send Empty List with ReplaceAll)
@@ -7470,7 +7685,7 @@ router.post('/update-compatibility', requireAuth, async (req, res) => {
 
     const xmlRequest = `
             <?xml version="1.0" encoding="utf-8"?>
-            <ReviseFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+            <ReviseItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
                 <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
                 <ErrorLanguage>en_US</ErrorLanguage>
                 <WarningLevel>High</WarningLevel>
@@ -7479,19 +7694,19 @@ router.post('/update-compatibility', requireAuth, async (req, res) => {
                     ${itemInnerContent}
                 </Item>
 
-            </ReviseFixedPriceItemRequest>
+            </ReviseItemRequest>
         `;
 
     const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
-      headers: { 'X-EBAY-API-SITEID': '100', 'X-EBAY-API-COMPATIBILITY-LEVEL': '1423', 'X-EBAY-API-CALL-NAME': 'ReviseFixedPriceItem', 'Content-Type': 'text/xml' }
+      headers: { 'X-EBAY-API-SITEID': '100', 'X-EBAY-API-COMPATIBILITY-LEVEL': '1423', 'X-EBAY-API-CALL-NAME': 'ReviseItem', 'Content-Type': 'text/xml' }
     });
 
     const result = await parseStringPromise(response.data);
-    const ack = result.ReviseFixedPriceItemResponse.Ack[0];
+    const ack = result.ReviseItemResponse.Ack[0];
 
     // 1. Handle Failures
     if (ack === 'Failure') {
-      const errors = result.ReviseFixedPriceItemResponse.Errors || [];
+      const errors = result.ReviseItemResponse.Errors || [];
       const errorMessage = errors.map(e => e.LongMessage[0]).join('; ');
 
       // Check if it's a rate limit error
@@ -7529,7 +7744,7 @@ router.post('/update-compatibility', requireAuth, async (req, res) => {
     let warningMessage = null;
     let filteredCompatibilityList = compatibilityList;
     if (ack === 'Warning') {
-      const warnings = result.ReviseFixedPriceItemResponse.Errors || [];
+      const warnings = result.ReviseItemResponse.Errors || [];
 
       const meaningfulWarnings = warnings.filter(err => {
         const msg = err.LongMessage[0];
@@ -7590,6 +7805,55 @@ router.post('/bulk-update-compatibility', requireAuth, async (req, res) => {
       const { itemId, title, sku, compatibilityList: rawCompatList } = entry;
       const compatibilityList = sanitizeCompatibilityList(rawCompatList);
       try {
+        // ── Strategy 1: Inventory REST API (avoids "duplicate listing" error) ──
+        if (sku) {
+          try {
+            const invResult = await updateCompatibilityViaInventoryAPI(token, sku, compatibilityList);
+            await Listing.findOneAndUpdate({ itemId }, { compatibility: compatibilityList });
+            const warning = invResult.warnings.length > 0
+              ? invResult.warnings.map(w => w.longMessage || w.message).join('; ')
+              : null;
+            results.push({ itemId, title, sku, status: 'success', error: warning || null, compatibilityCount: compatibilityList?.length || 0, strippedCount: 0 });
+            successCount++;
+            continue; // move to next item
+          } catch (invErr) {
+            const errData = invErr.response?.data;
+            const isSkuNotFound = invErr.response?.status === 404 ||
+              (errData?.errors && errData.errors.some(e => e.errorId === 25702));
+
+            if (!isSkuNotFound) {
+              const errMsg = errData?.errors?.map(e => e.longMessage || e.message).join('; ') || invErr.message;
+              results.push({ itemId, title, sku, status: 'failure', error: errMsg, compatibilityCount: compatibilityList?.length || 0 });
+              failureCount++;
+              continue;
+            }
+
+            // SKU not in inventory system → try migrating the listing first
+            console.log(`[Compatibility] SKU "${sku}" not found in Inventory API — attempting listing migration...`);
+            try {
+              const migResult = await migrateListingAndSetCompatibility(token, sku, itemId, compatibilityList);
+              await Listing.findOneAndUpdate({ itemId }, { compatibility: compatibilityList });
+              const warning = migResult.warnings.length > 0
+                ? migResult.warnings.map(w => w.longMessage || w.message).join('; ')
+                : null;
+              results.push({ itemId, title, sku, status: 'success', error: warning || null, compatibilityCount: compatibilityList?.length || 0, strippedCount: 0 });
+              successCount++;
+              continue;
+            } catch (migErr) {
+              if (migErr.postMigrationFailure) {
+                const ebayMsg = migErr.response?.data?.errors?.map(e => e.longMessage || e.message).join('; ') || '';
+                const errMsg = `eBay could not apply compatibility via API after migration. Please update manually in eBay Seller Hub.${ebayMsg ? ' eBay said: ' + ebayMsg : ''}`;
+                results.push({ itemId, title, sku, status: 'failure', error: errMsg, requiresManualUpdate: true, compatibilityCount: compatibilityList?.length || 0 });
+                failureCount++;
+                continue;
+              }
+              // Migration itself failed → fall through to Trading API below
+              console.log(`[Compatibility] Migration failed for SKU "${sku}": ${migErr.message} — falling back to Trading API`);
+            }
+          }
+        }
+
+        // ── Strategy 3: Trading API (ReviseItem) — last resort fallback ────────
         let itemInnerContent = `<ItemID>${itemId}</ItemID>`;
 
         if (!compatibilityList || compatibilityList.length === 0) {
@@ -7609,22 +7873,22 @@ router.post('/bulk-update-compatibility', requireAuth, async (req, res) => {
         }
 
         const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
-          <ReviseFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+          <ReviseItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
             <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
             <ErrorLanguage>en_US</ErrorLanguage>
             <WarningLevel>High</WarningLevel>
             <Item>${itemInnerContent}</Item>
-          </ReviseFixedPriceItemRequest>`;
+          </ReviseItemRequest>`;
 
         const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
-          headers: { 'X-EBAY-API-SITEID': '100', 'X-EBAY-API-COMPATIBILITY-LEVEL': '1423', 'X-EBAY-API-CALL-NAME': 'ReviseFixedPriceItem', 'Content-Type': 'text/xml' }
+          headers: { 'X-EBAY-API-SITEID': '100', 'X-EBAY-API-COMPATIBILITY-LEVEL': '1423', 'X-EBAY-API-CALL-NAME': 'ReviseItem', 'Content-Type': 'text/xml' }
         });
 
         const result = await parseStringPromise(response.data);
-        const ack = result.ReviseFixedPriceItemResponse.Ack[0];
+        const ack = result.ReviseItemResponse.Ack[0];
 
         if (ack === 'Failure') {
-          const errors = result.ReviseFixedPriceItemResponse.Errors || [];
+          const errors = result.ReviseItemResponse.Errors || [];
           const errorMessage = errors.map(e => e.LongMessage[0]).join('; ');
 
           // If rate limited, stop processing remaining items
@@ -7650,7 +7914,7 @@ router.post('/bulk-update-compatibility', requireAuth, async (req, res) => {
           let savedList = compatibilityList;
           let warning = null;
           if (ack === 'Warning') {
-            const warnings = result.ReviseFixedPriceItemResponse.Errors || [];
+            const warnings = result.ReviseItemResponse.Errors || [];
             const meaningful = warnings.filter(err => {
               const msg = err.LongMessage[0];
               return !msg.includes("If this item sells by a Best Offer") && !msg.includes("Funds from your sales may be unavailable");
