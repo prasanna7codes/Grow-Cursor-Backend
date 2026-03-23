@@ -28,7 +28,11 @@ const UserSchema = new mongoose.Schema(
     },
     department: { type: String, trim: true },
     active: { type: Boolean, default: true },
-    isStrictTimer: { type: Boolean, default: true } // Mandatory timer tracking (false for superadmin by default)
+    isStrictTimer: { type: Boolean, default: true }, // Mandatory timer tracking (false for superadmin by default)
+    pagePermissions: [{
+      page: { type: String, required: true },
+      accessLevel: { type: String, enum: ['read', 'update', 'none'], required: true }
+    }]
   },
   { timestamps: true }
 );

@@ -201,4 +201,49 @@ router.put('/:id/strict-timer', requireAuth, requireRole('superadmin'), async (r
   }
 });
 
+// GET /all-with-permissions - fetch all active users with their pagePermissions (superadmin only)
+router.get('/all-with-permissions', requireAuth, requireRole('superadmin'), async (req, res) => {
+  try {
+    const users = await User.find({ active: true }).select('username email role department pagePermissions');
+    res.json(users);
+  } catch (e) {
+    res.status(500).json({ error: 'Error fetching users with permissions' });
+  }
+});
+
+// PUT /:id/permissions - update a user's pagePermissions (superadmin only)
+router.put('/:id/permissions', requireAuth, requireRole('superadmin'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { pagePermissions } = req.body;
+
+    if (!Array.isArray(pagePermissions)) {
+      return res.status(400).json({ error: 'pagePermissions must be an array' });
+    }
+
+    // Validate each entry
+    const validLevels = ['read', 'update', 'none'];
+    for (const perm of pagePermissions) {
+      if (!perm.page || !validLevels.includes(perm.accessLevel)) {
+        return res.status(400).json({ error: `Invalid permission entry: page="${perm.page}", accessLevel="${perm.accessLevel}"` });
+      }
+    }
+
+    const user = await User.findByIdAndUpdate(
+      id,
+      { pagePermissions },
+      { new: true, select: 'username email role department pagePermissions' }
+    );
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({ message: `Permissions updated for ${user.username}`, user });
+  } catch (error) {
+    console.error('Error updating permissions:', error);
+    res.status(500).json({ error: 'Failed to update permissions' });
+  }
+});
+
 export default router;

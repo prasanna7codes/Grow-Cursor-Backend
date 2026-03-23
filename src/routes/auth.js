@@ -14,7 +14,7 @@ router.post('/login', async (req, res) => {
   const ok = await bcrypt.compare(password, user.passwordHash);
   if (!ok) return res.status(401).json({ error: 'Incorrect password' });
   const token = jwt.sign({ userId: user._id.toString(), role: user.role }, process.env.JWT_SECRET, { expiresIn: '7d' });
-  res.json({ token, user: { id: user._id, email: user.email, username: user.username, role: user.role } });
+  res.json({ token, user: { id: user._id, email: user.email, username: user.username, role: user.role, pagePermissions: user.pagePermissions || [] } });
 });
 
 // Seed superadmin if none exists (development helper)
