@@ -1,7 +1,7 @@
 import express from 'express';
 import AsinDirectory from '../models/AsinDirectory.js';
 import AsinListProduct from '../models/AsinListProduct.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import { fetchAmazonData } from '../utils/asinAutofill.js';
 
 // Scrape a batch of ASINs in parallel (max 5 at a time) and return enrichment map
@@ -25,7 +25,7 @@ async function scrapeAsinsBatched(asinList, region = 'US', batchSize = 5) {
 const router = express.Router();
 
 // Get all ASINs with pagination and search
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 25;
@@ -99,7 +99,7 @@ router.get('/', requireAuth, async (req, res) => {
 });
 
 // Get multiple ASINs by exact ASIN list (used by Proof Read flow)
-router.get('/by-asins', requireAuth, async (req, res) => {
+router.get('/by-asins', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { asins } = req.query; // comma-separated ASIN strings
     if (!asins) return res.status(400).json({ error: 'asins query param required' });
@@ -113,7 +113,7 @@ router.get('/by-asins', requireAuth, async (req, res) => {
 });
 
 // Get statistics
-router.get('/stats', requireAuth, async (req, res) => {
+router.get('/stats', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const total = await AsinDirectory.countDocuments();
     const unassigned = await AsinDirectory.countDocuments({ listProductId: null });
@@ -144,7 +144,7 @@ router.get('/stats', requireAuth, async (req, res) => {
 });
 
 // Bulk add ASINs manually
-router.post('/bulk-manual', requireAuth, async (req, res) => {
+router.post('/bulk-manual', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { asins, region = 'US' } = req.body;
 
@@ -225,7 +225,7 @@ router.post('/bulk-manual', requireAuth, async (req, res) => {
 });
 
 // Bulk add from CSV
-router.post('/bulk-csv', requireAuth, async (req, res) => {
+router.post('/bulk-csv', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { csvData, region = 'US' } = req.body;
 
@@ -329,7 +329,7 @@ router.post('/bulk-csv', requireAuth, async (req, res) => {
 });
 
 // Export ASINs to CSV
-router.get('/export-csv', requireAuth, async (req, res) => {
+router.get('/export-csv', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const search = req.query.search || '';
 
@@ -357,7 +357,7 @@ router.get('/export-csv', requireAuth, async (req, res) => {
 });
 
 // Manually update price and/or description for a single ASIN
-router.patch('/:id', requireAuth, async (req, res) => {
+router.patch('/:id', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { id } = req.params;
     const { price, description } = req.body;
@@ -389,7 +389,7 @@ router.patch('/:id', requireAuth, async (req, res) => {
 });
 
 // Delete single ASIN
-router.delete('/:id', requireAuth, async (req, res) => {
+router.delete('/:id', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -407,7 +407,7 @@ router.delete('/:id', requireAuth, async (req, res) => {
 });
 
 // Bulk delete ASINs
-router.post('/bulk-delete', requireAuth, async (req, res) => {
+router.post('/bulk-delete', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { ids } = req.body;
 

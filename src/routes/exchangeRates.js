@@ -1,5 +1,5 @@
 import express from 'express';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import ExchangeRate from '../models/ExchangeRate.js';
 
 const router = express.Router();
@@ -68,7 +68,7 @@ router.get('/for-date', requireAuth, async (req, res) => {
 });
 
 // Set new exchange rate
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, requireRole('superadmin', 'fulfillmentadmin', 'hoc', 'compliancemanager'), async (req, res) => {
   try {
     const { rate, effectiveDate, marketplace = 'EBAY', notes } = req.body;
     
@@ -108,7 +108,7 @@ router.post('/', requireAuth, async (req, res) => {
 });
 
 // Delete exchange rate entry
-router.delete('/:id', requireAuth, async (req, res) => {
+router.delete('/:id', requireAuth, requireRole('superadmin', 'fulfillmentadmin', 'hoc', 'compliancemanager'), async (req, res) => {
   try {
     const { id } = req.params;
     

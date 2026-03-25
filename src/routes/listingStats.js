@@ -38,7 +38,7 @@ const router = express.Router();
  *       500:
  *         description: Server error
  */
-router.get('/day-wise-counts', requireAuth, async (req, res) => {
+router.get('/day-wise-counts', requireAuth, requireRole('superadmin', 'compatibilityadmin'), async (req, res) => {
   try {
     const { startDate, endDate, sellerId } = req.query;
 
@@ -179,7 +179,7 @@ router.get('/day-wise-counts', requireAuth, async (req, res) => {
  *       500:
  *         description: Server error
  */
-router.get('/summary', requireAuth, async (req, res) => {
+router.get('/summary', requireAuth, requireRole('superadmin', 'compatibilityadmin'), async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
 

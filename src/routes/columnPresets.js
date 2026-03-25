@@ -1,11 +1,13 @@
 import { Router } from 'express';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import ColumnPreset from '../models/ColumnPreset.js';
 
 const router = Router();
 
+const presetRoles = requireRole('superadmin', 'fulfillmentadmin', 'hoc', 'compliancemanager');
+
 // GET all presets (shared across all users), optionally filtered by page
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, presetRoles, async (req, res) => {
   try {
     const { page } = req.query;
     const query = {};
@@ -19,7 +21,7 @@ router.get('/', requireAuth, async (req, res) => {
 });
 
 // CREATE a new preset
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, presetRoles, async (req, res) => {
   const { name, columns, page = 'dashboard' } = req.body || {};
   if (!name || !columns) {
     return res.status(400).json({ error: 'name and columns required' });
@@ -38,7 +40,7 @@ router.post('/', requireAuth, async (req, res) => {
 });
 
 // DELETE a preset
-router.delete('/:id', requireAuth, async (req, res) => {
+router.delete('/:id', requireAuth, presetRoles, async (req, res) => {
   try {
     await ColumnPreset.findByIdAndDelete(req.params.id);
     res.json({ success: true });

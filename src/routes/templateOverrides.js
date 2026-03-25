@@ -1,6 +1,6 @@
 import express from 'express';
 const router = express.Router();
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import TemplateOverride from '../models/TemplateOverride.js';
 import ListingTemplate from '../models/ListingTemplate.js';
 import { 
@@ -10,6 +10,8 @@ import {
   getOverrideCount,
   getOverriddenSellers 
 } from '../utils/templateMerger.js';
+
+const listerRoles = requireRole('superadmin', 'listingadmin', 'lister', 'advancelister', 'trainee');
 
 /**
  * Get count of sellers who have overridden a template
@@ -34,7 +36,7 @@ router.get('/:templateId/count', requireAuth, async (req, res) => {
  * Get effective template for seller (base + overrides merged)
  * GET /api/template-overrides/:templateId/effective?sellerId=xxx
  */
-router.get('/:templateId/effective', requireAuth, async (req, res) => {
+router.get('/:templateId/effective', requireAuth, listerRoles, async (req, res) => {
   try {
     const { templateId } = req.params;
     const { sellerId } = req.query;
@@ -55,7 +57,7 @@ router.get('/:templateId/effective', requireAuth, async (req, res) => {
  * Get seller's override for a template (if exists)
  * GET /api/template-overrides/:templateId/override?sellerId=xxx
  */
-router.get('/:templateId/override', requireAuth, async (req, res) => {
+router.get('/:templateId/override', requireAuth, listerRoles, async (req, res) => {
   try {
     const { templateId } = req.params;
     const { sellerId } = req.query;
@@ -80,7 +82,7 @@ router.get('/:templateId/override', requireAuth, async (req, res) => {
  * Check if seller has override for template
  * GET /api/template-overrides/:templateId/has-override?sellerId=xxx
  */
-router.get('/:templateId/has-override', requireAuth, async (req, res) => {
+router.get('/:templateId/has-override', requireAuth, listerRoles, async (req, res) => {
   try {
     const { templateId } = req.params;
     const { sellerId } = req.query;
@@ -101,7 +103,7 @@ router.get('/:templateId/has-override', requireAuth, async (req, res) => {
  * Get override count for template (how many sellers customized it)
  * GET /api/template-overrides/:templateId/count
  */
-router.get('/:templateId/count', requireAuth, async (req, res) => {
+router.get('/:templateId/count', requireAuth, listerRoles, async (req, res) => {
   try {
     const { templateId } = req.params;
     const count = await getOverrideCount(templateId);
@@ -116,7 +118,7 @@ router.get('/:templateId/count', requireAuth, async (req, res) => {
  * Create or update seller's override (full replacement)
  * PUT /api/template-overrides/:templateId/override
  */
-router.put('/:templateId/override', requireAuth, async (req, res) => {
+router.put('/:templateId/override', requireAuth, listerRoles, async (req, res) => {
   try {
     const { templateId } = req.params;
     const { sellerId, overrides, ...overrideData } = req.body;
@@ -160,7 +162,7 @@ router.put('/:templateId/override', requireAuth, async (req, res) => {
  * Partially update specific override section
  * PATCH /api/template-overrides/:templateId/override/:section
  */
-router.patch('/:templateId/override/:section', requireAuth, async (req, res) => {
+router.patch('/:templateId/override/:section', requireAuth, listerRoles, async (req, res) => {
   try {
     const { templateId, section } = req.params;
     const { sellerId, data } = req.body;
@@ -205,7 +207,7 @@ router.patch('/:templateId/override/:section', requireAuth, async (req, res) => 
  * Reset seller's override (revert to base template)
  * DELETE /api/template-overrides/:templateId/override?sellerId=xxx
  */
-router.delete('/:templateId/override', requireAuth, async (req, res) => {
+router.delete('/:templateId/override', requireAuth, listerRoles, async (req, res) => {
   try {
     const { templateId } = req.params;
     const { sellerId } = req.query;
@@ -235,7 +237,7 @@ router.delete('/:templateId/override', requireAuth, async (req, res) => {
  * Reset specific section of override (revert section to base template)
  * DELETE /api/template-overrides/:templateId/override/:section?sellerId=xxx
  */
-router.delete('/:templateId/override/:section', requireAuth, async (req, res) => {
+router.delete('/:templateId/override/:section', requireAuth, listerRoles, async (req, res) => {
   try {
     const { templateId, section } = req.params;
     const { sellerId } = req.query;

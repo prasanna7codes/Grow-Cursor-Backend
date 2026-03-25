@@ -2,12 +2,13 @@ import express from 'express';
 import Order from '../models/Order.js';
 import AmazonAccount from '../models/AmazonAccount.js';
 import AmazonAccountDailyBalance from '../models/AmazonAccountDailyBalance.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 
 const router = express.Router();
 
-// All routes require authentication
+// All routes require authentication and specific roles
 router.use(requireAuth);
+router.use(requireRole('superadmin', 'fulfillmentadmin', 'hoc', 'compliancemanager'));
 
 // PST offset used throughout the platform
 const PST_OFFSET_HOURS = 8;

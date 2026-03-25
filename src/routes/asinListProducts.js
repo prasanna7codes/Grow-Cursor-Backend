@@ -1,12 +1,12 @@
 import express from 'express';
 import AsinListProduct from '../models/AsinListProduct.js';
 import AsinDirectory from '../models/AsinDirectory.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 
 const router = express.Router();
 
 // Get all products under a range
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, requireRole('superadmin', 'productadmin', 'listingadmin', 'lister', 'advancelister', 'trainee'), async (req, res) => {
   try {
     const { rangeId } = req.query;
     if (!rangeId) {
@@ -22,7 +22,7 @@ router.get('/', requireAuth, async (req, res) => {
 });
 
 // Create a new product under a range
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { name, rangeId, categoryId } = req.body;
     if (!name || !name.trim()) {
@@ -47,7 +47,7 @@ router.post('/', requireAuth, async (req, res) => {
 });
 
 // Move selected ASINs to a product list
-router.post('/move', requireAuth, async (req, res) => {
+router.post('/move', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { asinIds, productId } = req.body;
 
@@ -83,7 +83,7 @@ router.post('/move', requireAuth, async (req, res) => {
 });
 
 // Rename a product
-router.put('/:id', requireAuth, async (req, res) => {
+router.put('/:id', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { id } = req.params;
     const { name } = req.body;
@@ -107,7 +107,7 @@ router.put('/:id', requireAuth, async (req, res) => {
 });
 
 // Copy selected products (by id) into a target range
-router.post('/copy-to-range', requireAuth, async (req, res) => {
+router.post('/copy-to-range', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { productIds, targetRangeId } = req.body;
     if (!productIds || !Array.isArray(productIds) || productIds.length === 0) {
@@ -151,7 +151,7 @@ router.post('/copy-to-range', requireAuth, async (req, res) => {
 });
 
 // Delete a product and orphan its assigned ASINs
-router.delete('/:id', requireAuth, async (req, res) => {
+router.delete('/:id', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { id } = req.params;
 

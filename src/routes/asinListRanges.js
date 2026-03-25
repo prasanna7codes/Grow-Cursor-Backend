@@ -3,12 +3,12 @@ import AsinListRange from '../models/AsinListRange.js';
 import AsinListProduct from '../models/AsinListProduct.js';
 import AsinDirectory from '../models/AsinDirectory.js';
 import AsinListCategory from '../models/AsinListCategory.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 
 const router = express.Router();
 
 // Get ranges — filtered by categoryId, or all ranges when ?all=true
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, requireRole('superadmin', 'productadmin', 'listingadmin', 'lister', 'advancelister', 'trainee'), async (req, res) => {
   try {
     const { categoryId, all } = req.query;
 
@@ -39,7 +39,7 @@ router.get('/', requireAuth, async (req, res) => {
 });
 
 // Create a new range under a category
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { name, categoryId } = req.body;
     if (!name || !name.trim()) {
@@ -61,7 +61,7 @@ router.post('/', requireAuth, async (req, res) => {
 });
 
 // Rename a range
-router.put('/:id', requireAuth, async (req, res) => {
+router.put('/:id', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { id } = req.params;
     const { name } = req.body;
@@ -85,7 +85,7 @@ router.put('/:id', requireAuth, async (req, res) => {
 });
 
 // Shallow duplicate a range (same category, no products copied)
-router.post('/duplicate', requireAuth, async (req, res) => {
+router.post('/duplicate', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { sourceRangeId, name } = req.body;
     if (!name || !name.trim()) {
@@ -108,7 +108,7 @@ router.post('/duplicate', requireAuth, async (req, res) => {
 });
 
 // Delete a range and cascade-delete its products and orphan assigned ASINs
-router.delete('/:id', requireAuth, async (req, res) => {
+router.delete('/:id', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { id } = req.params;
 

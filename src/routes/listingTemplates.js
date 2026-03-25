@@ -1,12 +1,15 @@
 import express from 'express';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import ListingTemplate from '../models/ListingTemplate.js';
 import TemplateOverride from '../models/TemplateOverride.js';
 
 const router = express.Router();
 
+const listerRoles = requireRole('superadmin', 'listingadmin', 'lister', 'advancelister', 'trainee');
+const adminOnly = requireRole('superadmin');
+
 // Get custom Action field for template
-router.get('/action-field/:templateId', requireAuth, async (req, res) => {
+router.get('/action-field/:templateId', requireAuth, listerRoles, async (req, res) => {
   try {
     const { templateId } = req.params;
     const { sellerId } = req.query;
@@ -43,7 +46,7 @@ router.get('/action-field/:templateId', requireAuth, async (req, res) => {
 });
 
 // Update custom Action field for template
-router.put('/action-field/:templateId', requireAuth, async (req, res) => {
+router.put('/action-field/:templateId', requireAuth, listerRoles, async (req, res) => {
   try {
     const { templateId } = req.params;
     const { actionField, sellerId } = req.body;
@@ -98,7 +101,7 @@ router.put('/action-field/:templateId', requireAuth, async (req, res) => {
 });
 
 // Bulk reset overrides for a template (apply base template to all sellers)
-router.delete('/:id/bulk-reset-overrides', requireAuth, async (req, res) => {
+router.delete('/:id/bulk-reset-overrides', requireAuth, adminOnly, async (req, res) => {
   try {
     const { id: templateId } = req.params;
     
@@ -136,7 +139,7 @@ router.delete('/:id/bulk-reset-overrides', requireAuth, async (req, res) => {
 });
 
 // Get all templates
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, listerRoles, async (req, res) => {
   try {
     const { listProductId, rangeId } = req.query;
     const filter = {};
@@ -154,7 +157,7 @@ router.get('/', requireAuth, async (req, res) => {
 });
 
 // Get single template by ID
-router.get('/:id', requireAuth, async (req, res) => {
+router.get('/:id', requireAuth, listerRoles, async (req, res) => {
   try {
     const template = await ListingTemplate.findById(req.params.id)
       .populate('createdBy', 'name email');
@@ -171,7 +174,7 @@ router.get('/:id', requireAuth, async (req, res) => {
 });
 
 // Create new template
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, adminOnly, async (req, res) => {
   try {
     const { name, description, category, ebayCategory, customColumns, asinAutomation, pricingConfig, coreFieldDefaults, rangeId, listProductId } = req.body;
     
@@ -212,7 +215,7 @@ router.post('/', requireAuth, async (req, res) => {
 });
 
 // Duplicate template
-router.post('/:id/duplicate', requireAuth, async (req, res) => {
+router.post('/:id/duplicate', requireAuth, adminOnly, async (req, res) => {
   try {
     const { id } = req.params;
     
@@ -281,7 +284,7 @@ router.post('/:id/duplicate', requireAuth, async (req, res) => {
 });
 
 // Update template
-router.put('/:id', requireAuth, async (req, res) => {
+router.put('/:id', requireAuth, adminOnly, async (req, res) => {
   try {
     const { name, description, category, ebayCategory, customColumns, asinAutomation, pricingConfig, coreFieldDefaults, customActionField, rangeId, listProductId } = req.body;
     
@@ -328,7 +331,7 @@ router.put('/:id', requireAuth, async (req, res) => {
 });
 
 // Delete template
-router.delete('/:id', requireAuth, async (req, res) => {
+router.delete('/:id', requireAuth, adminOnly, async (req, res) => {
   try {
     const template = await ListingTemplate.findByIdAndDelete(req.params.id);
     
@@ -347,7 +350,7 @@ router.delete('/:id', requireAuth, async (req, res) => {
 });
 
 // Add custom column to template
-router.post('/:id/columns', requireAuth, async (req, res) => {
+router.post('/:id/columns', requireAuth, adminOnly, async (req, res) => {
   try {
     const { name, displayName, dataType, defaultValue, isRequired, placeholder } = req.body;
     
@@ -387,7 +390,7 @@ router.post('/:id/columns', requireAuth, async (req, res) => {
 });
 
 // Update custom column
-router.put('/:id/columns/:columnName', requireAuth, async (req, res) => {
+router.put('/:id/columns/:columnName', requireAuth, adminOnly, async (req, res) => {
   try {
     const { displayName, dataType, defaultValue, isRequired, placeholder } = req.body;
     
@@ -422,7 +425,7 @@ router.put('/:id/columns/:columnName', requireAuth, async (req, res) => {
 });
 
 // Delete custom column
-router.delete('/:id/columns/:columnName', requireAuth, async (req, res) => {
+router.delete('/:id/columns/:columnName', requireAuth, adminOnly, async (req, res) => {
   try {
     const template = await ListingTemplate.findById(req.params.id);
     
@@ -445,7 +448,7 @@ router.delete('/:id/columns/:columnName', requireAuth, async (req, res) => {
 });
 
 // Reorder custom columns
-router.post('/:id/columns/reorder', requireAuth, async (req, res) => {
+router.post('/:id/columns/reorder', requireAuth, adminOnly, async (req, res) => {
   try {
     const { columnOrders } = req.body; // Array of { name, order }
     

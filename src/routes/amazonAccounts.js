@@ -6,7 +6,7 @@ import AmazonAccount from '../models/AmazonAccount.js';
 const router = Router();
 
 // GET: Fetch all Amazon Accounts (Accessible by authenticated users so Dashboard can read it)
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, requireRole('superadmin', 'fulfillmentadmin', 'hoc', 'compliancemanager'), async (req, res) => {
   try {
     const accounts = await AmazonAccount.find().sort({ name: 1 });
     res.json(accounts);

@@ -37,7 +37,7 @@ const router = express.Router();
 // ============================================
 // UPLOAD FEED TO EBAY
 // ============================================
-router.post('/feed/upload', requireAuth, upload.single('file'), async (req, res) => {
+router.post('/feed/upload', requireAuth, requireRole('superadmin', 'listingadmin', 'lister', 'advancelister', 'trainee'), upload.single('file'), async (req, res) => {
   try {
     const { sellerId, feedType = 'FX_LISTING', schemaVersion = '1.0' } = req.body;
     const file = req.file;

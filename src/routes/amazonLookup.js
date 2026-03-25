@@ -1,5 +1,5 @@
 import express from 'express';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import AmazonProduct from '../models/AmazonProduct.js';
 import ProductUmbrella from '../models/ProductUmbrella.js';
 import { generateWithGemini, replacePlaceholders } from '../utils/gemini.js';
@@ -8,7 +8,7 @@ import { createEbayImageWithOverlay, deleteEbayImage } from '../utils/imageProce
 const router = express.Router();
 
 // Fetch Amazon data and optionally save to database
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { asin, sellerId, productUmbrellaId } = req.body;
 
@@ -210,7 +210,7 @@ router.post('/', requireAuth, async (req, res) => {
 });
 
 // Get all saved Amazon products
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { sellerId, productUmbrellaId, includeDeleted } = req.query;
     const filter = {};
@@ -242,7 +242,7 @@ router.get('/', requireAuth, async (req, res) => {
 });
 
 // Get single Amazon product by ID
-router.get('/:id', requireAuth, async (req, res) => {
+router.get('/:id', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const product = await AmazonProduct.findById(req.params.id)
       .populate({ path: 'sellerId', populate: { path: 'user', select: 'username email' } })
@@ -261,7 +261,7 @@ router.get('/:id', requireAuth, async (req, res) => {
 });
 
 // Soft delete Amazon product (mark as deleted)
-router.delete('/:id', requireAuth, async (req, res) => {
+router.delete('/:id', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const product = await AmazonProduct.findById(req.params.id);
 
@@ -283,7 +283,7 @@ router.delete('/:id', requireAuth, async (req, res) => {
 });
 
 // Restore archived product
-router.patch('/:id/restore', requireAuth, async (req, res) => {
+router.patch('/:id/restore', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const product = await AmazonProduct.findById(req.params.id);
 
@@ -309,7 +309,7 @@ router.patch('/:id/restore', requireAuth, async (req, res) => {
 });
 
 // Permanently delete Amazon product
-router.delete('/:id/permanent', requireAuth, async (req, res) => {
+router.delete('/:id/permanent', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const product = await AmazonProduct.findByIdAndDelete(req.params.id);
 

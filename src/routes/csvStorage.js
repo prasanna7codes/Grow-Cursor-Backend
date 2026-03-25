@@ -1,16 +1,18 @@
 import express from 'express';
 import multer from 'multer';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import CsvStorage from '../models/CsvStorage.js';
 import FeedUpload from '../models/FeedUpload.js';
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
+const listerRoles = requireRole('superadmin', 'listingadmin', 'lister', 'advancelister', 'trainee');
+
 // ============================================
 // GET /csv-storage — Paginated list with filters
 // ============================================
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, listerRoles, async (req, res) => {
     try {
         const {
             sellerId,
@@ -69,7 +71,7 @@ router.get('/', requireAuth, async (req, res) => {
 // ============================================
 // POST /csv-storage — Save a new CSV record
 // ============================================
-router.post('/', requireAuth, upload.single('csvFile'), async (req, res) => {
+router.post('/', requireAuth, listerRoles, upload.single('csvFile'), async (req, res) => {
     try {
         const file = req.file;
         if (!file) {
@@ -123,7 +125,7 @@ router.post('/', requireAuth, upload.single('csvFile'), async (req, res) => {
 // ============================================
 // PATCH /csv-storage/:id/link-upload — Link FeedUpload by taskId
 // ============================================
-router.patch('/:id/link-upload', requireAuth, async (req, res) => {
+router.patch('/:id/link-upload', requireAuth, listerRoles, async (req, res) => {
     try {
         const { taskId } = req.body;
         if (!taskId) {
@@ -155,7 +157,7 @@ router.patch('/:id/link-upload', requireAuth, async (req, res) => {
 // ============================================
 // GET /csv-storage/:id/download — Stream CSV from DB
 // ============================================
-router.get('/:id/download', requireAuth, async (req, res) => {
+router.get('/:id/download', requireAuth, listerRoles, async (req, res) => {
     try {
         const record = await CsvStorage.findById(req.params.id);
         if (!record) {
@@ -174,7 +176,7 @@ router.get('/:id/download', requireAuth, async (req, res) => {
 // ============================================
 // POST /csv-storage/:id/schedule-upload — Set or update scheduled auto-upload
 // ============================================
-router.post('/:id/schedule-upload', requireAuth, async (req, res) => {
+router.post('/:id/schedule-upload', requireAuth, listerRoles, async (req, res) => {
     try {
         const { scheduledAt, sellerId } = req.body;
         if (!scheduledAt) return res.status(400).json({ error: 'Missing scheduledAt' });
@@ -201,7 +203,7 @@ router.post('/:id/schedule-upload', requireAuth, async (req, res) => {
 // ============================================
 // DELETE /csv-storage/:id/schedule-upload — Cancel scheduled auto-upload
 // ============================================
-router.delete('/:id/schedule-upload', requireAuth, async (req, res) => {
+router.delete('/:id/schedule-upload', requireAuth, listerRoles, async (req, res) => {
     try {
         const existing = await CsvStorage.findById(req.params.id).select('scheduledUploadStatus');
         if (!existing) return res.status(404).json({ error: 'CSV record not found' });
@@ -225,7 +227,7 @@ router.delete('/:id/schedule-upload', requireAuth, async (req, res) => {
 // ============================================
 // DELETE /csv-storage/:id — Remove record
 // ============================================
-router.delete('/:id', requireAuth, async (req, res) => {
+router.delete('/:id', requireAuth, listerRoles, async (req, res) => {
     try {
         const record = await CsvStorage.findByIdAndDelete(req.params.id);
         if (!record) {

@@ -1,11 +1,13 @@
 import express from 'express';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import ProductUmbrella from '../models/ProductUmbrella.js';
 
 const router = express.Router();
 
+const umbrellaRoles = requireRole('superadmin', 'productadmin');
+
 // Get all product umbrellas
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, umbrellaRoles, async (req, res) => {
   try {
     const { sellerId } = req.query;
     const filter = sellerId ? { sellerId } : {};
@@ -23,7 +25,7 @@ router.get('/', requireAuth, async (req, res) => {
 });
 
 // Get single product umbrella by ID
-router.get('/:id', requireAuth, async (req, res) => {
+router.get('/:id', requireAuth, umbrellaRoles, async (req, res) => {
   try {
     const umbrella = await ProductUmbrella.findById(req.params.id)
       .populate('customColumns.columnId', 'name prompt dataType')
@@ -41,7 +43,7 @@ router.get('/:id', requireAuth, async (req, res) => {
 });
 
 // Create new product umbrella
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, umbrellaRoles, async (req, res) => {
   try {
     const { name, customColumns } = req.body;
     
@@ -67,7 +69,7 @@ router.post('/', requireAuth, async (req, res) => {
 });
 
 // Update product umbrella
-router.put('/:id', requireAuth, async (req, res) => {
+router.put('/:id', requireAuth, umbrellaRoles, async (req, res) => {
   try {
     const { name, customColumns } = req.body;
     
@@ -95,7 +97,7 @@ router.put('/:id', requireAuth, async (req, res) => {
 });
 
 // Delete product umbrella
-router.delete('/:id', requireAuth, async (req, res) => {
+router.delete('/:id', requireAuth, umbrellaRoles, async (req, res) => {
   try {
     const umbrella = await ProductUmbrella.findByIdAndDelete(req.params.id);
     

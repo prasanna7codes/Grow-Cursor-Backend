@@ -5,7 +5,7 @@ import { requireAuth, requireRole } from '../middleware/auth.js';
 const router = express.Router();
 
 // Get all credit card names
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, requireRole('superadmin'), async (req, res) => {
     try {
         const cards = await CreditCardName.find().sort({ name: 1 });
         res.json(cards);

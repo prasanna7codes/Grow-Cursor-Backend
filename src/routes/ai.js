@@ -25,7 +25,7 @@ function getOpenAI() {
 // Body: { title: string, description: string }
 // Returns: { make, model, startYear, endYear, allFitments }
 // ============================================
-router.post('/suggest-fitment', requireAuth, async (req, res) => {
+router.post('/suggest-fitment', requireAuth, requireRole('superadmin', 'compatibilityadmin', 'compatibilityeditor'), async (req, res) => {
     try {
         const { title = '', description = '' } = req.body;
 
@@ -140,7 +140,7 @@ Example output: [{"make":"Lexus","model":"IS F","startYear":"2008","endYear":"20
 // POST /api/ai/track-save-next
 // Body: { hadData: boolean }
 // ============================================
-router.post('/track-save-next', requireAuth, async (req, res) => {
+router.post('/track-save-next', requireAuth, requireRole('superadmin', 'compatibilityadmin', 'compatibilityeditor'), async (req, res) => {
     try {
         const { hadData = false } = req.body;
         const now = new Date();
@@ -168,7 +168,7 @@ router.post('/track-save-next', requireAuth, async (req, res) => {
 // Body: { currentTitle, sourceTitle, brand, color, compatibility }
 // Returns: { rephrasedTitle }
 // ============================================
-router.post('/rephrase-title', requireAuth, async (req, res) => {
+router.post('/rephrase-title', requireAuth, requireRole('superadmin', 'productadmin', 'compatibilityadmin', 'compatibilityeditor', 'listingadmin', 'lister', 'advancelister', 'trainee'), async (req, res) => {
     try {
         const { currentTitle = '', sourceTitle = '', brand = '', color = '', compatibility = '' } = req.body;
 

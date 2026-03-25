@@ -1,11 +1,11 @@
 import express from 'express';
 import Idea from '../models/Idea.js';
+import { requireAuth } from '../middleware/auth.js';
 
 const router = express.Router();
 
 // Get all ideas/tickets with pagination and filters
-// PUBLIC ROUTE - No authentication required
-router.get('/', async (req, res) => {
+router.get('/', requireAuth, async (req, res) => {
   try {
     const { 
       page = 1, 
@@ -47,8 +47,7 @@ router.get('/', async (req, res) => {
 });
 
 // Get single idea by ID
-// PUBLIC ROUTE
-router.get('/:id', async (req, res) => {
+router.get('/:id', requireAuth, async (req, res) => {
   try {
     const idea = await Idea.findById(req.params.id).lean();
     if (!idea) {
@@ -61,8 +60,7 @@ router.get('/:id', async (req, res) => {
 });
 
 // Create new idea/ticket
-// PUBLIC ROUTE - Anyone can submit
-router.post('/', async (req, res) => {
+router.post('/', requireAuth, async (req, res) => {
   try {
     const { title, description, type, priority, createdBy, completeByDate } = req.body;
 
@@ -90,8 +88,7 @@ router.post('/', async (req, res) => {
 });
 
 // Update idea (status, priority, assignee, etc.)
-// PUBLIC ROUTE - But you might want to restrict this later
-router.patch('/:id', async (req, res) => {
+router.patch('/:id', requireAuth, async (req, res) => {
   try {
     const { status, priority, assignedTo, pickedUpBy, resolvedBy, completeByDate, notes } = req.body;
     
@@ -131,8 +128,7 @@ router.patch('/:id', async (req, res) => {
 });
 
 // Add comment to an idea
-// PUBLIC ROUTE
-router.post('/:id/comments', async (req, res) => {
+router.post('/:id/comments', requireAuth, async (req, res) => {
   try {
     const { text, commentedBy } = req.body;
 
@@ -159,8 +155,7 @@ router.post('/:id/comments', async (req, res) => {
 });
 
 // Delete idea
-// PUBLIC ROUTE - But you might want to restrict this to admins only
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', requireAuth, async (req, res) => {
   try {
     const idea = await Idea.findByIdAndDelete(req.params.id);
     if (!idea) {
@@ -173,8 +168,7 @@ router.delete('/:id', async (req, res) => {
 });
 
 // Get statistics
-// PUBLIC ROUTE
-router.get('/stats/summary', async (req, res) => {
+router.get('/stats/summary', requireAuth, async (req, res) => {
   try {
     const [total, open, inProgress, completed, byPriority] = await Promise.all([
       Idea.countDocuments(),

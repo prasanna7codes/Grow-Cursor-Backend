@@ -1,13 +1,15 @@
 import express from 'express';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import SellerPricingConfig from '../models/SellerPricingConfig.js';
 import ListingTemplate from '../models/ListingTemplate.js';
 import { validateProfitTiers } from '../utils/pricingCalculator.js';
 
 const router = express.Router();
 
+const listerRoles = requireRole('superadmin', 'listingadmin', 'lister', 'advancelister', 'trainee');
+
 // Get pricing config for specific seller+template
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, listerRoles, async (req, res) => {
   try {
     const { sellerId, templateId } = req.query;
 
@@ -60,7 +62,7 @@ router.get('/', requireAuth, async (req, res) => {
 });
 
 // Create or update pricing config for seller+template
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, listerRoles, async (req, res) => {
   try {
     const { sellerId, templateId, pricingConfig } = req.body;
 
@@ -112,7 +114,7 @@ router.post('/', requireAuth, async (req, res) => {
 });
 
 // Delete pricing config (revert to template default)
-router.delete('/', requireAuth, async (req, res) => {
+router.delete('/', requireAuth, listerRoles, async (req, res) => {
   try {
     const { sellerId, templateId } = req.query;
 

@@ -1,11 +1,13 @@
 import express from 'express';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 import CustomColumn from '../models/CustomColumn.js';
 
 const router = express.Router();
 
+const columnRoles = requireRole('superadmin', 'productadmin');
+
 // Get all custom columns
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, columnRoles, async (req, res) => {
   try {
     const columns = await CustomColumn.find()
       .populate('createdBy', 'name email')
@@ -18,7 +20,7 @@ router.get('/', requireAuth, async (req, res) => {
 });
 
 // Create custom column
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, columnRoles, async (req, res) => {
   try {
     const { name, prompt, dataType, description } = req.body;
 
@@ -45,7 +47,7 @@ router.post('/', requireAuth, async (req, res) => {
 });
 
 // Update custom column
-router.put('/:id', requireAuth, async (req, res) => {
+router.put('/:id', requireAuth, columnRoles, async (req, res) => {
   try {
     const { name, prompt, dataType, description } = req.body;
 
@@ -67,7 +69,7 @@ router.put('/:id', requireAuth, async (req, res) => {
 });
 
 // Delete custom column
-router.delete('/:id', requireAuth, async (req, res) => {
+router.delete('/:id', requireAuth, columnRoles, async (req, res) => {
   try {
     const column = await CustomColumn.findByIdAndDelete(req.params.id);
 

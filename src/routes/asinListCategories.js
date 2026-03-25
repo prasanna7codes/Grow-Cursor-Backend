@@ -3,12 +3,12 @@ import AsinListCategory from '../models/AsinListCategory.js';
 import AsinListRange from '../models/AsinListRange.js';
 import AsinListProduct from '../models/AsinListProduct.js';
 import AsinDirectory from '../models/AsinDirectory.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requireRole } from '../middleware/auth.js';
 
 const router = express.Router();
 
 // Get all categories
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, requireRole('superadmin', 'productadmin', 'listingadmin', 'lister', 'advancelister', 'trainee'), async (req, res) => {
   try {
     const categories = await AsinListCategory.find().sort({ name: 1 }).lean();
     res.json(categories);
@@ -19,7 +19,7 @@ router.get('/', requireAuth, async (req, res) => {
 });
 
 // Create a new category
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { name } = req.body;
     if (!name || !name.trim()) {
@@ -38,7 +38,7 @@ router.post('/', requireAuth, async (req, res) => {
 });
 
 // Delete a category and cascade-delete its ranges, products, and orphan assigned ASINs
-router.delete('/:id', requireAuth, async (req, res) => {
+router.delete('/:id', requireAuth, requireRole('superadmin', 'productadmin'), async (req, res) => {
   try {
     const { id } = req.params;
 
