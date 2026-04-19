@@ -12,6 +12,7 @@ import TemplateListing from '../models/TemplateListing.js';
 
 const router = Router();
 const EXCLUDED_CLIENT_USERNAME = 'Vergo';
+const EXCLUDED_CLIENT_USERNAME_NORMALIZED = EXCLUDED_CLIENT_USERNAME.toLowerCase();
 
 const PT_TIMEZONE = 'America/Los_Angeles';
 const SNAD_RETURN_REASONS = [
@@ -115,7 +116,7 @@ async function getExcludedClientSellerIds() {
     .lean();
 
   return sellers
-    .filter((seller) => seller.user?.username?.toLowerCase() === EXCLUDED_CLIENT_USERNAME)
+    .filter((seller) => seller.user?.username?.trim().toLowerCase() === EXCLUDED_CLIENT_USERNAME_NORMALIZED)
     .map((seller) => seller._id);
 }
 
