@@ -52,6 +52,7 @@ export const PAGE_DEFAULT_ROLES = {
   'Salary': ['superadmin'],
   'AllOrdersSheet': ['superadmin', 'fulfillmentadmin', 'hoc', 'compliancemanager'],
   'PriceChangeHistory': ['superadmin', 'fulfillmentadmin', 'hoc', 'compliancemanager'],
+  'PriceChangeOrderCheck': ['superadmin', 'fulfillmentadmin', 'hoc', 'compliancemanager'],
   'SellerAnalytics': ['superadmin', 'fulfillmentadmin', 'hoc', 'compliancemanager'],
 
   // Compliance & Support
