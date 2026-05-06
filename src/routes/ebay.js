@@ -401,39 +401,39 @@ export async function processAutoCompatibilityBatch(batchId) {
 
           // Process Trims
           if (hasSpecificTrims) {
-            filteredCombinations = filteredCombinations.filter(c => 
-               aiSuggested.some(suggested => {
-                 if (!suggested || typeof suggested !== 'string') return false;
-                 const escaped = suggested.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s*');
-                 return new RegExp(`\\b${escaped}\\b`, 'i').test(`${c.trim} ${c.engine}`);
-               })
+            filteredCombinations = filteredCombinations.filter(c =>
+              aiSuggested.some(suggested => {
+                if (!suggested || typeof suggested !== 'string') return false;
+                const escaped = suggested.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s*');
+                return new RegExp(`\\b${escaped}\\b`, 'i').test(`${c.trim} ${c.engine}`);
+              })
             );
           } else if (hasExcludedTrims) {
-            filteredCombinations = filteredCombinations.filter(c => 
-               !aiExcluded.some(excluded => {
-                 if (!excluded || typeof excluded !== 'string') return false;
-                 const escaped = excluded.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s*');
-                 return new RegExp(`\\b${escaped}\\b`, 'i').test(`${c.trim} ${c.engine}`);
-               })
+            filteredCombinations = filteredCombinations.filter(c =>
+              !aiExcluded.some(excluded => {
+                if (!excluded || typeof excluded !== 'string') return false;
+                const escaped = excluded.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s*');
+                return new RegExp(`\\b${escaped}\\b`, 'i').test(`${c.trim} ${c.engine}`);
+              })
             );
           }
 
           // Process Engines
           if (hasSpecificEngines) {
-            filteredCombinations = filteredCombinations.filter(c => 
-               aiSuggestedEngines.some(suggested => {
-                 if (!suggested || typeof suggested !== 'string') return false;
-                 const escaped = suggested.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s*');
-                 return new RegExp(`\\b${escaped}\\b`, 'i').test(`${c.trim} ${c.engine}`);
-               })
+            filteredCombinations = filteredCombinations.filter(c =>
+              aiSuggestedEngines.some(suggested => {
+                if (!suggested || typeof suggested !== 'string') return false;
+                const escaped = suggested.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s*');
+                return new RegExp(`\\b${escaped}\\b`, 'i').test(`${c.trim} ${c.engine}`);
+              })
             );
           } else if (hasExcludedEngines) {
-            filteredCombinations = filteredCombinations.filter(c => 
-               !aiExcludedEngines.some(excluded => {
-                 if (!excluded || typeof excluded !== 'string') return false;
-                 const escaped = excluded.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s*');
-                 return new RegExp(`\\b${escaped}\\b`, 'i').test(`${c.trim} ${c.engine}`);
-               })
+            filteredCombinations = filteredCombinations.filter(c =>
+              !aiExcludedEngines.some(excluded => {
+                if (!excluded || typeof excluded !== 'string') return false;
+                const escaped = excluded.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/ /g, '\\s*');
+                return new RegExp(`\\b${escaped}\\b`, 'i').test(`${c.trim} ${c.engine}`);
+              })
             );
           }
 
@@ -530,7 +530,7 @@ export async function processAutoCompatibilityBatch(batchId) {
                   itemResult.ebayWarning = meaningful.map(e => parseInvalidCombos(e.LongMessage[0])).join('; ');
                   savedList = filterOutInvalidCombos(sanitized, rawWarning);
                   itemResult.strippedCount = sanitized.length - savedList.length;
-                  purgeInvalidFromCache(rawWarning).catch(() => {});
+                  purgeInvalidFromCache(rawWarning).catch(() => { });
                 }
               }
               itemResult.status = 'success';
@@ -554,7 +554,7 @@ export async function processAutoCompatibilityBatch(batchId) {
             itemResult.status = 'ebay_error';
             itemResult.ebayError = parseInvalidCombos(errorMessage);
             counts.ebayErrorCount += 1;
-            purgeInvalidFromCache(errorMessage).catch(() => {});
+            purgeInvalidFromCache(errorMessage).catch(() => { });
           }
         } else {
           let savedList = sanitized;
@@ -569,7 +569,7 @@ export async function processAutoCompatibilityBatch(batchId) {
               itemResult.ebayWarning = meaningful.map(e => parseInvalidCombos(e.LongMessage[0])).join('; ');
               savedList = filterOutInvalidCombos(sanitized, rawWarning);
               itemResult.strippedCount = sanitized.length - savedList.length;
-              purgeInvalidFromCache(rawWarning).catch(() => {});
+              purgeInvalidFromCache(rawWarning).catch(() => { });
             }
             // eBay Warning == still sent successfully; treat as success
             itemResult.status = 'success';
@@ -845,7 +845,7 @@ router.get('/feed/tasks', requireAuth, async (req, res) => {
               if ((ebayTask.status === 'COMPLETED' || ebayTask.status === 'COMPLETED_WITH_ERROR') &&
                 oldStatus !== 'COMPLETED' && oldStatus !== 'COMPLETED_WITH_ERROR') {
                 newlyCompletedSuccessCount = ebayTask.uploadSummary.successCount;
-              }   
+              }
             }
             task.lastUpdated = new Date();
             await task.save();
@@ -1435,13 +1435,13 @@ function calculateOrderEarnings() {
 
 // --- NEW CONFIG: AUTOMATED WELCOME MESSAGE ---
 const ENABLE_AUTO_WELCOME = true; // Set to false to disable
-const WELCOME_TEMPLATE = `Hello {BUYER_NAME},
+const WELCOME_TEMPLATE = `Hi {BUYER_NAME},
 
-Thank you for your recent purchase!
+We're pleased to inform you that your order has been processed.
 
-Orders are typically shipped within 12–24 hours. We will keep you updated, and once your order is shipped, the tracking details will be available on your eBay order page.
+Also, we are actively monitoring your order to ensure it reaches you smoothly and tracking number will be updated on your eBay order page as soon as they become available.
 
-If you need any assistance, please feel free to message us at any time. Wishing you a wonderful day!`;
+Thank you for choosing us.`;
 
 // --- HELPER: Send Auto Welcome Message ---
 async function sendAutoWelcomeMessage(seller, order) {
@@ -2671,19 +2671,19 @@ router.get('/all-orders-usd', async (req, res) => {
     if (minProfit !== undefined || maxProfit !== undefined) {
       query.$and = query.$and || [];
       const profitConditions = [];
-      
+
       if (minProfit !== undefined && minProfit !== '') {
         profitConditions.push({
           $gte: [computedProfitExpression, parseFloat(minProfit)]
         });
       }
-      
+
       if (maxProfit !== undefined && maxProfit !== '') {
         profitConditions.push({
           $lte: [computedProfitExpression, parseFloat(maxProfit)]
         });
       }
-      
+
       if (profitConditions.length === 1) {
         query.$and.push({ $expr: profitConditions[0] });
       } else if (profitConditions.length > 1) {
@@ -2695,15 +2695,15 @@ router.get('/all-orders-usd', async (req, res) => {
     if (minSubtotal !== undefined || maxSubtotal !== undefined) {
       query.$and = query.$and || [];
       const subtotalCondition = {};
-      
+
       if (minSubtotal !== undefined && minSubtotal !== '') {
         subtotalCondition.$gte = parseFloat(minSubtotal);
       }
-      
+
       if (maxSubtotal !== undefined && maxSubtotal !== '') {
         subtotalCondition.$lte = parseFloat(maxSubtotal);
       }
-      
+
       if (Object.keys(subtotalCondition).length > 0) {
         query.$and.push({ subtotal: subtotalCondition });
       }
@@ -2725,25 +2725,25 @@ router.get('/all-orders-usd', async (req, res) => {
         {
           $group: {
             _id: null,
-            subtotal:        { $sum: { $ifNull: ['$subtotal', 0] } },
-            shipping:        { $sum: { $ifNull: ['$shipping', 0] } },
-            salesTax:        { $sum: { $ifNull: ['$salesTax', 0] } },
-            discount:        { $sum: { $ifNull: ['$discount', 0] } },
+            subtotal: { $sum: { $ifNull: ['$subtotal', 0] } },
+            shipping: { $sum: { $ifNull: ['$shipping', 0] } },
+            salesTax: { $sum: { $ifNull: ['$salesTax', 0] } },
+            discount: { $sum: { $ifNull: ['$discount', 0] } },
             transactionFees: { $sum: { $ifNull: ['$transactionFees', 0] } },
-            adFeeGeneral:    { $sum: { $ifNull: ['$adFeeGeneral', 0] } },
-            orderEarnings:   { $sum: { $ifNull: ['$orderEarnings', 0] } },
-            orderTotal:      { $sum: { $ifNull: ['$orderTotal', 0] } },
-            tds:             { $sum: { $ifNull: ['$tds', 0] } },
-            tid:             { $sum: { $ifNull: ['$tid', 0] } },
-            net:             { $sum: { $ifNull: ['$net', 0] } },
-            pBalanceINR:     { $sum: { $ifNull: ['$pBalanceINR', 0] } },
-            beforeTax:       { $sum: { $ifNull: ['$beforeTax', 0] } },
-            estimatedTax:    { $sum: { $ifNull: ['$estimatedTax', 0] } },
-            amazonTotal:     { $sum: { $ifNull: ['$amazonTotal', 0] } },
-            amazonTotalINR:  { $sum: { $ifNull: ['$amazonTotalINR', 0] } },
-            marketplaceFee:  { $sum: { $ifNull: ['$marketplaceFee', 0] } },
-            igst:            { $sum: { $ifNull: ['$igst', 0] } },
-            totalCC:         { $sum: { $ifNull: ['$totalCC', 0] } },
+            adFeeGeneral: { $sum: { $ifNull: ['$adFeeGeneral', 0] } },
+            orderEarnings: { $sum: { $ifNull: ['$orderEarnings', 0] } },
+            orderTotal: { $sum: { $ifNull: ['$orderTotal', 0] } },
+            tds: { $sum: { $ifNull: ['$tds', 0] } },
+            tid: { $sum: { $ifNull: ['$tid', 0] } },
+            net: { $sum: { $ifNull: ['$net', 0] } },
+            pBalanceINR: { $sum: { $ifNull: ['$pBalanceINR', 0] } },
+            beforeTax: { $sum: { $ifNull: ['$beforeTax', 0] } },
+            estimatedTax: { $sum: { $ifNull: ['$estimatedTax', 0] } },
+            amazonTotal: { $sum: { $ifNull: ['$amazonTotal', 0] } },
+            amazonTotalINR: { $sum: { $ifNull: ['$amazonTotalINR', 0] } },
+            marketplaceFee: { $sum: { $ifNull: ['$marketplaceFee', 0] } },
+            igst: { $sum: { $ifNull: ['$igst', 0] } },
+            totalCC: { $sum: { $ifNull: ['$totalCC', 0] } },
           }
         },
         {
@@ -5590,31 +5590,31 @@ const QUANTITY_UPDATE_EXCLUDED_ITEMS = new Set([
   '397760913732',
   '397760913792',
   '397760912460',
-    '318135906852',
-    '318135906854',
-    '318135906872',
-    '318135906878',
-    '318135906890',
-    '389876300253',
-    '389876300254',
-    '389876300263',
-    '389876300264',
-    '389876300271',
-    '397828455740',
-    '397828455742',
-    '397828455743',
-    '397828455744',
-    '397828455749',
-    '397828455873',
-    '397828455874',
-    '397828455876',
-    '397828455877',
-    '397828455878',
-    '389905142747',
-    '389905161240',
-    '389905163638',
-    '389905163695',
-    '389905163516',
+  '318135906852',
+  '318135906854',
+  '318135906872',
+  '318135906878',
+  '318135906890',
+  '389876300253',
+  '389876300254',
+  '389876300263',
+  '389876300264',
+  '389876300271',
+  '397828455740',
+  '397828455742',
+  '397828455743',
+  '397828455744',
+  '397828455749',
+  '397828455873',
+  '397828455874',
+  '397828455876',
+  '397828455877',
+  '397828455878',
+  '389905142747',
+  '389905161240',
+  '389905163638',
+  '389905163695',
+  '389905163516',
 
 
 
@@ -6776,7 +6776,7 @@ router.get('/stored-payment-disputes', async (req, res) => {
     if (startDate || endDate) {
       query[resolvedDateField] = {};
       if (startDate) query[resolvedDateField].$gte = new Date(startDate + 'T00:00:00.000Z');
-      if (endDate)   query[resolvedDateField].$lte = new Date(endDate   + 'T23:59:59.999Z');
+      if (endDate) query[resolvedDateField].$lte = new Date(endDate + 'T23:59:59.999Z');
     }
 
     const disputes = await PaymentDispute.find(query)
@@ -8338,7 +8338,7 @@ router.get('/listings', requireAuth, async (req, res) => {
     if (listedFrom || listedTo) {
       query.startTime = {};
       if (listedFrom) query.startTime.$gte = new Date(listedFrom + 'T00:00:00+05:30');
-      if (listedTo)   query.startTime.$lte = new Date(listedTo   + 'T23:59:59.999+05:30');
+      if (listedTo) query.startTime.$lte = new Date(listedTo + 'T23:59:59.999+05:30');
     }
 
     // --- SEARCH LOGIC ---
@@ -9314,11 +9314,11 @@ router.get('/all-listings', requireAuth, async (req, res) => {
 //   - All other listing durations are ≤30 days as well.
 //   - Therefore EndTimeFrom=now / EndTimeTo=now+32days captures 100% of active listings.
 const CURRENCY_TO_MARKETPLACE = {
-  USD: { label: 'eBay US',        flag: '🇺🇸' },
+  USD: { label: 'eBay US', flag: '🇺🇸' },
   AUD: { label: 'eBay Australia', flag: '🇦🇺' },
-  CAD: { label: 'eBay Canada',    flag: '🇨🇦' },
-  GBP: { label: 'eBay UK',        flag: '🇬🇧' },
-  EUR: { label: 'eBay Europe',    flag: '🇪🇺' },
+  CAD: { label: 'eBay Canada', flag: '🇨🇦' },
+  GBP: { label: 'eBay UK', flag: '🇬🇧' },
+  EUR: { label: 'eBay Europe', flag: '🇪🇺' },
 };
 router.get('/active-listings/live-tiers', requireAuth, async (req, res) => {
   const { sellerId } = req.query;
@@ -9332,7 +9332,7 @@ router.get('/active-listings/live-tiers', requireAuth, async (req, res) => {
 
     // 32-day window starting now — covers all active GTC and fixed-duration listings
     const endTimeFrom = new Date().toISOString();
-    const endTimeTo   = new Date(Date.now() + 32 * 24 * 60 * 60 * 1000).toISOString();
+    const endTimeTo = new Date(Date.now() + 32 * 24 * 60 * 60 * 1000).toISOString();
 
     let page = 1;
     let totalPages = 1;
@@ -9425,7 +9425,7 @@ router.get('/active-listings/live-tiers', requireAuth, async (req, res) => {
       .map(([currency, mpTiers]) => ({
         currency,
         label: CURRENCY_TO_MARKETPLACE[currency]?.label || `eBay (${currency})`,
-        flag:  CURRENCY_TO_MARKETPLACE[currency]?.flag  || '🌐',
+        flag: CURRENCY_TO_MARKETPLACE[currency]?.flag || '🌐',
         total: mpTiers.total,
         tiers: { low: mpTiers.low, mid: mpTiers.mid, high: mpTiers.high },
       }))
@@ -9507,7 +9507,7 @@ router.post('/update-listing', requireAuth, async (req, res) => {
     if (ack === 'Failure') {
       const errors = result.ReviseFixedPriceItemResponse.Errors || [];
       const errorMessage = errors.map(e => e.LongMessage?.[0]).join('; ');
-      
+
       // Log failed price change attempt
       if (price !== undefined && price !== null && originalPrice !== null) {
         await createPriceChangeLog({
@@ -9525,7 +9525,7 @@ router.post('/update-listing', requireAuth, async (req, res) => {
           userAgent: req.get('user-agent')
         });
       }
-      
+
       throw new Error(`eBay Error: ${errorMessage}`);
     }
 
@@ -11624,7 +11624,7 @@ router.get('/feed/upload-stats', requireAuth, requirePageAccess('FeedUploadStats
       'uploadSummary.successCount': { $gt: 0 }
     };
     if (sellerId) matchStage.seller = new mongoose.Types.ObjectId(sellerId);
-    
+
     // Handle country filtering: if US, include records without country field (old data)
     if (country) {
       if (country === 'US') {
@@ -11637,7 +11637,7 @@ router.get('/feed/upload-stats', requireAuth, requirePageAccess('FeedUploadStats
         matchStage.country = country;
       }
     }
-    
+
     if (startDate || endDate) {
       matchStage.creationDate = {};
       if (startDate) {
@@ -12702,8 +12702,8 @@ export async function scheduledRunAutoCompatForDate(targetDate, { triggeredBy = 
     return [];
   }
   const dayStart = new Date(targetDate + 'T00:00:00Z');
-  const dayEnd   = new Date(targetDate + 'T23:59:59.999Z');
-  const result   = [];
+  const dayEnd = new Date(targetDate + 'T23:59:59.999Z');
+  const result = [];
   for (const seller of eligible) {
     const existing = await AutoCompatibilityBatch.findOne({
       seller: seller._id,
