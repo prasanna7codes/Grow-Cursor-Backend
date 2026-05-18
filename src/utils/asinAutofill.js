@@ -6,6 +6,36 @@ import { trackApiUsage } from './apiUsageTracker.js';
 import { getCachedAsinData, setCachedAsinData } from './asinCache.js';
 
 /**
+ * Extract vehicle make/model/year mentions from Amazon customer reviews.
+ * Looks for patterns like "2019 Ford Fusion" or "2026 Toyota Tacoma".
+ * Returns the top 3 unique mentions by frequency as a comma-separated string,
+ * or 'none' if nothing is found.
+ * @param {Array} reviews - reviews array from ScraperAPI raw response
+ * @returns {string}
+ */
+function extractVehicleMentions(reviews) {
+  if (!Array.isArray(reviews) || reviews.length === 0) return 'none';
+
+  const YEAR_MODEL_RE = /\b((?:19|20)\d{2})\s+([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+){0,2})/g;
+  const counts = {};
+
+  for (const r of reviews) {
+    const text = `${r.review || ''} ${r.title || ''}`;
+    for (const match of text.matchAll(YEAR_MODEL_RE)) {
+      const mention = `${match[1]} ${match[2].trim()}`;
+      counts[mention] = (counts[mention] || 0) + 1;
+    }
+  }
+
+  const sorted = Object.entries(counts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([mention]) => mention);
+
+  return sorted.length > 0 ? sorted.join(', ') : 'none';
+}
+
+/**
  * Fetch Amazon product data by ASIN
  * Uses ScraperAPI for ALL product data (Title, Brand, Description, Images, Price)
  * Replaces PAAPI entirely
@@ -20,7 +50,12 @@ export async function fetchAmazonData(asin, region = 'US') {
     const cached = getCachedAsinData(asin, region);
     if (cached) {
       const cacheTime = Date.now() - startTime;
-      console.log(`[fetchAmazonData] ⚡ Cache hit for ${asin} (${region}, ${cacheTime}ms)`);
+      // Backfill vehicle_mentions for entries cached before this feature was added
+      if (cached.vehicle_mentions === undefined) {
+        cached.vehicle_mentions = extractVehicleMentions(cached.rawData?.reviews);
+      }
+      console.log(`[fetchAmazonData] ⚡ Cache hit for ${asin} (${region}, ${cacheTime}ms)${cached.vehicle_mentions !== 'none' ? ` | vehicles: ${cached.vehicle_mentions}` : ''}`);
+      console.log(`[vehicleMentions] ${asin} → "${cached.vehicle_mentions}" (${Array.isArray(cached.rawData?.reviews) ? cached.rawData.reviews.length : 0} reviews scanned, from cache)`);
       return cached;
     }
     
@@ -39,8 +74,12 @@ export async function fetchAmazonData(asin, region = 'US') {
     
     // Keep images as array (same as PAAPI format)
     const imagesArray = Array.isArray(images) ? images : [];
-    
-    console.log(`[fetchAmazonData] ✅ ${asin} (${region}) ${responseTime}ms | "${title.substring(0, 40)}..." | ${brand} | ${price} | ${imagesArray.length} imgs${color ? ` | color: ${color}` : ''}${compatibility ? ` | compat: ${compatibility.substring(0, 30)}` : ''}`);
+
+    // Extract vehicle mentions from customer reviews for AI title context
+    const vehicleMentions = extractVehicleMentions(scrapedData.rawData?.reviews);
+    console.log(`[vehicleMentions] ${asin} → "${vehicleMentions}" (${Array.isArray(scrapedData.rawData?.reviews) ? scrapedData.rawData.reviews.length : 0} reviews scanned, fresh scrape)`);
+
+    console.log(`[fetchAmazonData] ✅ ${asin} (${region}) ${responseTime}ms | "${title.substring(0, 40)}..." | ${brand} | ${price} | ${imagesArray.length} imgs${color ? ` | color: ${color}` : ''}${compatibility ? ` | compat: ${compatibility.substring(0, 30)}` : ''}${vehicleMentions !== 'none' ? ` | vehicles: ${vehicleMentions}` : ''}`);
     
     const result = {
       asin,
@@ -55,6 +94,7 @@ export async function fetchAmazonData(asin, region = 'US') {
       material: material || '',
       specialFeatures: specialFeatures || '',
       size: size || '',
+      vehicle_mentions: vehicleMentions,
       rawData: scrapedData // Store scraped data for debugging
     };
     
@@ -94,7 +134,8 @@ export async function applyFieldConfigs(amazonData, fieldConfigs, pricingConfig 
     brand: amazonData.brand,
     description: amazonData.description,
     price: amazonData.price,
-    asin: amazonData.asin
+    asin: amazonData.asin,
+    vehicle_mentions: amazonData.vehicle_mentions || 'none'
   };
 
   // Images are already an array (same as PAAPI format)
