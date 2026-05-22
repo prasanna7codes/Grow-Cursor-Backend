@@ -22,6 +22,7 @@ const SNAD_RETURN_REASONS = [
   'NOT_AS_DESCRIBED',
   'DEFECTIVE_ITEM',
   'WRONG_ITEM',
+  'ORDERED_DIFFERENT_ITEM',
   'MISSING_PARTS',
   'ARRIVED_DAMAGED',
   'DOESNT_MATCH',
@@ -152,7 +153,7 @@ router.get('/details', requireAuth, requirePageAccess('AccountHealth'), async (r
     // Build response
     const details = orders.map(order => {
       const orderId = order.orderId || order.legacyOrderId;
-      
+
       // Try to match with orderId first, then legacyOrderId (but not both to avoid double-counting)
       let snadCount = 0;
       if (order.orderId && orderSnadCount.has(order.orderId)) {
@@ -160,14 +161,14 @@ router.get('/details', requireAuth, requirePageAccess('AccountHealth'), async (r
       } else if (order.legacyOrderId && orderSnadCount.has(order.legacyOrderId)) {
         snadCount = orderSnadCount.get(order.legacyOrderId);
       }
-      
+
       let inrCount = 0;
       if (order.orderId && orderInrCount.has(order.orderId)) {
         inrCount = orderInrCount.get(order.orderId);
       } else if (order.legacyOrderId && orderInrCount.has(order.legacyOrderId)) {
         inrCount = orderInrCount.get(order.legacyOrderId);
       }
-      
+
       // Calculate remark date (3 months from order date)
       let remarkDate = null;
       if (order.dateSold) {
@@ -238,7 +239,7 @@ router.get('/evaluation-windows', requireAuth, requirePageAccess('AccountHealth'
     // We'll generate weekly windows, each spanning 84 days
     const windows = [];
     const today = new Date();
-    
+
     // Align to the most recent Sunday (or today if Sunday)
     let currentWindowEnd = new Date(today);
     const dayOfWeek = currentWindowEnd.getDay();
@@ -256,17 +257,17 @@ router.get('/evaluation-windows', requireAuth, requirePageAccess('AccountHealth'
     // - without seller selected: use only global metrics
     const marketMetricQuery = sellerId
       ? {
-          type: 'bbe_market_avg',
-          $or: [
-            { seller: new mongoose.Types.ObjectId(sellerId) },
-            { seller: { $exists: false } },
-            { seller: null }
-          ]
-        }
+        type: 'bbe_market_avg',
+        $or: [
+          { seller: new mongoose.Types.ObjectId(sellerId) },
+          { seller: { $exists: false } },
+          { seller: null }
+        ]
+      }
       : {
-          type: 'bbe_market_avg',
-          $or: [{ seller: { $exists: false } }, { seller: null }]
-        };
+        type: 'bbe_market_avg',
+        $or: [{ seller: { $exists: false } }, { seller: null }]
+      };
     // Important: when multiple metrics exist for the same effectiveDate,
     // prefer the most recently created record.
     const marketMetrics = await MarketMetric.find(marketMetricQuery)
@@ -276,7 +277,7 @@ router.get('/evaluation-windows', requireAuth, requirePageAccess('AccountHealth'
       ? marketMetrics.filter(m => m.seller && m.seller.toString() === sellerId)
       : [];
     const globalMetrics = marketMetrics.filter(m => !m.seller);
-    
+
     for (let i = 0; i < maxWindows; i++) {
       // Data should cover 84 days ending on the displayed window end date minus 1 day.
       // Example: if display end is 01/25, data should include up to 01/24.
@@ -338,7 +339,7 @@ router.get('/evaluation-windows', requireAuth, requirePageAccess('AccountHealth'
         totalSales: totalSalesCount,
         snadCount: totalSnadCount,
         bbeRate: bbeRate.toFixed(2),
-        marketAvg, 
+        marketAvg,
         evaluationDate: currentWindowEnd.toISOString()
       });
 
@@ -392,7 +393,7 @@ router.get('/evaluation-windows', requireAuth, requirePageAccess('AccountHealth'
 router.post('/evaluation-windows/market-avg', requireAuth, requirePageAccess('AccountHealth'), async (req, res) => {
   try {
     const { value, effectiveDate, sellerId } = req.body;
-    
+
     if (!value || isNaN(value)) {
       return res.status(400).json({ error: 'Valid value is required' });
     }
@@ -543,11 +544,11 @@ router.get('/overview', requireAuth, requirePageAccess('AccountHealth'), async (
 
       for (let weekIdx = 0; weekIdx < 4; weekIdx++) {
         const windowEnd = weekEnds[weekIdx];
-        
+
         // Apply the same row shift logic: data window is 1 week before display window
         const dataWindowEnd = new Date(windowEnd);
         dataWindowEnd.setDate(dataWindowEnd.getDate() - 7);
-        
+
         // Apply 7-day buffer
         const calculationEnd = new Date(dataWindowEnd);
         calculationEnd.setDate(calculationEnd.getDate() - 7);
