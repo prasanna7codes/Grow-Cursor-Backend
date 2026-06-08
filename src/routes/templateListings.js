@@ -6,6 +6,7 @@ import ListingTemplate from '../models/ListingTemplate.js';
 import Seller from '../models/Seller.js';
 import SellerPricingConfig from '../models/SellerPricingConfig.js';
 import { fetchAmazonData, applyFieldConfigs } from '../utils/asinAutofill.js';
+import { calculateStartPrice } from '../utils/pricingCalculator.js';
 import { generateSKUFromASIN, generateSKUWithCount } from '../utils/skuGenerator.js';
 import { getEffectiveTemplate } from '../utils/templateMerger.js';
 import { getUsageStats, getFieldExtractionStats, getRecentErrors, checkQuotaStatus } from '../utils/apiUsageTracker.js';
@@ -83,6 +84,52 @@ function buildAmazonSourceData(amazonData) {
     compatibility: amazonData.compatibility,
     productInfo: amazonData.productInfo || null
   };
+}
+
+function calculatePricingOnly(asin, amazonPrice, pricingConfig) {
+  if (!pricingConfig?.enabled) return null;
+
+  if (!amazonPrice || String(amazonPrice).trim() === '') {
+    console.warn(`[ASIN: ${asin}] ⚠️ duplicate pricing: Amazon price not available — cannot calculate startPrice`);
+    return {
+      enabled: true,
+      error: 'Amazon price not available'
+    };
+  }
+
+  try {
+    const amazonCost = parseFloat(String(amazonPrice).replace(/[^0-9.]/g, ''));
+
+    if (!isNaN(amazonCost) && amazonCost > 0) {
+      const result = calculateStartPrice(pricingConfig, amazonCost);
+      const pricingCalculation = {
+        enabled: true,
+        amazonCost: amazonPrice,
+        calculatedStartPrice: result.price.toFixed(2),
+        breakdown: result.breakdown
+      };
+
+      if (result.breakdown.profitTier?.enabled) {
+        console.log(`[ASIN: ${asin}] 💰 duplicate pricing: ${amazonPrice} → $${result.price.toFixed(2)} (tier: ${result.breakdown.profitTier.costRange}, +₹${result.breakdown.profitTier.profit})`);
+      } else {
+        console.log(`[ASIN: ${asin}] 💰 duplicate pricing: ${amazonPrice} → $${result.price.toFixed(2)}`);
+      }
+
+      return pricingCalculation;
+    }
+
+    console.warn(`[ASIN: ${asin}] ⚠️ duplicate pricing: invalid price "${amazonPrice}" (parsed: ${amazonCost})`);
+    return {
+      enabled: true,
+      error: `Invalid price value: ${amazonPrice}`
+    };
+  } catch (error) {
+    console.error(`[ASIN: ${asin}] ❌ duplicate pricing error: ${error.message}`);
+    return {
+      enabled: true,
+      error: error.message
+    };
+  }
 }
 
 async function runWithConcurrency(items, concurrency, worker) {
@@ -1030,8 +1077,7 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
                   progressStage: 'generating'
                 });
                 freshAmazonSourcePrice = amazonData.price ? String(amazonData.price) : freshAmazonSourcePrice;
-                const configs = await applyFieldConfigs(amazonData, template.asinAutomation.fieldConfigs, pricingConfig, buildAiUsageContext(req, templateId, sellerId));
-                pricingCalculation = configs.pricingCalculation;
+                pricingCalculation = calculatePricingOnly(asin, amazonData.price, pricingConfig);
               }
             } catch (fetchErr) {
               // Non-fatal: chip won't render but the rest of the modal works fine
@@ -1349,18 +1395,7 @@ router.get('/bulk-preview-from-directory-stream', requireAuthSSE, async (req, re
 
           if (doc) {
             sourceData = buildDirectorySourceData(doc);
-            
-            const amazonData = {
-              asin,
-              ...sourceData,
-              model: doc.model || '',
-              material: doc.material || '',
-              specialFeatures: doc.specialFeatures || '',
-              size: doc.size || ''
-            };
-            
-            const configs = await applyFieldConfigs(amazonData, template.asinAutomation.fieldConfigs, pricingConfig, buildAiUsageContext(req, templateId, sellerId));
-            pricingCalculation = configs.pricingCalculation;
+            pricingCalculation = calculatePricingOnly(asin, sourceData.price, pricingConfig);
           }
 
           const freshStartPrice = pricingCalculation?.calculatedStartPrice ?? existingListing.startPrice;
