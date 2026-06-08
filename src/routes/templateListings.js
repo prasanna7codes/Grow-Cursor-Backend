@@ -867,6 +867,7 @@ router.get('/analytics', requireAuth, async (req, res) => {
 router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
   try {
     const { templateId, sellerId, asins: asinsParam, region = 'US' } = req.query;
+    const streamStartTime = Date.now();
     
     if (!templateId || !sellerId || !asinsParam) {
       return res.status(400).json({ error: 'Template ID, Seller ID, and ASINs are required' });
@@ -980,17 +981,44 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
         asin: listing._asinReference
       }])
     );
+
+    const asinDirectoryDocs = await AsinDirectory.find({
+      asin: { $in: asins }
+    }).select('asin listingCount images').lean();
+    const asinDirectoryMap = new Map(
+      asinDirectoryDocs.map(doc => [doc.asin, doc])
+    );
     
     // Process ASINs with controlled concurrency and stream results as they complete.
     let completed = 0;
+    let started = 0;
+    let active = 0;
+
+    const buildProgressMeta = () => ({
+      completed,
+      started,
+      active,
+      queued: Math.max(asins.length - started, 0),
+      total: asins.length
+    });
     
     await runWithConcurrency(asins, streamConcurrency, async (asin) => {
+      const asinStartTime = Date.now();
+      const timings = {
+        queueWaitMs: asinStartTime - streamStartTime
+      };
+
+      started += 1;
+      active += 1;
+
       try {
         sendSse({
           type: 'item_started',
           asin,
           id: `preview-${asin}`,
-          progressStage: 'fetching'
+          progressStage: 'fetching',
+          timings,
+          progressMeta: buildProgressMeta()
         });
 
         // If ASIN exists in another template, note warning but continue with generation
@@ -1005,7 +1033,7 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
           const existingListing = asinInCurrentTemplate.get(asin);
           const existingCustomFields = existingListing.customFields || {};
 
-          const asinDoc = await AsinDirectory.findOne({ asin }).lean();
+          const asinDoc = asinDirectoryMap.get(asin);
           const futureSKU = generateSKUWithCount(asin, asinDoc?.listingCount || 0);
 
           let sourceData = null;
@@ -1018,7 +1046,9 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
             // Always refresh duplicate ASIN previews so price/source data stays current.
             try {
               console.log(`[duplicate_updateable] Fetching fresh Amazon data for ${asin}`);
+              const fetchStartTime = Date.now();
               const amazonData = await fetchAmazonData(asin, region);
+              timings.amazonFetchMs = Date.now() - fetchStartTime;
               if (amazonData) {
                 duplicateImages = Array.isArray(amazonData.images) ? amazonData.images : duplicateImages;
                 sourceData = buildAmazonSourceData(amazonData);
@@ -1027,10 +1057,14 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
                   asin,
                   id: `preview-${asin}`,
                   sourceData,
-                  progressStage: 'generating'
+                  progressStage: 'generating',
+                  timings,
+                  progressMeta: buildProgressMeta()
                 });
                 freshAmazonSourcePrice = amazonData.price ? String(amazonData.price) : freshAmazonSourcePrice;
+                const aiStartTime = Date.now();
                 const configs = await applyFieldConfigs(amazonData, template.asinAutomation.fieldConfigs, pricingConfig, buildAiUsageContext(req, templateId, sellerId));
+                timings.aiGenerationMs = Date.now() - aiStartTime;
                 pricingCalculation = configs.pricingCalculation;
               }
             } catch (fetchErr) {
@@ -1042,6 +1076,7 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
           // Return existing listing data for editing (generatedListing = user's current saved data)
           // _amazonSourcePrice is included so the save endpoint stores it automatically
           const freshStartPrice = pricingCalculation?.calculatedStartPrice ?? existingListing.startPrice;
+          timings.totalMs = Date.now() - asinStartTime;
           const item = {
             id: `preview-${asin}`,
             asin,
@@ -1067,6 +1102,7 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
               ...(freshAmazonSourcePrice ? { _amazonSourcePrice: freshAmazonSourcePrice } : {})
             },
             progressStage: 'complete',
+            timings,
             warnings: [
               `This ASIN already exists in this template.`,
               existingListing.duplicateCount > 0
@@ -1076,7 +1112,9 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
             errors: []
           };
 
-          sendSse({ type: 'item', item, progress: ++completed, total: asins.length });
+          completed += 1;
+          console.log(`[SSE Timing] ${asin} duplicate_updateable total=${timings.totalMs}ms fetch=${timings.amazonFetchMs || 0}ms ai=${timings.aiGenerationMs || 0}ms queue=${timings.queueWaitMs}ms`);
+          sendSse({ type: 'item', item, progress: completed, total: asins.length, progressMeta: buildProgressMeta() });
           return;
         }
 
@@ -1087,6 +1125,7 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
         const existingSKU = existingSKUMap.get(sku);
         
         if (existingSKU) {
+          timings.totalMs = Date.now() - asinStartTime;
           const item = {
             id: `preview-${asin}`,
             asin,
@@ -1094,24 +1133,32 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
             status: 'blocked',
             progressStage: 'complete',
             blockedReason: 'sku_conflict',
+            timings,
             errors: [`SKU ${sku} already exists`]
           };
-          sendSse({ type: 'item', item, progress: ++completed, total: asins.length });
+          completed += 1;
+          sendSse({ type: 'item', item, progress: completed, total: asins.length, progressMeta: buildProgressMeta() });
           return;
         }
         
         // Fetch and process ASIN (new listing case)
+        const fetchStartTime = Date.now();
         const amazonData = await fetchAmazonData(asin, region);
+        timings.amazonFetchMs = Date.now() - fetchStartTime;
         const sourceData = buildAmazonSourceData(amazonData);
         sendSse({
           type: 'amazon_loaded',
           asin,
           id: `preview-${asin}`,
           sourceData,
-          progressStage: 'generating'
+          progressStage: 'generating',
+          timings,
+          progressMeta: buildProgressMeta()
         });
+        const aiStartTime = Date.now();
         const { coreFields, customFields, pricingCalculation } = 
           await applyFieldConfigs(amazonData, template.asinAutomation.fieldConfigs, pricingConfig, buildAiUsageContext(req, templateId, sellerId));
+        timings.aiGenerationMs = Date.now() - aiStartTime;
         
         const mergedCoreFields = {
           ...(template.coreFieldDefaults || {}),
@@ -1143,8 +1190,9 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
         }
 
         // Compute count-based SKU for new listing preview
-        const countDoc = await AsinDirectory.findOne({ asin }).select('listingCount').lean();
+        const countDoc = asinDirectoryMap.get(asin);
         const finalSKU = generateSKUWithCount(asin, countDoc?.listingCount || 0);
+        timings.totalMs = Date.now() - asinStartTime;
 
         const item = {
           id: `preview-${asin}`,
@@ -1162,23 +1210,32 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
           warnings,
           errors: validationErrors,
           progressStage: 'complete',
+          timings,
           status: validationErrors.length > 0 ? 'error' : (warnings.length > 0 ? 'warning' : 'success')
         };
 
         // Stream the completed item
-        sendSse({ type: 'item', item, progress: ++completed, total: asins.length });
+        completed += 1;
+        console.log(`[SSE Timing] ${asin} ${item.status} total=${timings.totalMs}ms fetch=${timings.amazonFetchMs || 0}ms ai=${timings.aiGenerationMs || 0}ms queue=${timings.queueWaitMs}ms`);
+        sendSse({ type: 'item', item, progress: completed, total: asins.length, progressMeta: buildProgressMeta() });
 
       } catch (error) {
         console.error(`❌ Error processing ASIN ${asin}:`, error);
+        timings.totalMs = Date.now() - asinStartTime;
         const item = {
           id: `preview-${asin}`,
           asin,
           sku: generateSKUFromASIN(asin),
           status: 'error',
           progressStage: 'complete',
+          timings,
           errors: [error.message]
         };
-        sendSse({ type: 'item', item, progress: ++completed, total: asins.length });
+        completed += 1;
+        console.log(`[SSE Timing] ${asin} error total=${timings.totalMs}ms fetch=${timings.amazonFetchMs || 0}ms ai=${timings.aiGenerationMs || 0}ms queue=${timings.queueWaitMs}ms`);
+        sendSse({ type: 'item', item, progress: completed, total: asins.length, progressMeta: buildProgressMeta() });
+      } finally {
+        active = Math.max(active - 1, 0);
       }
     });
 
