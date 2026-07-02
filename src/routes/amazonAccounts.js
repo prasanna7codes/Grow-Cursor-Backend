@@ -30,7 +30,7 @@ const router = Router();
  */
 router.get('/', requireAuth, async (req, res) => {
   try {
-    const accounts = await AmazonAccount.find().sort({ name: 1 });
+    const accounts = await AmazonAccount.find().sort({ name: 1 }).lean();
     res.json(accounts);
   } catch (e) {
     res.status(500).json({ error: e.message });

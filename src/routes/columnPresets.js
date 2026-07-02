@@ -39,7 +39,7 @@ router.get('/', requireAuth, async (req, res) => {
     const query = {};
     if (page) query.page = page;
     
-    const presets = await ColumnPreset.find(query).sort({ name: 1 });
+    const presets = await ColumnPreset.find(query).sort({ name: 1 }).lean();
     res.json(presets);
   } catch (e) {
     res.status(500).json({ error: e.message });

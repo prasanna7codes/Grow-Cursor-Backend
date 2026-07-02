@@ -29,7 +29,7 @@ const router = express.Router();
 // Get all credit card names
 router.get('/', requireAuth, async (req, res) => {
     try {
-        const cards = await CreditCardName.find().sort({ name: 1 });
+        const cards = await CreditCardName.find().sort({ name: 1 }).lean();
         res.json(cards);
     } catch (error) {
         console.error('Error fetching credit card names:', error);

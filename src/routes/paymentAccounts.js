@@ -31,7 +31,8 @@ router.get('/', requireAuth, requirePageAccess('BankAccounts'), async (req, res)
     try {
         const accounts = await PaymentAccount.find()
             .populate('bankAccount', 'name')
-            .sort({ name: 1 });
+            .sort({ name: 1 })
+            .lean();
         res.json(accounts);
     } catch (err) {
         res.status(500).json({ error: err.message });

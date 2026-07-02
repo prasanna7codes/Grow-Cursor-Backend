@@ -28,7 +28,7 @@ const router = express.Router();
  */
 router.get('/', requireAuth, requirePageAccess('ExtraExpenses'), async (req, res) => {
     try {
-        const expenses = await ExtraExpense.find().sort({ date: -1 });
+        const expenses = await ExtraExpense.find().sort({ date: -1 }).lean();
         res.json(expenses);
     } catch (err) {
         res.status(500).json({ error: err.message });

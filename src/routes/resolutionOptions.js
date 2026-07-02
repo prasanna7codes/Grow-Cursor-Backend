@@ -44,7 +44,7 @@ async function ensureDefaultOptions() {
 router.get('/', requireAuth, async (req, res) => {
     try {
         await ensureDefaultOptions();
-        const options = await ResolutionOption.find().sort({ name: 1 });
+        const options = await ResolutionOption.find().sort({ name: 1 }).lean();
         res.json(options);
     } catch (error) {
         console.error('Error fetching resolution options:', error);

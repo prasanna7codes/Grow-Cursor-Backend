@@ -29,7 +29,7 @@ const router = express.Router();
  */
 router.get('/', requireAuth, requirePageAccess(['BankAccounts', 'Transactions','Payoneer']), async (req, res) => {
     try {
-        const accounts = await BankAccount.find().sort({ name: 1 });
+        const accounts = await BankAccount.find().sort({ name: 1 }).lean();
         res.json(accounts);
     } catch (err) {
         res.status(500).json({ error: err.message });

@@ -66,7 +66,7 @@ router.post('/', requireAuth, requirePageAccess('ManageCategories'), validate(cr
 router.get('/', requireAuth, async (req, res) => {
   const { categoryId } = req.query || {};
   const query = categoryId ? { category: categoryId } : {};
-  const items = await Subcategory.find(query).populate('category').sort({ name: 1 });
+  const items = await Subcategory.find(query).populate('category').sort({ name: 1 }).lean();
   res.json(items);
 });
 

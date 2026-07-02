@@ -76,7 +76,7 @@ router.post('/', requireAuth, requirePageAccess('ManageStores'), validate(create
 router.get('/', requireAuth, async (req, res) => {
   const { platformId } = req.query || {};
   const query = platformId ? { platform: platformId } : {};
-  const items = await Store.find(query).populate('platform').sort({ name: 1 });
+  const items = await Store.find(query).populate('platform').sort({ name: 1 }).lean();
   res.json(items);
 });
 

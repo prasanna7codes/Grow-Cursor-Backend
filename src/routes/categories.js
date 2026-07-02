@@ -60,7 +60,7 @@ router.post('/', requireAuth, requirePageAccess('ManageCategories'), validate(cr
  *       401: { description: Unauthorized }
  */
 router.get('/', requireAuth, async (req, res) => {
-  const items = await Category.find().sort({ name: 1 });
+  const items = await Category.find().sort({ name: 1 }).lean();
   res.json(items);
 });
 
