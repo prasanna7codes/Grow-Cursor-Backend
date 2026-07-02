@@ -478,3 +478,56 @@ export const adminProfileFieldsSchema = z.object({
   workingMode: z.string().optional(),
   workingHours: z.union([z.string(), z.number()]).optional(),
 });
+
+// ── Listing stats ────────────────────────────────────────────────────────────
+
+export const listingStatsDayWiseQuerySchema = z.object({
+  startDate: optionalDateStringSchema,
+  endDate: optionalDateStringSchema,
+  sellerId: optionalObjectIdSchema,
+});
+
+export const listingStatsSummaryQuerySchema = z.object({
+  startDate: optionalDateStringSchema,
+  endDate: optionalDateStringSchema,
+});
+
+// ── Seller pricing config ────────────────────────────────────────────────────
+
+export const sellerPricingConfigQuerySchema = z.object({
+  sellerId: objectIdSchema,
+  templateId: objectIdSchema,
+});
+
+export const sellerPricingConfigBodySchema = z.object({
+  sellerId: objectIdSchema,
+  templateId: objectIdSchema,
+  pricingConfig: z.record(z.string(), z.any()),
+});
+
+// ── Exchange rates ────────────────────────────────────────────────────────────
+
+export const exchangeRateCurrentQuerySchema = z.object({
+  marketplace: z.string().trim().optional(),
+});
+
+export const exchangeRateHistoryQuerySchema = z.object({
+  marketplace: z.string().trim().optional(),
+  limit: z.coerce.number().int().positive().max(500).optional(),
+});
+
+export const exchangeRateForDateQuerySchema = z.object({
+  date: z.string().trim().min(1, 'date is required'),
+  marketplace: z.string().trim().optional(),
+});
+
+export const createExchangeRateSchema = z.object({
+  rate: z.coerce.number({ invalid_type_error: 'rate must be a number' }).positive('rate must be a positive number'),
+  effectiveDate: z.string().trim().min(1, 'effectiveDate is required'),
+  marketplace: z.string().trim().optional(),
+  notes: z.string().optional(),
+  applicationMode: z.enum(['effective', 'specific-date'], {
+    errorMap: () => ({ message: 'applicationMode must be either effective or specific-date' }),
+  }).optional(),
+  updateExistingOrders: z.boolean().optional(),
+});

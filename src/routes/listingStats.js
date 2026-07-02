@@ -2,6 +2,8 @@ import express from 'express';
 import Listing from '../models/Listing.js';
 import Seller from '../models/Seller.js';
 import { requireAuth, requirePageAccess } from '../middleware/auth.js';
+import { validate } from '../utils/validate.js';
+import { listingStatsDayWiseQuerySchema, listingStatsSummaryQuerySchema } from '../schemas/index.js';
 
 const router = express.Router();
 const PT_TIMEZONE = 'America/Los_Angeles';
@@ -56,7 +58,7 @@ function getPTDayBoundsUTC(dateStr) {
  *       500:
  *         description: Server error
  */
-router.get('/day-wise-counts', requireAuth, async (req, res) => {
+router.get('/day-wise-counts', requireAuth, validate(listingStatsDayWiseQuerySchema, 'query'), async (req, res) => {
   try {
     const { startDate, endDate, sellerId } = req.query;
 
@@ -188,7 +190,7 @@ router.get('/day-wise-counts', requireAuth, async (req, res) => {
  *       500:
  *         description: Server error
  */
-router.get('/summary', requireAuth, async (req, res) => {
+router.get('/summary', requireAuth, validate(listingStatsSummaryQuerySchema, 'query'), async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
 

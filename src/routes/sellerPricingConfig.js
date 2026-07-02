@@ -3,6 +3,8 @@ import { requireAuth } from '../middleware/auth.js';
 import SellerPricingConfig from '../models/SellerPricingConfig.js';
 import ListingTemplate from '../models/ListingTemplate.js';
 import { validateProfitTiers } from '../utils/pricingCalculator.js';
+import { validate } from '../utils/validate.js';
+import { sellerPricingConfigQuerySchema, sellerPricingConfigBodySchema } from '../schemas/index.js';
 
 const router = express.Router();
 
@@ -47,15 +49,9 @@ const router = express.Router();
  *       500:
  *         description: Internal server error
  */
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, validate(sellerPricingConfigQuerySchema, 'query'), async (req, res) => {
   try {
     const { sellerId, templateId } = req.query;
-
-    if (!sellerId || !templateId) {
-      return res.status(400).json({ 
-        error: 'sellerId and templateId are required' 
-      });
-    }
 
     // Try to find seller-specific config
     const sellerConfig = await SellerPricingConfig.findOne({ 
@@ -140,21 +136,9 @@ router.get('/', requireAuth, async (req, res) => {
  *         description: Internal server error
  */
 // Create or update pricing config for seller+template
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, validate(sellerPricingConfigBodySchema), async (req, res) => {
   try {
     const { sellerId, templateId, pricingConfig } = req.body;
-
-    if (!sellerId || !templateId) {
-      return res.status(400).json({ 
-        error: 'sellerId and templateId are required' 
-      });
-    }
-
-    if (!pricingConfig) {
-      return res.status(400).json({ 
-        error: 'pricingConfig is required' 
-      });
-    }
 
     // Validate profit tiers if enabled
     if (pricingConfig.profitTiers?.enabled) {
@@ -228,17 +212,11 @@ router.post('/', requireAuth, async (req, res) => {
  *         description: Internal server error
  */
 // Delete pricing config (revert to template default)
-router.delete('/', requireAuth, async (req, res) => {
+router.delete('/', requireAuth, validate(sellerPricingConfigQuerySchema, 'query'), async (req, res) => {
   try {
     const { sellerId, templateId } = req.query;
 
-    if (!sellerId || !templateId) {
-      return res.status(400).json({ 
-        error: 'sellerId and templateId are required' 
-      });
-    }
-
-    await SellerPricingConfig.findOneAndDelete({ 
+    await SellerPricingConfig.findOneAndDelete({
       sellerId, 
       templateId 
     });
