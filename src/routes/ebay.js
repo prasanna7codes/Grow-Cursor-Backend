@@ -7049,6 +7049,146 @@ router.post('/resync-existing-orders-by-utc-date', requireAuth, requirePageAcces
   }
 });
 
+// ============================================
+// PT Refresh preview: token health + order count, without mutating orders
+// ============================================
+router.get('/pt-refresh-preview', requireAuth, requirePageAccess('Fulfillment'), async (req, res) => {
+  try {
+    const { startDate, endDate, sellerId } = req.query;
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+
+    if (!dateRegex.test(startDate || '') || !dateRegex.test(endDate || '')) {
+      return res.status(400).json({ error: 'startDate and endDate are required in YYYY-MM-DD format' });
+    }
+
+    const { start: startUTC } = getPTDayBoundsUTC(startDate);
+    const { end: endUTC } = getPTDayBoundsUTC(endDate);
+
+    if (Number.isNaN(startUTC.getTime()) || Number.isNaN(endUTC.getTime()) || startUTC > endUTC) {
+      return res.status(400).json({ error: 'Invalid Pacific Time date range' });
+    }
+
+    const rangeDays = Math.floor((endUTC.getTime() - startUTC.getTime()) / 86400000) + 1;
+    if (rangeDays > 90) {
+      return res.status(400).json({ error: 'Date range cannot exceed 90 Pacific Time days' });
+    }
+
+    const sellerQuery = { 'ebayTokens.refresh_token': { $exists: true, $ne: null } };
+    if (sellerId) {
+      if (!mongoose.Types.ObjectId.isValid(sellerId)) {
+        return res.status(400).json({ error: 'Invalid sellerId' });
+      }
+      sellerQuery._id = sellerId;
+    }
+
+    const sellers = await Seller.find(sellerQuery).populate('user', 'username email');
+    const filter = `creationdate:[${startUTC.toISOString()}..${endUTC.toISOString()}]`;
+
+    // Count-only fetch with the same retry/backoff behavior as the real paginated
+    // fetch (fetchAllOrdersWithPagination), so a transient 429/503/timeout doesn't
+    // get misreported as a broken seller token.
+    async function fetchOrderCountWithRetry(accessToken, maxRetries = 3) {
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          const response = await axios.get('https://api.ebay.com/sell/fulfillment/v1/order', {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+              'Content-Type': 'application/json',
+            },
+            params: { filter, limit: 1 },
+            timeout: 15000
+          });
+          return response.data.total ?? (response.data.orders || []).length;
+        } catch (err) {
+          const status = err.response?.status;
+          const isRetryable = status === 503 || status === 429 || err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT';
+          if (isRetryable && attempt < maxRetries) {
+            const waitTime = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+            continue;
+          }
+          throw err;
+        }
+      }
+    }
+
+    async function checkSeller(seller) {
+      const sellerName = seller.user?.username || seller.user?.email || seller._id.toString();
+      const now = Date.now();
+      const fetchedAt = seller.ebayTokens.fetchedAt ? new Date(seller.ebayTokens.fetchedAt).getTime() : 0;
+      const expiresInMs = (seller.ebayTokens.expires_in || 0) * 1000;
+      const bufferTime = 2 * 60 * 1000;
+      const wasValidBefore = !!(fetchedAt && (now - fetchedAt < expiresInMs - bufferTime));
+
+      let accessToken;
+      try {
+        accessToken = await ensureValidToken(seller);
+      } catch (tokenErr) {
+        return {
+          sellerId: seller._id,
+          sellerName,
+          tokenStatus: 'needs_reconnect',
+          orderCountPreview: null,
+          error: tokenErr.message
+        };
+      }
+
+      try {
+        const orderCountPreview = await fetchOrderCountWithRetry(accessToken);
+        return {
+          sellerId: seller._id,
+          sellerName,
+          tokenStatus: wasValidBefore ? 'active' : 'refreshed',
+          orderCountPreview,
+          error: null
+        };
+      } catch (fetchErr) {
+        console.error(
+          `[PT Refresh Preview] Fulfillment API call failed for ${sellerName}:`,
+          fetchErr.response?.status,
+          JSON.stringify(fetchErr.response?.data) || fetchErr.message
+        );
+        return {
+          sellerId: seller._id,
+          sellerName,
+          tokenStatus: 'fetch_error',
+          orderCountPreview: null,
+          error: fetchErr.response?.data?.errors?.[0]?.message || fetchErr.message
+        };
+      }
+    }
+
+    // Check sellers in small concurrent batches (instead of all at once) to avoid
+    // bursting eBay's rate limiter across ~20 sellers simultaneously.
+    const BATCH_SIZE = 5;
+    const sellerResults = [];
+    for (let i = 0; i < sellers.length; i += BATCH_SIZE) {
+      const batch = sellers.slice(i, i + BATCH_SIZE);
+      const batchResults = await Promise.allSettled(batch.map(checkSeller));
+      sellerResults.push(...batchResults.map(result =>
+        result.status === 'fulfilled'
+          ? result.value
+          : { tokenStatus: 'fetch_error', orderCountPreview: null, error: result.reason?.message || 'Unknown error' }
+      ));
+      if (i + BATCH_SIZE < sellers.length) {
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+    }
+
+    const totalPreviewCount = sellerResults.reduce((sum, s) => sum + (s.orderCountPreview || 0), 0);
+    const sellersNeedingAttention = sellerResults.filter(s => s.tokenStatus === 'needs_reconnect' || s.tokenStatus === 'fetch_error');
+
+    res.json({
+      sellers: sellerResults,
+      totalPreviewCount,
+      sellersNeedingAttention
+    });
+  } catch (err) {
+    console.error('Error in PT refresh preview:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get('/pt-refresh-history', requireAuth, requirePageAccess('Fulfillment'), async (req, res) => {
   try {
     const logs = await PtRefreshLog.find()
