@@ -2,7 +2,11 @@ import express from 'express';
 import axios from 'axios';
 import pLimit from 'p-limit';
 import { parseStringPromise } from 'xml2js';
-import { requireAuth, requirePageAccess } from '../middleware/auth.js';
+import { requireAuth, requirePageAccess, requireFeatureAccess } from '../middleware/auth.js';
+
+// Feature id used to gate who may run Estimate/Start on this page (superadmin
+// always allowed; others must be explicitly granted via /feature-permissions).
+export const AMAZON_STOCK_CHECK_RUN_FEATURE_ID = 'amazonStockCheck.run';
 import SellerSkuIndex from '../models/SellerSkuIndex.js';
 import TemplateListing from '../models/TemplateListing.js';
 import Seller from '../models/Seller.js';
@@ -840,7 +844,7 @@ async function getItemFilterCounts(runId) {
   };
 }
 
-router.get('/estimate', requireAuth, requirePageAccess(['AmazonStockCheck']), async (req, res) => {
+router.get('/estimate', requireAuth, requirePageAccess(['AmazonStockCheck']), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), async (req, res) => {
   const requestStartedAt = Date.now();
   try {
     const mode = req.query.mode === 'pilot_option_b' ? 'pilot_option_b' : (req.query.mode === 'full' ? 'full' : 'custom');
@@ -893,7 +897,7 @@ router.get('/estimate', requireAuth, requirePageAccess(['AmazonStockCheck']), as
   }
 });
 
-router.post('/runs', requireAuth, requirePageAccess(['AmazonStockCheck']), async (req, res) => {
+router.post('/runs', requireAuth, requirePageAccess(['AmazonStockCheck']), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), async (req, res) => {
   try {
     const mode = req.body?.mode === 'pilot_option_b' ? 'pilot_option_b' : (req.body?.mode === 'full' ? 'full' : 'custom');
     const currencies = mode === 'pilot_option_b'
