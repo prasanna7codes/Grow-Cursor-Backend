@@ -3,6 +3,13 @@ import mongoose from 'mongoose';
 import PayoneerRecord from '../models/PayoneerRecord.js';
 import Transaction from '../models/Transaction.js';
 import { requireAuth, requirePageAccess } from '../middleware/auth.js';
+import { validate } from '../utils/validate.js';
+import {
+  payoneerListQuerySchema,
+  createPayoneerRecordSchema,
+  updatePayoneerRecordSchema,
+  idParamsSchema
+} from '../schemas/index.js';
 
 const router = express.Router();
 
@@ -67,7 +74,7 @@ const calculateFields = (amount, exchangeRate) => {
  *       500:
  *         description: Internal server error
  */
-router.get('/', requireAuth, requirePageAccess('Payoneer'), async (req, res) => {
+router.get('/', requireAuth, requirePageAccess('Payoneer'), validate(payoneerListQuerySchema, 'query'), async (req, res) => {
     try {
         const { page = 1, limit = 50, startDate, endDate, store } = req.query;
 
@@ -176,13 +183,9 @@ router.get('/', requireAuth, requirePageAccess('Payoneer'), async (req, res) => 
  *       500:
  *         description: Internal server error
  */
-router.post('/', requireAuth, requirePageAccess('Payoneer'), async (req, res) => {
+router.post('/', requireAuth, requirePageAccess('Payoneer'), validate(createPayoneerRecordSchema), async (req, res) => {
     try {
         const { bankAccount, paymentDate, amount, exchangeRate, store, periodStart, periodEnd, profit } = req.body;
-
-        if (!bankAccount || !paymentDate || !amount || !exchangeRate || !store) {
-            return res.status(400).json({ error: 'Missing required fields' });
-        }
 
         const calcs = calculateFields(amount, exchangeRate);
 
@@ -272,7 +275,13 @@ router.post('/', requireAuth, requirePageAccess('Payoneer'), async (req, res) =>
  *       500:
  *         description: Internal server error
  */
-router.put('/:id', requireAuth, requirePageAccess('Payoneer'), async (req, res) => {
+router.put(
+    '/:id',
+    requireAuth,
+    requirePageAccess('Payoneer'),
+    validate(idParamsSchema, 'params'),
+    validate(updatePayoneerRecordSchema),
+    async (req, res) => {
     try {
         const { id } = req.params;
         const { bankAccount, paymentDate, amount, exchangeRate, store, periodStart, periodEnd, profit } = req.body;
@@ -354,7 +363,7 @@ router.put('/:id', requireAuth, requirePageAccess('Payoneer'), async (req, res) 
  *       500:
  *         description: Internal server error
  */
-router.delete('/:id', requireAuth, requirePageAccess('Payoneer'), async (req, res) => {
+router.delete('/:id', requireAuth, requirePageAccess('Payoneer'), validate(idParamsSchema, 'params'), async (req, res) => {
     try {
         const { id } = req.params;
         await PayoneerRecord.findByIdAndDelete(id);

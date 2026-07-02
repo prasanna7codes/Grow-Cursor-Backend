@@ -531,3 +531,53 @@ export const createExchangeRateSchema = z.object({
   }).optional(),
   updateExistingOrders: z.boolean().optional(),
 });
+
+// ── Payoneer ──────────────────────────────────────────────────────────────────
+
+export const payoneerListQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+  startDate: optionalDateStringSchema,
+  endDate: optionalDateStringSchema,
+  store: optionalObjectIdSchema,
+});
+
+export const createPayoneerRecordSchema = z.object({
+  bankAccount: objectIdSchema,
+  paymentDate: z.string().trim().min(1, 'paymentDate is required'),
+  amount: z.coerce.number({ invalid_type_error: 'amount must be a number' }).positive('amount must be a positive number'),
+  exchangeRate: z.coerce.number({ invalid_type_error: 'exchangeRate must be a number' }).positive('exchangeRate must be a positive number'),
+  store: objectIdSchema,
+  periodStart: z.string().optional(),
+  periodEnd: z.string().optional(),
+  profit: z.union([z.literal(''), z.coerce.number()]).optional(),
+});
+
+export const updatePayoneerRecordSchema = createPayoneerRecordSchema.partial();
+
+// ── User category targets ────────────────────────────────────────────────────
+
+const USER_CATEGORY_TARGET_MARKETPLACES = ['US', 'UK', 'AU', 'Canada'];
+
+export const userCategoryTargetsPerformanceQuerySchema = z.object({
+  startDate: optionalDateStringSchema,
+  endDate: optionalDateStringSchema,
+  userId: optionalObjectIdSchema,
+  sellerId: optionalObjectIdSchema,
+  marketplace: z.string().trim().optional(),
+  categoryId: optionalObjectIdSchema,
+  rangeId: optionalObjectIdSchema,
+});
+
+export const createUserCategoryTargetSchema = z.object({
+  userId: objectIdSchema,
+  sellerId: objectIdSchema,
+  marketplace: z.enum(USER_CATEGORY_TARGET_MARKETPLACES, {
+    errorMap: () => ({ message: 'marketplace must be one of: US, UK, AU, Canada' }),
+  }),
+  categoryId: objectIdSchema,
+  rangeId: optionalObjectIdSchema,
+  dailyDesiredQuantity: z.coerce.number({
+    invalid_type_error: 'Daily desired quantity must be a number greater than or equal to 0',
+  }).min(0, 'Daily desired quantity must be a number greater than or equal to 0'),
+});

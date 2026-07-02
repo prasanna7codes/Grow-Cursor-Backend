@@ -9,6 +9,12 @@ import AsinListRange from '../models/AsinListRange.js';
 import FeedUpload from '../models/FeedUpload.js';
 import TemplateListing from '../models/TemplateListing.js';
 import AiListingRun from '../models/AiListingRun.js';
+import { validate } from '../utils/validate.js';
+import {
+  userCategoryTargetsPerformanceQuerySchema,
+  createUserCategoryTargetSchema,
+  idParamsSchema
+} from '../schemas/index.js';
 
 const router = express.Router();
 const PT_TIMEZONE = 'America/Los_Angeles';
@@ -16,9 +22,6 @@ const IST_TIMEZONE = 'Asia/Kolkata';
 
 const pageAccess = requirePageAccess('UserCategoryTargets');
 const performancePageAccess = requirePageAccess(['UserCategoryTargets', 'UserListingPerformance']);
-const MARKETPLACES = ['US', 'UK', 'AU', 'Canada'];
-
-const isValidObjectId = (value) => mongoose.Types.ObjectId.isValid(value);
 
 function getPTDate(offsetDays = 0) {
   const date = new Date(Date.now() + offsetDays * 86400000);
@@ -85,7 +88,7 @@ function buildIstHourlyRows(hourMap = new Map()) {
   });
 }
 
-router.get('/performance', requireAuth, performancePageAccess, async (req, res) => {
+router.get('/performance', requireAuth, performancePageAccess, validate(userCategoryTargetsPerformanceQuerySchema, 'query'), async (req, res) => {
   const {
     startDate = getPTDate(),
     endDate = startDate,
@@ -98,10 +101,6 @@ router.get('/performance', requireAuth, performancePageAccess, async (req, res) 
 
   if (!startDate || !endDate) {
     return res.status(400).json({ error: 'startDate and endDate are required' });
-  }
-
-  if ([userId, sellerId, categoryId, rangeId].filter(Boolean).some((id) => !isValidObjectId(id))) {
-    return res.status(400).json({ error: 'Invalid filter id' });
   }
 
   try {
@@ -350,25 +349,8 @@ router.get('/', requireAuth, pageAccess, async (req, res) => {
   }
 });
 
-router.post('/', requireAuth, pageAccess, async (req, res) => {
+router.post('/', requireAuth, pageAccess, validate(createUserCategoryTargetSchema), async (req, res) => {
   const { userId, sellerId, marketplace, categoryId, rangeId, dailyDesiredQuantity } = req.body || {};
-
-  if (!userId || !sellerId || !marketplace || !categoryId || dailyDesiredQuantity == null) {
-    return res.status(400).json({ error: 'userId, sellerId, marketplace, categoryId, and dailyDesiredQuantity are required' });
-  }
-
-  if (!MARKETPLACES.includes(marketplace)) {
-    return res.status(400).json({ error: 'marketplace must be one of: US, UK, AU, Canada' });
-  }
-
-  if (![userId, sellerId, categoryId].every(isValidObjectId) || (rangeId && !isValidObjectId(rangeId))) {
-    return res.status(400).json({ error: 'Invalid user, seller, or category id' });
-  }
-
-  const quantity = Number(dailyDesiredQuantity);
-  if (!Number.isFinite(quantity) || quantity < 0) {
-    return res.status(400).json({ error: 'Daily desired quantity must be a number greater than or equal to 0' });
-  }
 
   try {
     const [userExists, sellerExists, categoryExists, rangeDoc] = await Promise.all([
@@ -388,7 +370,7 @@ router.post('/', requireAuth, pageAccess, async (req, res) => {
 
     const target = await UserCategoryTarget.findOneAndUpdate(
       { user: userId, seller: sellerId, marketplace, category: categoryId, range: rangeId || null },
-      { user: userId, seller: sellerId, marketplace, category: categoryId, range: rangeId || null, dailyDesiredQuantity: quantity },
+      { user: userId, seller: sellerId, marketplace, category: categoryId, range: rangeId || null, dailyDesiredQuantity },
       { upsert: true, new: true, runValidators: true }
     )
       .populate('user', 'username email role department')
@@ -407,11 +389,8 @@ router.post('/', requireAuth, pageAccess, async (req, res) => {
   }
 });
 
-router.delete('/:id', requireAuth, pageAccess, async (req, res) => {
+router.delete('/:id', requireAuth, pageAccess, validate(idParamsSchema, 'params'), async (req, res) => {
   const { id } = req.params;
-  if (!isValidObjectId(id)) {
-    return res.status(400).json({ error: 'Invalid target id' });
-  }
 
   try {
     const deleted = await UserCategoryTarget.findByIdAndDelete(id);
