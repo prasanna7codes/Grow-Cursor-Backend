@@ -1,5 +1,6 @@
 import jwt from 'jsonwebtoken';
 import User from '../models/User.js';
+import FeaturePermission from '../models/FeaturePermission.js';
 
 // Page registry: maps pageId -> defaultRoles (backward compat)
 // This is the server-side source of truth for which roles have default access to each page
@@ -291,6 +292,34 @@ export function requirePageAccess(pageId, defaultRoles) {
       }
     } catch (err) {
       console.error('requirePageAccess error:', err);
+      return res.status(500).json({ error: 'Internal server error' });
+    }
+  };
+}
+
+// Button/feature-level gate, finer-grained than requirePageAccess: superadmin
+// always passes, everyone else must be explicitly listed in the FeaturePermission
+// doc for featureId (defaults to nobody until a superadmin configures it).
+export function requireFeatureAccess(featureId) {
+  return async function (req, res, next) {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    if (req.user.role === 'superadmin') {
+      return next();
+    }
+
+    try {
+      const permission = await FeaturePermission.findOne({ featureId }).lean();
+      const allowedUserIds = permission?.allowedUserIds || [];
+      const isAllowed = allowedUserIds.some((id) => id.toString() === req.user.userId);
+      if (isAllowed) {
+        return next();
+      }
+      return res.status(403).json({ error: 'Forbidden: You do not have access to this feature' });
+    } catch (err) {
+      console.error('requireFeatureAccess error:', err);
       return res.status(500).json({ error: 'Internal server error' });
     }
   };
