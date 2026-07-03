@@ -3825,12 +3825,39 @@ router.get('/stored-orders', requireAuth, async (req, res) => {
       });
     });
 
+    // Lookup last buyer/seller message timestamps per order (same "Buyer SLA" basis
+    // used on Conversation Management), scoped by seller+orderId to avoid cross-seller collisions.
+    const sellerIdsForSla = [...new Set(orders.map(order => order.seller?._id?.toString()).filter(Boolean))]
+      .map(id => new mongoose.Types.ObjectId(id));
+    const slaMap = new Map();
+    if (orderIds.length > 0 && sellerIdsForSla.length > 0) {
+      const slaAgg = await Message.aggregate([
+        { $match: { orderId: { $in: orderIds }, seller: { $in: sellerIdsForSla } } },
+        {
+          $group: {
+            _id: { seller: '$seller', orderId: '$orderId' },
+            lastBuyerMessageAt: { $max: { $cond: [{ $eq: ['$sender', 'BUYER'] }, '$messageDate', null] } },
+            lastSellerMessageAt: { $max: { $cond: [{ $eq: ['$sender', 'SELLER'] }, '$messageDate', null] } }
+          }
+        }
+      ]);
+      slaAgg.forEach(row => {
+        slaMap.set(`${row._id.seller}_${row._id.orderId}`, {
+          lastBuyerMessageAt: row.lastBuyerMessageAt,
+          lastSellerMessageAt: row.lastSellerMessageAt
+        });
+      });
+    }
+
     // Add fromConvoManagement fields to each order
     const ordersWithConvoData = orders.map(order => {
       const orderObj = order.toObject();
       const convoData = conversationMetaMap.get(order.orderId);
       orderObj.convoCategory = convoData?.category || null;
       orderObj.convoCaseStatus = convoData?.caseStatus || null;
+      const slaData = slaMap.get(`${order.seller?._id}_${order.orderId}`);
+      orderObj.lastBuyerMessageAt = slaData?.lastBuyerMessageAt || null;
+      orderObj.lastSellerMessageAt = slaData?.lastSellerMessageAt || null;
       return orderObj;
     });
 
