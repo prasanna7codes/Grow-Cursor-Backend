@@ -1120,13 +1120,12 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
       });
     }
 
+    // Lifetime order history for these item IDs (a SKU has only a handful of
+    // item IDs, so this stays small even for busy listings).
     let orders = [];
     if (itemIds.length) {
       orders = await Order.find({
-        $and: [
-          { $or: [{ itemNumber: { $in: itemIds } }, { 'lineItems.legacyItemId': { $in: itemIds } }] },
-          { $or: [{ dateSold: { $gte: since } }, { creationDate: { $gte: since } }] }
-        ]
+        $or: [{ itemNumber: { $in: itemIds } }, { 'lineItems.legacyItemId': { $in: itemIds } }]
       })
         .select('seller orderId dateSold creationDate itemNumber lineItems quantity subtotal productName')
         .sort({ dateSold: -1, creationDate: -1 })
@@ -1138,7 +1137,7 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
     const ordersByKey = new Map();
     for (const order of orders) {
       const orderDate = order.dateSold || order.creationDate || null;
-      if (!orderDate || new Date(orderDate) < since) continue;
+      if (!orderDate) continue;
       const ids = new Set();
       if (order.itemNumber) ids.add(order.itemNumber);
       for (const lineItem of order.lineItems || []) {
@@ -1158,9 +1157,24 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
       }
     }
 
+    // Last 12 calendar months (oldest first) for the per-item order sparkline.
+    const monthKeys = [];
+    const now = new Date();
+    for (let i = 11; i >= 0; i -= 1) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      monthKeys.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
+    }
+
     const enrichedSellerItems = sellerItems.map((row) => {
       const key = `${String(row.sellerId)}:${row.itemId}`;
-      const rowOrders = (ordersByKey.get(key) || []).sort((a, b) => new Date(b.date) - new Date(a.date));
+      const allOrders = (ordersByKey.get(key) || []).sort((a, b) => new Date(b.date) - new Date(a.date));
+      const recentOrders = allOrders.filter((order) => new Date(order.date) >= since);
+      const countsByMonth = new Map();
+      for (const order of allOrders) {
+        const d = new Date(order.date);
+        const monthKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        countsByMonth.set(monthKey, (countsByMonth.get(monthKey) || 0) + 1);
+      }
       return {
         sellerId: row.sellerId,
         sellerName: row.sellerName,
@@ -1170,8 +1184,10 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
         currency: row.currency || item.currency,
         quantityZeroStatus: row.quantityZeroStatus || 'not_needed',
         isRunSeller: runSellerId ? String(row.sellerId) === runSellerId : false,
-        orderCount30d: rowOrders.length,
-        orders: rowOrders.slice(0, 20),
+        orderCount30d: recentOrders.length,
+        orders: recentOrders.slice(0, 20),
+        lifetimeOrderCount: allOrders.length,
+        monthlyOrders: monthKeys.map((month) => ({ month, count: countsByMonth.get(month) || 0 })),
         endedInfo: endedByKey.get(key) || null
       };
     });
