@@ -115,6 +115,14 @@ function getConfig(currency) {
   return COUNTRY_CONFIG[normalizeCurrency(currency)] || null;
 }
 
+// Raw currency values to match in the SKU index for a normalized currency.
+// Legacy UK rows were synced with currency "GB" instead of "GBP"; the other
+// currencies are stored consistently and need no alias.
+function currencyAliases(currency) {
+  const normalized = normalizeCurrency(currency);
+  return normalized === 'GBP' ? ['GBP', 'GB'] : [normalized];
+}
+
 function cleanSku(value) {
   return String(value || '').trim();
 }
@@ -378,24 +386,34 @@ async function buildCandidates({ currencies, mode, limit, sellerId }) {
       : Number.parseInt(limit, 10) || null;
 
     const currencyStartedAt = Date.now();
-    const match = { currency: config.currency, sku: { $ne: '' } };
+    const match = { currency: { $in: currencyAliases(config.currency) }, sku: { $ne: '' } };
     if (sellerId) match.seller = new mongoose.Types.ObjectId(String(sellerId));
+    // One candidate per BASE SKU: variant listings like GRW25X-1 fold into
+    // GRW25X so the same product is checked (and billed) once per currency.
     const rows = await SellerSkuIndex.aggregate([
       { $match: match },
-      { $sort: { sku: 1, syncedAt: -1 } },
+      {
+        $addFields: {
+          groupKey: {
+            $let: {
+              vars: { base: { $ifNull: ['$baseSku', ''] } },
+              in: { $cond: [{ $eq: ['$$base', ''] }, '$sku', '$$base'] }
+            }
+          }
+        }
+      },
       {
         $group: {
-          _id: '$sku',
-          sku: { $first: '$sku' },
-          baseSku: { $first: '$baseSku' },
+          _id: '$groupKey',
           currency: { $first: '$currency' },
           sellers: { $addToSet: '$seller' },
           itemCount: { $sum: 1 }
         }
       },
+      { $project: { _id: 0, sku: '$_id', baseSku: '$_id', currency: 1, sellers: 1, itemCount: 1 } },
       { $sort: { sku: 1 } },
       ...(runLimit ? [{ $limit: runLimit }] : [])
-    ]);
+    ]).allowDiskUse(true);
     stockCheckLog('buildCandidates:currencyComplete', {
       currency: config.currency,
       runLimit,
@@ -488,9 +506,11 @@ async function enrichCandidates(candidates, { includeSellerItems = true } = {}) 
   }
 
   const skuIndexStartedAt = Date.now();
+  // Candidates are keyed by base SKU, so pull every index row whose base (or
+  // exact, for legacy rows without a baseSku) matches.
   const skuIndexRows = await SellerSkuIndex.find({
-    sku: { $in: skus },
-    currency: { $in: [...new Set(candidates.map((row) => row.currency))] }
+    $or: [{ baseSku: { $in: skus } }, { sku: { $in: skus } }],
+    currency: { $in: [...new Set(candidates.flatMap((row) => currencyAliases(row.currency)))] }
   }).lean();
   stockCheckLog('enrichCandidates:skuIndexLookupComplete', {
     skuIndexRowCount: skuIndexRows.length,
@@ -509,7 +529,7 @@ async function enrichCandidates(candidates, { includeSellerItems = true } = {}) 
   for (const row of skuIndexRows) {
     const sku = cleanSku(row.sku);
     const currency = normalizeCurrency(row.currency);
-    const key = `${currency}:${sku}`;
+    const key = `${currency}:${cleanSku(row.baseSku) || sku}`;
     const arr = sellerItemsByKey.get(key) || [];
     const sellerItem = {
       sellerId: row.seller,
@@ -1035,7 +1055,16 @@ router.get('/seller-summary', requireAuth, requirePageAccess(STOCK_CHECK_PAGES),
 
     const rows = await SellerSkuIndex.aggregate([
       { $match: { seller: new mongoose.Types.ObjectId(sellerId), sku: { $nin: ['', null] } } },
-      { $addFields: { normalizedCurrency: { $toUpper: { $ifNull: ['$currency', 'UNKNOWN'] } } } },
+      {
+        $addFields: {
+          normalizedCurrency: {
+            $let: {
+              vars: { cur: { $toUpper: { $ifNull: ['$currency', 'UNKNOWN'] } } },
+              in: { $cond: [{ $eq: ['$$cur', 'GB'] }, 'GBP', '$$cur'] }
+            }
+          }
+        }
+      },
       {
         $group: {
           _id: { currency: '$normalizedCurrency', sku: '$sku' },
@@ -1096,19 +1125,75 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
     const config = getConfig(item.currency);
     const amazonUrl = item.asin && config ? `https://www.amazon.${config.domain}/dp/${item.asin}` : '';
 
-    const sellerItems = item.sellerItems || [];
+    // Gather item IDs live from the SKU index by BASE SKU (same currency), so
+    // variant listings like GRW25X and GRW25X-1 are reviewed together and the
+    // list reflects the current index rather than the run-time snapshot.
+    const exactSku = cleanSku(item.sku);
+    const baseLabel = getBaseLabel(item.sku);
+    const baseCandidates = [...new Set([exactSku, baseLabel].filter(Boolean))];
+    const currencyMatches = currencyAliases(item.currency);
+    const indexRows = baseCandidates.length
+      ? await SellerSkuIndex.find({
+          currency: { $in: currencyMatches },
+          $or: [{ baseSku: { $in: baseCandidates } }, { sku: exactSku }]
+        }).lean()
+      : [];
+
+    let sellerItems;
+    if (indexRows.length) {
+      sellerItems = indexRows.map((row) => ({
+        sellerId: row.seller,
+        sellerName: String(row.seller), // replaced with the username below
+        itemId: row.itemId,
+        sku: cleanSku(row.sku),
+        title: row.title || '',
+        price: row.price ?? null,
+        currency: normalizeCurrency(row.currency),
+        quantityZeroStatus: 'not_needed'
+      }));
+    } else {
+      // Index has no rows for this base SKU any more (e.g. everything was
+      // ended and re-synced) — fall back to the snapshot stored on the run.
+      sellerItems = (item.sellerItems || []).map((row) => ({ ...row, sku: item.sku }));
+    }
+
     const itemIds = [...new Set(sellerItems.map((row) => row.itemId).filter(Boolean))];
     const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
 
-    // Prior end-listing actions for these item IDs (any source), so the panel
-    // can show "already ended, by whom, when" on reopen.
-    let endLogs = [];
-    if (itemIds.length) {
-      endLogs = await EndListingLog.find({ itemId: { $in: itemIds } })
-        .populate('endedBy', 'username name email')
-        .sort({ endedAt: -1 })
-        .lean();
+    // Seller names, prior end-listing actions, and order history are
+    // independent lookups — run them in parallel.
+    const [sellerNameMap, endLogs, orders] = await Promise.all([
+      indexRows.length
+        ? getSellerNameMap([...new Set(indexRows.map((row) => row.seller).filter(Boolean))])
+        : Promise.resolve(new Map()),
+      itemIds.length
+        ? EndListingLog.find({ itemId: { $in: itemIds } })
+            .populate('endedBy', 'username name email')
+            .sort({ endedAt: -1 })
+            .lean()
+        : Promise.resolve([]),
+      itemIds.length
+        ? Order.find({
+            $or: [{ itemNumber: { $in: itemIds } }, { 'lineItems.legacyItemId': { $in: itemIds } }]
+          })
+            .select('seller orderId dateSold creationDate itemNumber lineItems quantity subtotal productName')
+            .sort({ dateSold: -1, creationDate: -1 })
+            .lean()
+        : Promise.resolve([])
+    ]);
+
+    if (sellerNameMap.size) {
+      for (const row of sellerItems) {
+        row.sellerName = sellerNameMap.get(String(row.sellerId)) || row.sellerName;
+      }
     }
+    // Exact-SKU rows first, then variants, then by seller name for stable reading order.
+    sellerItems.sort((a, b) => (
+      (a.sku === item.sku ? 0 : 1) - (b.sku === item.sku ? 0 : 1)
+      || String(a.sku).localeCompare(String(b.sku))
+      || String(a.sellerName).localeCompare(String(b.sellerName))
+    ));
+
     const endedByKey = new Map();
     for (const log of endLogs) {
       const key = `${String(log.seller)}:${log.itemId}`;
@@ -1118,18 +1203,6 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
         endedBy: log.endedBy?.username || log.endedBy?.name || log.endedBy?.email || null,
         source: log.source
       });
-    }
-
-    // Lifetime order history for these item IDs (a SKU has only a handful of
-    // item IDs, so this stays small even for busy listings).
-    let orders = [];
-    if (itemIds.length) {
-      orders = await Order.find({
-        $or: [{ itemNumber: { $in: itemIds } }, { 'lineItems.legacyItemId': { $in: itemIds } }]
-      })
-        .select('seller orderId dateSold creationDate itemNumber lineItems quantity subtotal productName')
-        .sort({ dateSold: -1, creationDate: -1 })
-        .lean();
     }
 
     // Group orders by (seller, itemId); an order can reference an item id via
@@ -1179,6 +1252,7 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
         sellerId: row.sellerId,
         sellerName: row.sellerName,
         itemId: row.itemId,
+        sku: row.sku || item.sku,
         title: row.title || '',
         price: row.price ?? null,
         currency: row.currency || item.currency,
@@ -1206,6 +1280,56 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
     });
   } catch (error) {
     res.status(500).json({ error: error.message || 'Failed to load verification data' });
+  }
+});
+
+// POST /amazon-stock-checks/live-images
+// Fetches current listing images straight from eBay (Trading GetItem) for the
+// verify panel. Any connected seller's token can read public items; the panel
+// passes its selected seller. Fetched lazily by the client so verify stays fast.
+const liveImageLimit = pLimit(6);
+router.post('/live-images', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
+  try {
+    const sellerId = String(req.body?.sellerId || '');
+    const itemIds = [...new Set((req.body?.itemIds || []).map((id) => String(id).trim()).filter(Boolean))].slice(0, 24);
+    if (!mongoose.Types.ObjectId.isValid(sellerId) || !itemIds.length) {
+      return res.status(400).json({ error: 'sellerId and itemIds are required.' });
+    }
+
+    const seller = await Seller.findById(sellerId);
+    if (!seller) return res.status(404).json({ error: 'Seller not found.' });
+    const token = await ensureValidToken(seller);
+
+    const entries = await Promise.all(itemIds.map((itemId) => liveImageLimit(async () => {
+      try {
+        const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+<GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
+  <ItemID>${itemId}</ItemID>
+  <OutputSelector>Item.ItemID</OutputSelector>
+  <OutputSelector>Item.PictureDetails</OutputSelector>
+</GetItemRequest>`;
+        const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
+          headers: {
+            'X-EBAY-API-SITEID': '0',
+            'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
+            'X-EBAY-API-CALL-NAME': 'GetItem',
+            'Content-Type': 'text/xml'
+          },
+          timeout: 20000
+        });
+        const parsed = await parseStringPromise(response.data, { explicitArray: false });
+        const pictureUrl = parsed?.GetItemResponse?.Item?.PictureDetails?.PictureURL;
+        const url = Array.isArray(pictureUrl) ? pictureUrl[0] : pictureUrl;
+        return url ? [itemId, url] : null;
+      } catch {
+        return null; // ended/unavailable items simply have no image
+      }
+    })));
+
+    res.json({ images: Object.fromEntries(entries.filter(Boolean)) });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to load listing images' });
   }
 });
 
@@ -1398,7 +1522,14 @@ router.get('/runs/:runId/items', requireAuth, requirePageAccess(STOCK_CHECK_PAGE
   const skip = (page - 1) * limit;
 
   const [items, total] = await Promise.all([
-    AmazonStockCheckItem.find(query).sort({ status: 1, sku: 1 }).skip(skip).limit(limit).lean(),
+    AmazonStockCheckItem.find(query)
+      // Raw scraper payload fields are never rendered by the UI; excluding
+      // them keeps the list response small (they can be large per row).
+      .select('-scraperResponseSummary -previousStatus -scraperStatusCode')
+      .sort({ status: 1, sku: 1 })
+      .skip(skip)
+      .limit(limit)
+      .lean(),
     AmazonStockCheckItem.countDocuments(query)
   ]);
 
