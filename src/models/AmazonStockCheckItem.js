@@ -15,7 +15,13 @@ const SellerItemSchema = new mongoose.Schema(
       enum: ['not_needed', 'pending', 'success', 'failed', 'skipped'],
       default: 'not_needed'
     },
-    quantityZeroError: { type: String, default: '' }
+    quantityZeroError: { type: String, default: '' },
+    quantityOneStatus: {
+      type: String,
+      enum: ['not_needed', 'pending', 'success', 'failed', 'skipped'],
+      default: 'not_needed'
+    },
+    quantityOneError: { type: String, default: '' }
   },
   { _id: false }
 );
@@ -29,7 +35,7 @@ const AmazonStockCheckItemSchema = new mongoose.Schema(
     country: { type: String, required: true },
     status: {
       type: String,
-      enum: ['queued', 'processing', 'in_stock', 'low_stock', 'out_of_stock', 'no_asin', 'error'],
+      enum: ['queued', 'processing', 'in_stock', 'low_stock', 'out_of_stock', 'unknown_stock_text', 'no_asin', 'error'],
       default: 'queued',
       index: true
     },
@@ -41,6 +47,9 @@ const AmazonStockCheckItemSchema = new mongoose.Schema(
     previousStatus: { type: String, default: '' },
     becameAvailable: { type: Boolean, default: false, index: true },
     error: { type: String, default: '' },
+    errorType: { type: String, default: '', index: true },
+    errorSource: { type: String, default: '' },
+    retryable: { type: Boolean, default: false },
     checkedAt: { type: Date, default: null }
   },
   { timestamps: true }
@@ -50,6 +59,7 @@ AmazonStockCheckItemSchema.index({ run: 1, status: 1 });
 AmazonStockCheckItemSchema.index({ run: 1, status: 1, asin: 1 });
 AmazonStockCheckItemSchema.index({ run: 1, becameAvailable: 1 });
 AmazonStockCheckItemSchema.index({ run: 1, 'sellerItems.quantityZeroStatus': 1 });
+AmazonStockCheckItemSchema.index({ run: 1, 'sellerItems.quantityOneStatus': 1 });
 AmazonStockCheckItemSchema.index({ run: 1, 'sellerItems.orderCount': 1 });
 AmazonStockCheckItemSchema.index({ currency: 1, sku: 1, asin: 1 });
 
