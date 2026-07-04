@@ -12,9 +12,11 @@ const AmazonStockCheckRunSchema = new mongoose.Schema(
     },
     mode: {
       type: String,
-      enum: ['pilot_option_b', 'custom', 'full'],
+      enum: ['pilot_option_b', 'custom', 'full', 'seller'],
       default: 'custom'
     },
+    // Optional seller scope: when set, only this seller's SKU index rows are checked.
+    seller: { type: mongoose.Schema.Types.ObjectId, ref: 'Seller', default: null, index: true },
     threshold: { type: Number, default: 10 },
     autoZeroQuantity: { type: Boolean, default: false },
     requestedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },

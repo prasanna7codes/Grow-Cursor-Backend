@@ -1,4 +1,5 @@
 import express from 'express';
+import mongoose from 'mongoose';
 import axios from 'axios';
 import pLimit from 'p-limit';
 import { parseStringPromise } from 'xml2js';
@@ -7,6 +8,10 @@ import { requireAuth, requirePageAccess, requireFeatureAccess } from '../middlew
 // Feature id used to gate who may run Estimate/Start on this page (superadmin
 // always allowed; others must be explicitly granted via /feature-permissions).
 export const AMAZON_STOCK_CHECK_RUN_FEATURE_ID = 'amazonStockCheck.run';
+
+// Pages allowed to use these endpoints. SellerSkuStockCheck is the
+// seller-scoped variant of the Amazon Stock Check page.
+const STOCK_CHECK_PAGES = ['AmazonStockCheck', 'SellerSkuStockCheck'];
 import SellerSkuIndex from '../models/SellerSkuIndex.js';
 import TemplateListing from '../models/TemplateListing.js';
 import Seller from '../models/Seller.js';
@@ -360,9 +365,9 @@ function attachOrderSummariesFromMap(sellerItems, orderMap) {
   });
 }
 
-async function buildCandidates({ currencies, mode, limit }) {
+async function buildCandidates({ currencies, mode, limit, sellerId }) {
   const startedAt = Date.now();
-  stockCheckLog('buildCandidates:start', { currencies, mode, limit: limit || null });
+  stockCheckLog('buildCandidates:start', { currencies, mode, limit: limit || null, sellerId: sellerId ? String(sellerId) : null });
   const candidates = [];
   for (const currency of currencies) {
     const config = getConfig(currency);
@@ -372,8 +377,10 @@ async function buildCandidates({ currencies, mode, limit }) {
       : Number.parseInt(limit, 10) || null;
 
     const currencyStartedAt = Date.now();
+    const match = { currency: config.currency, sku: { $ne: '' } };
+    if (sellerId) match.seller = new mongoose.Types.ObjectId(String(sellerId));
     const rows = await SellerSkuIndex.aggregate([
-      { $match: { currency: config.currency, sku: { $ne: '' } } },
+      { $match: match },
       { $sort: { sku: 1, syncedAt: -1 } },
       {
         $group: {
@@ -719,7 +726,7 @@ async function initializeRunItems(run) {
   }
 
   const currencies = run.currencies.map(normalizeCurrency);
-  const candidates = await withMongoRetry('Build SKU candidate list', () => buildCandidates({ currencies, mode: run.mode }));
+  const candidates = await withMongoRetry('Build SKU candidate list', () => buildCandidates({ currencies, mode: run.mode, sellerId: run.seller || null }));
   await AmazonStockCheckRun.findByIdAndUpdate(runId, {
     totalSkus: candidates.length,
     candidateBuildComplete: false
@@ -1011,10 +1018,162 @@ async function getItemFilterCounts(runId) {
   };
 }
 
-router.get('/estimate', requireAuth, requirePageAccess(['AmazonStockCheck']), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), async (req, res) => {
+// GET /amazon-stock-checks/seller-summary?sellerId=...
+// Per-currency SKU index summary for one seller: unique SKU count, listing
+// count, and extra duplicate count (mirrors the SKU Index Dashboard math).
+router.get('/seller-summary', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
+  try {
+    const sellerId = String(req.query.sellerId || '');
+    if (!mongoose.Types.ObjectId.isValid(sellerId)) {
+      return res.status(400).json({ error: 'A valid sellerId is required.' });
+    }
+
+    const rows = await SellerSkuIndex.aggregate([
+      { $match: { seller: new mongoose.Types.ObjectId(sellerId), sku: { $nin: ['', null] } } },
+      { $addFields: { normalizedCurrency: { $toUpper: { $ifNull: ['$currency', 'UNKNOWN'] } } } },
+      {
+        $group: {
+          _id: { currency: '$normalizedCurrency', sku: '$sku' },
+          listingCount: { $sum: 1 }
+        }
+      },
+      {
+        $group: {
+          _id: '$_id.currency',
+          uniqueSkuCount: { $sum: 1 },
+          listingCount: { $sum: '$listingCount' },
+          duplicateSkuCount: { $sum: { $cond: [{ $gt: ['$listingCount', 1] }, 1, 0] } },
+          extraCount: { $sum: { $subtract: ['$listingCount', 1] } }
+        }
+      },
+      { $sort: { listingCount: -1 } }
+    ]);
+
+    const currencies = rows.map((row) => {
+      const config = getConfig(row._id);
+      return {
+        currency: row._id,
+        country: config?.country || row._id,
+        supported: Boolean(config),
+        credits: config?.credits || 0,
+        uniqueSkuCount: row.uniqueSkuCount,
+        listingCount: row.listingCount,
+        duplicateSkuCount: row.duplicateSkuCount,
+        extraCount: row.extraCount
+      };
+    });
+
+    const totals = currencies.reduce((acc, row) => {
+      acc.uniqueSkuCount += row.uniqueSkuCount;
+      acc.listingCount += row.listingCount;
+      acc.duplicateSkuCount += row.duplicateSkuCount;
+      acc.extraCount += row.extraCount;
+      return acc;
+    }, { uniqueSkuCount: 0, listingCount: 0, duplicateSkuCount: 0, extraCount: 0 });
+
+    res.json({ sellerId, currencies, totals });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to load seller SKU summary' });
+  }
+});
+
+// GET /amazon-stock-checks/items/:itemId/verify
+// Verification data for one checked SKU: the Amazon product URL for the
+// item's country plus every seller's item IDs for this SKU/currency with
+// their orders from the last 30 days.
+router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
+  try {
+    const item = await AmazonStockCheckItem.findById(req.params.itemId).lean();
+    if (!item) return res.status(404).json({ error: 'Item result not found' });
+
+    const run = await AmazonStockCheckRun.findById(item.run).select('seller').lean();
+    const runSellerId = run?.seller ? String(run.seller) : null;
+    const config = getConfig(item.currency);
+    const amazonUrl = item.asin && config ? `https://www.amazon.${config.domain}/dp/${item.asin}` : '';
+
+    const sellerItems = item.sellerItems || [];
+    const itemIds = [...new Set(sellerItems.map((row) => row.itemId).filter(Boolean))];
+    const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    let orders = [];
+    if (itemIds.length) {
+      orders = await Order.find({
+        $and: [
+          { $or: [{ itemNumber: { $in: itemIds } }, { 'lineItems.legacyItemId': { $in: itemIds } }] },
+          { $or: [{ dateSold: { $gte: since } }, { creationDate: { $gte: since } }] }
+        ]
+      })
+        .select('seller orderId dateSold creationDate itemNumber lineItems quantity subtotal productName')
+        .sort({ dateSold: -1, creationDate: -1 })
+        .lean();
+    }
+
+    // Group orders by (seller, itemId); an order can reference an item id via
+    // the denormalized itemNumber or any of its line items.
+    const ordersByKey = new Map();
+    for (const order of orders) {
+      const orderDate = order.dateSold || order.creationDate || null;
+      if (!orderDate || new Date(orderDate) < since) continue;
+      const ids = new Set();
+      if (order.itemNumber) ids.add(order.itemNumber);
+      for (const lineItem of order.lineItems || []) {
+        if (lineItem?.legacyItemId) ids.add(lineItem.legacyItemId);
+      }
+      for (const itemId of ids) {
+        const key = `${String(order.seller)}:${itemId}`;
+        const list = ordersByKey.get(key) || [];
+        list.push({
+          orderId: order.orderId,
+          date: orderDate,
+          quantity: order.quantity ?? null,
+          subtotal: order.subtotal ?? null,
+          productName: order.productName || ''
+        });
+        ordersByKey.set(key, list);
+      }
+    }
+
+    const enrichedSellerItems = sellerItems.map((row) => {
+      const key = `${String(row.sellerId)}:${row.itemId}`;
+      const rowOrders = (ordersByKey.get(key) || []).sort((a, b) => new Date(b.date) - new Date(a.date));
+      return {
+        sellerId: row.sellerId,
+        sellerName: row.sellerName,
+        itemId: row.itemId,
+        title: row.title || '',
+        price: row.price ?? null,
+        currency: row.currency || item.currency,
+        quantityZeroStatus: row.quantityZeroStatus || 'not_needed',
+        isRunSeller: runSellerId ? String(row.sellerId) === runSellerId : false,
+        orderCount30d: rowOrders.length,
+        orders: rowOrders.slice(0, 20)
+      };
+    });
+
+    res.json({
+      sku: item.sku,
+      asin: item.asin,
+      currency: item.currency,
+      country: item.country,
+      status: item.status,
+      stockQuantity: item.stockQuantity,
+      availabilityText: item.availabilityText,
+      amazonUrl,
+      runSellerId,
+      sellerItems: enrichedSellerItems
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to load verification data' });
+  }
+});
+
+router.get('/estimate', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), async (req, res) => {
   const requestStartedAt = Date.now();
   try {
-    const mode = req.query.mode === 'pilot_option_b' ? 'pilot_option_b' : (req.query.mode === 'full' ? 'full' : 'custom');
+    const sellerId = mongoose.Types.ObjectId.isValid(String(req.query.sellerId || '')) ? String(req.query.sellerId) : null;
+    const mode = sellerId
+      ? 'seller'
+      : (req.query.mode === 'pilot_option_b' ? 'pilot_option_b' : (req.query.mode === 'full' ? 'full' : 'custom'));
     const currencies = mode === 'pilot_option_b'
       ? Object.keys(PILOT_OPTION_B_LIMITS)
       : (mode === 'full'
@@ -1023,10 +1182,11 @@ router.get('/estimate', requireAuth, requirePageAccess(['AmazonStockCheck']), re
     stockCheckLog('estimate:start', {
       mode,
       currencies,
+      sellerId,
       limit: req.query.limit || null,
       userId: req.user?.userId || null
     });
-    const candidates = await buildCandidates({ currencies, mode, limit: req.query.limit });
+    const candidates = await buildCandidates({ currencies, mode, limit: req.query.limit, sellerId });
     const enriched = await enrichCandidates(candidates, { includeSellerItems: false });
     const withAsin = enriched.filter((row) => row.asin);
     stockCheckLog('estimate:complete', {
@@ -1064,9 +1224,12 @@ router.get('/estimate', requireAuth, requirePageAccess(['AmazonStockCheck']), re
   }
 });
 
-router.post('/runs', requireAuth, requirePageAccess(['AmazonStockCheck']), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), async (req, res) => {
+router.post('/runs', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), async (req, res) => {
   try {
-    const mode = req.body?.mode === 'pilot_option_b' ? 'pilot_option_b' : (req.body?.mode === 'full' ? 'full' : 'custom');
+    const sellerId = mongoose.Types.ObjectId.isValid(String(req.body?.sellerId || '')) ? String(req.body.sellerId) : null;
+    const mode = sellerId
+      ? 'seller'
+      : (req.body?.mode === 'pilot_option_b' ? 'pilot_option_b' : (req.body?.mode === 'full' ? 'full' : 'custom'));
     const currencies = mode === 'pilot_option_b'
       ? Object.keys(PILOT_OPTION_B_LIMITS)
       : (req.body?.currencies || ['USD']).map(normalizeCurrency).filter((cur) => getConfig(cur));
@@ -1075,11 +1238,17 @@ router.post('/runs', requireAuth, requirePageAccess(['AmazonStockCheck']), requi
       return res.status(400).json({ error: 'Select at least one supported currency.' });
     }
 
+    if (sellerId) {
+      const sellerExists = await Seller.exists({ _id: sellerId });
+      if (!sellerExists) return res.status(404).json({ error: 'Seller not found.' });
+    }
+
     const run = await AmazonStockCheckRun.create({
       countries: currencies.map((currency) => getConfig(currency).country),
       currencies,
       status: 'queued',
       mode,
+      seller: sellerId,
       threshold: Number.parseInt(req.body?.threshold, 10) || 10,
       autoZeroQuantity: Boolean(req.body?.autoZeroQuantity),
       requestedBy: req.user?.userId || null
@@ -1092,7 +1261,7 @@ router.post('/runs', requireAuth, requirePageAccess(['AmazonStockCheck']), requi
   }
 });
 
-router.post('/runs/:runId/pause', requireAuth, requirePageAccess(['AmazonStockCheck']), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), async (req, res) => {
+router.post('/runs/:runId/pause', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), async (req, res) => {
   const run = await AmazonStockCheckRun.findById(req.params.runId);
   if (!run) return res.status(404).json({ error: 'Run not found' });
   if (!['queued', 'running'].includes(run.status)) {
@@ -1108,7 +1277,7 @@ router.post('/runs/:runId/pause', requireAuth, requirePageAccess(['AmazonStockCh
   res.json({ run, message: 'Run paused.' });
 });
 
-router.post('/runs/:runId/resume', requireAuth, requirePageAccess(['AmazonStockCheck']), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), async (req, res) => {
+router.post('/runs/:runId/resume', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), async (req, res) => {
   const run = await AmazonStockCheckRun.findById(req.params.runId);
   if (!run) return res.status(404).json({ error: 'Run not found' });
   if (run.status !== 'paused') {
@@ -1127,7 +1296,7 @@ router.post('/runs/:runId/resume', requireAuth, requirePageAccess(['AmazonStockC
   res.json({ run, message: 'Run resumed.' });
 });
 
-router.post('/runs/:runId/cancel', requireAuth, requirePageAccess(['AmazonStockCheck']), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), async (req, res) => {
+router.post('/runs/:runId/cancel', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), async (req, res) => {
   const run = await AmazonStockCheckRun.findById(req.params.runId);
   if (!run) return res.status(404).json({ error: 'Run not found' });
   if (['completed', 'failed', 'cancelled'].includes(run.status)) {
@@ -1144,18 +1313,22 @@ router.post('/runs/:runId/cancel', requireAuth, requirePageAccess(['AmazonStockC
   res.json({ run, message: 'Run cancelled.' });
 });
 
-router.get('/runs', requireAuth, requirePageAccess(['AmazonStockCheck']), async (req, res) => {
+router.get('/runs', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
   const page = Math.max(1, Number.parseInt(req.query.page || '1', 10));
   const limit = Math.min(50, Math.max(5, Number.parseInt(req.query.limit || '20', 10)));
   const skip = (page - 1) * limit;
+  const runQuery = {};
+  if (mongoose.Types.ObjectId.isValid(String(req.query.sellerId || ''))) {
+    runQuery.seller = String(req.query.sellerId);
+  }
   const [runs, total] = await Promise.all([
-    AmazonStockCheckRun.find()
+    AmazonStockCheckRun.find(runQuery)
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit)
       .populate('requestedBy', 'username name email')
       .lean(),
-    AmazonStockCheckRun.countDocuments()
+    AmazonStockCheckRun.countDocuments(runQuery)
   ]);
   res.json({
     runs,
@@ -1168,14 +1341,14 @@ router.get('/runs', requireAuth, requirePageAccess(['AmazonStockCheck']), async 
   });
 });
 
-router.get('/runs/:runId', requireAuth, requirePageAccess(['AmazonStockCheck']), async (req, res) => {
+router.get('/runs/:runId', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
   const run = await AmazonStockCheckRun.findById(req.params.runId).populate('requestedBy', 'username name email').lean();
   if (!run) return res.status(404).json({ error: 'Run not found' });
   const itemCounts = await getItemFilterCounts(req.params.runId);
   res.json({ run, itemCounts });
 });
 
-router.get('/runs/:runId/items', requireAuth, requirePageAccess(['AmazonStockCheck']), async (req, res) => {
+router.get('/runs/:runId/items', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
   const filter = String(req.query.filter || 'actionable').trim();
   const page = Math.max(1, Number.parseInt(req.query.page || '1', 10));
   const limit = Math.min(500, Math.max(25, Number.parseInt(req.query.limit || '100', 10)));
@@ -1198,7 +1371,7 @@ router.get('/runs/:runId/items', requireAuth, requirePageAccess(['AmazonStockChe
   });
 });
 
-router.post('/items/:itemId/set-quantity-zero', requireAuth, requirePageAccess(['AmazonStockCheck']), async (req, res) => {
+router.post('/items/:itemId/set-quantity-zero', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
   const item = await AmazonStockCheckItem.findById(req.params.itemId).lean();
   if (!item) return res.status(404).json({ error: 'Item result not found' });
 
@@ -1234,7 +1407,7 @@ router.post('/items/:itemId/set-quantity-zero', requireAuth, requirePageAccess([
   });
 });
 
-router.post('/items/:itemId/set-quantity-one', requireAuth, requirePageAccess(['AmazonStockCheck']), async (req, res) => {
+router.post('/items/:itemId/set-quantity-one', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
   const item = await AmazonStockCheckItem.findById(req.params.itemId).lean();
   if (!item) return res.status(404).json({ error: 'Item result not found' });
 
