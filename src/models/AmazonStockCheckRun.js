@@ -6,7 +6,7 @@ const AmazonStockCheckRunSchema = new mongoose.Schema(
     currencies: [{ type: String, required: true }],
     status: {
       type: String,
-      enum: ['queued', 'running', 'completed', 'failed', 'cancelled'],
+      enum: ['queued', 'running', 'paused', 'completed', 'failed', 'cancelled'],
       default: 'queued',
       index: true
     },
@@ -29,8 +29,11 @@ const AmazonStockCheckRunSchema = new mongoose.Schema(
     becameAvailableCount: { type: Number, default: 0 },
     quantityZeroAttemptedCount: { type: Number, default: 0 },
     quantityZeroSuccessCount: { type: Number, default: 0 },
+    quantityZeroFailedCount: { type: Number, default: 0 },
     creditsEstimated: { type: Number, default: 0 },
     creditsUsed: { type: Number, default: 0 },
+    candidateBuildComplete: { type: Boolean, default: false },
+    unknownStockTextCount: { type: Number, default: 0 },
     error: { type: String, default: '' },
     startedAt: { type: Date, default: null },
     completedAt: { type: Date, default: null }
