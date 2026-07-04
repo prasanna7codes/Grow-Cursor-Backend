@@ -20,6 +20,7 @@ import AmazonStockCheckRun from '../models/AmazonStockCheckRun.js';
 import AmazonStockCheckItem from '../models/AmazonStockCheckItem.js';
 import AmazonStockSkuState from '../models/AmazonStockSkuState.js';
 import AmazonStockActionLog from '../models/AmazonStockActionLog.js';
+import EndListingLog from '../models/EndListingLog.js';
 import { ensureValidToken } from './ebay.js';
 
 const router = express.Router();
@@ -945,6 +946,7 @@ function normalizeItemFilters(filter) {
 }
 
 function getItemFilterCondition(filter) {
+  if (filter === 'in_stock') return { status: 'in_stock' };
   if (filter === 'low_stock') return { status: 'low_stock' };
   if (filter === 'out_of_stock') return { status: 'out_of_stock' };
   if (filter === 'unknown_stock_text') return { status: 'unknown_stock_text' };
@@ -978,6 +980,7 @@ async function getItemFilterCounts(runId) {
     all,
     actionable,
     checked,
+    inStock,
     lowStock,
     outOfStock,
     unknownStockText,
@@ -991,6 +994,7 @@ async function getItemFilterCounts(runId) {
     AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'all')),
     AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'actionable')),
     AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'checked')),
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'in_stock')),
     AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'low_stock')),
     AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'out_of_stock')),
     AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'unknown_stock_text')),
@@ -1006,6 +1010,7 @@ async function getItemFilterCounts(runId) {
     all,
     actionable,
     checked,
+    in_stock: inStock,
     low_stock: lowStock,
     out_of_stock: outOfStock,
     unknown_stock_text: unknownStockText,
@@ -1095,6 +1100,26 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
     const itemIds = [...new Set(sellerItems.map((row) => row.itemId).filter(Boolean))];
     const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
 
+    // Prior end-listing actions for these item IDs (any source), so the panel
+    // can show "already ended, by whom, when" on reopen.
+    let endLogs = [];
+    if (itemIds.length) {
+      endLogs = await EndListingLog.find({ itemId: { $in: itemIds } })
+        .populate('endedBy', 'username name email')
+        .sort({ endedAt: -1 })
+        .lean();
+    }
+    const endedByKey = new Map();
+    for (const log of endLogs) {
+      const key = `${String(log.seller)}:${log.itemId}`;
+      if (endedByKey.has(key)) continue; // keep the most recent log per item
+      endedByKey.set(key, {
+        endedAt: log.endedAt,
+        endedBy: log.endedBy?.username || log.endedBy?.name || log.endedBy?.email || null,
+        source: log.source
+      });
+    }
+
     let orders = [];
     if (itemIds.length) {
       orders = await Order.find({
@@ -1146,7 +1171,8 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
         quantityZeroStatus: row.quantityZeroStatus || 'not_needed',
         isRunSeller: runSellerId ? String(row.sellerId) === runSellerId : false,
         orderCount30d: rowOrders.length,
-        orders: rowOrders.slice(0, 20)
+        orders: rowOrders.slice(0, 20),
+        endedInfo: endedByKey.get(key) || null
       };
     });
 

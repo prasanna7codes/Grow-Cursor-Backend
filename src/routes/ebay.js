@@ -15710,7 +15710,7 @@ router.get('/selling/summary', requireAuth, async (req, res) => {
  */
 router.post('/end-item', requireAuth, async (req, res) => {
   try {
-    const { sellerId, itemId, endingReason = 'NotAvailable', source, country, marketplaceId } = req.body;
+    const { sellerId, itemId, endingReason = 'NotAvailable', source, country, marketplaceId, sku } = req.body;
 
     if (!sellerId || !itemId) {
       return res.status(400).json({ error: 'Missing sellerId or itemId' });
@@ -15760,12 +15760,14 @@ router.post('/end-item', requireAuth, async (req, res) => {
     }
 
     // Log successful end-listing action if a valid source is provided
-    if (source && ['duplicate_sku', 'expiry_listing'].includes(source)) {
+    if (source && ['duplicate_sku', 'expiry_listing', 'amazon_stock_check'].includes(source)) {
       try {
         await EndListingLog.create({
           seller: sellerId,
           itemId,
+          sku: typeof sku === 'string' && sku.trim() ? sku.trim() : null,
           source,
+          endedBy: req.user?.userId || null,
           country: typeof country === 'string' && country.trim() ? country.trim() : null,
           marketplaceId: typeof marketplaceId === 'string' && marketplaceId.trim() ? marketplaceId.trim() : null,
         });

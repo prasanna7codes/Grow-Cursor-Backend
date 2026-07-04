@@ -40,7 +40,9 @@ router.get('/stats', requireAuth, validate(endListingStatsQuerySchema, 'query'),
   try {
     const { sellerId, startDate, endDate } = req.query;
 
-    const matchCriteria = {};
+    // This page reports only the duplicate-SKU / expiry sources; ends logged
+    // from the stock-check verify flow are excluded so totals stay consistent.
+    const matchCriteria = { source: { $in: ['duplicate_sku', 'expiry_listing'] } };
 
     if (sellerId) {
       if (!mongoose.Types.ObjectId.isValid(sellerId)) {
