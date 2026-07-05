@@ -186,8 +186,24 @@ function parseStockStatus(payload, threshold = 10) {
     return { status: 'in_stock', stockQuantity: null, availabilityText: text };
   }
 
-  // No stock/availability text anywhere in the response. Amazon only renders
-  // a returns/refund policy line when a listing has an active, purchasable
+  // No stock/availability text, but a real price is present — direct proof of
+  // an active, purchasable offer (Scrapingdog doesn't always emit an explicit
+  // stock string for every listing template, confirmed against production
+  // data where price/delivery/variants were all populated but stock was not,
+  // even after a retry). Kept as its own status rather than folded into
+  // "in_stock" since it's inferred from price, not confirmed by Amazon's own
+  // wording — no retry needed, this is a definite signal, not an ambiguous one.
+  const singleOfferPrice = singleOffer.price || singleOffer.extracted_price || null;
+  if (singleOfferPrice) {
+    return {
+      status: 'in_stock_unconfirmed',
+      stockQuantity: null,
+      availabilityText: `Price found (${singleOffer.price ?? singleOffer.extracted_price}) but no explicit stock text`
+    };
+  }
+
+  // No stock/availability text and no price either. Amazon only renders a
+  // returns/refund policy line when a listing has an active, purchasable
   // offer; a dead ("Currently unavailable") listing's purchase box shows only
   // the ships_from/sold_by headers with no returns entry at all. Confirmed
   // against several real listings (both dead and live) in production data.
@@ -657,7 +673,8 @@ async function processStockItem({ itemDoc, run, runId }) {
       }
     }
 
-    const becameAvailable = ['low_stock', 'out_of_stock'].includes(previous?.lastStatus) && parsed.status === 'in_stock';
+    const becameAvailable = ['low_stock', 'out_of_stock'].includes(previous?.lastStatus)
+      && ['in_stock', 'in_stock_unconfirmed'].includes(parsed.status);
     let sellerItems = row.sellerItems;
 
     await AmazonStockCheckRun.findByIdAndUpdate(runId, {
@@ -665,6 +682,7 @@ async function processStockItem({ itemDoc, run, runId }) {
         checkedCount: 1,
         creditsUsed: (getConfig(row.currency)?.credits || 0) * creditMultiplier,
         inStockCount: parsed.status === 'in_stock' ? 1 : 0,
+        inStockUnconfirmedCount: parsed.status === 'in_stock_unconfirmed' ? 1 : 0,
         lowStockCount: parsed.status === 'low_stock' ? 1 : 0,
         outOfStockCount: parsed.status === 'out_of_stock' ? 1 : 0,
         unknownStockTextCount: parsed.status === 'unknown_stock_text' ? 1 : 0,
@@ -1046,6 +1064,7 @@ function normalizeItemFilters(filter) {
 
 function getItemFilterCondition(filter) {
   if (filter === 'in_stock') return { status: 'in_stock' };
+  if (filter === 'in_stock_unconfirmed') return { status: 'in_stock_unconfirmed' };
   if (filter === 'low_stock') return { status: 'low_stock' };
   if (filter === 'out_of_stock') return { status: 'out_of_stock' };
   if (filter === 'unknown_stock_text') return { status: 'unknown_stock_text' };
@@ -1080,6 +1099,7 @@ async function getItemFilterCounts(runId) {
     actionable,
     checked,
     inStock,
+    inStockUnconfirmed,
     lowStock,
     outOfStock,
     unknownStockText,
@@ -1094,6 +1114,7 @@ async function getItemFilterCounts(runId) {
     AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'actionable')),
     AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'checked')),
     AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'in_stock')),
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'in_stock_unconfirmed')),
     AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'low_stock')),
     AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'out_of_stock')),
     AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'unknown_stock_text')),
@@ -1110,6 +1131,7 @@ async function getItemFilterCounts(runId) {
     actionable,
     checked,
     in_stock: inStock,
+    in_stock_unconfirmed: inStockUnconfirmed,
     low_stock: lowStock,
     out_of_stock: outOfStock,
     unknown_stock_text: unknownStockText,

@@ -25,6 +25,10 @@ const AmazonStockCheckRunSchema = new mongoose.Schema(
     noAsinCount: { type: Number, default: 0 },
     checkedCount: { type: Number, default: 0 },
     inStockCount: { type: Number, default: 0 },
+    // Inferred available (a price was found but Amazon gave no explicit
+    // stock/availability text) — kept separate from inStockCount so it's
+    // never conflated with Amazon-confirmed availability.
+    inStockUnconfirmedCount: { type: Number, default: 0 },
     lowStockCount: { type: Number, default: 0 },
     outOfStockCount: { type: Number, default: 0 },
     errorCount: { type: Number, default: 0 },

@@ -35,7 +35,7 @@ const AmazonStockCheckItemSchema = new mongoose.Schema(
     country: { type: String, required: true },
     status: {
       type: String,
-      enum: ['queued', 'processing', 'in_stock', 'low_stock', 'out_of_stock', 'unknown_stock_text', 'no_asin', 'error'],
+      enum: ['queued', 'processing', 'in_stock', 'in_stock_unconfirmed', 'low_stock', 'out_of_stock', 'unknown_stock_text', 'no_asin', 'error'],
       default: 'queued',
       index: true
     },
