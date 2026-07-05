@@ -155,7 +155,7 @@ function estimateCredits(candidates) {
   return candidates.reduce((sum, row) => sum + (getConfig(row.currency)?.credits || 0), 0);
 }
 
-function parseStockStatus(payload, threshold = 10) {
+function parseStockStatus(payload, threshold = 5) {
   const singleOffer = payload?.purchase_options?.single_offer || {};
   const text = String(singleOffer.stock || payload?.availability_status || '').trim();
   const normalized = text.toLowerCase();
@@ -1519,7 +1519,7 @@ router.post('/runs', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), requireF
       status: 'queued',
       mode,
       seller: sellerId,
-      threshold: Number.parseInt(req.body?.threshold, 10) || 10,
+      threshold: Number.parseInt(req.body?.threshold, 10) || 5,
       autoZeroQuantity: Boolean(req.body?.autoZeroQuantity),
       requestedBy: req.user?.userId || null
     });
