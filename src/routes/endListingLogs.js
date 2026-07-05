@@ -156,4 +156,113 @@ router.get('/stats', requireAuth, validate(endListingStatsQuerySchema, 'query'),
   }
 });
 
+/**
+ * GET /end-listing-logs/by-date
+ * Amazon Stock Check end-listing activity grouped by day, then by seller and
+ * who performed the action — answers "on which date, how many item IDs were
+ * ended, for which sellers, and by whom".
+ *
+ * Query params:
+ *   sellerId   - optional, filter to one seller
+ *   startDate  - optional, YYYY-MM-DD (Pacific time)
+ *   endDate    - optional, YYYY-MM-DD (Pacific time)
+ */
+router.get('/by-date', requireAuth, validate(endListingStatsQuerySchema, 'query'), async (req, res) => {
+  try {
+    const { sellerId, startDate, endDate, country } = req.query;
+
+    const matchCriteria = { source: 'amazon_stock_check' };
+
+    if (sellerId) {
+      if (!mongoose.Types.ObjectId.isValid(sellerId)) {
+        return res.status(400).json({ error: 'Invalid sellerId' });
+      }
+      matchCriteria.seller = new mongoose.Types.ObjectId(sellerId);
+    }
+
+    if (country) {
+      matchCriteria.country = country;
+    }
+
+    if (startDate || endDate) {
+      matchCriteria.endedAt = {};
+      if (startDate) matchCriteria.endedAt.$gte = getPTDayBoundsUTC(startDate).start;
+      if (endDate) matchCriteria.endedAt.$lte = getPTDayBoundsUTC(endDate).end;
+    }
+
+    const rows = await EndListingLog.aggregate([
+      { $match: matchCriteria },
+      {
+        $group: {
+          _id: {
+            day: { $dateToString: { format: '%Y-%m-%d', date: '$endedAt', timezone: PT_TIMEZONE } },
+            seller: '$seller',
+            endedBy: '$endedBy',
+            country: { $ifNull: ['$country', 'Unknown'] }
+          },
+          count: { $sum: 1 },
+          itemIds: { $push: '$itemId' },
+          lastEndedAt: { $max: '$endedAt' }
+        }
+      },
+      {
+        $lookup: { from: 'sellers', localField: '_id.seller', foreignField: '_id', as: 'sellerDoc' }
+      },
+      { $unwind: { path: '$sellerDoc', preserveNullAndEmptyArrays: true } },
+      {
+        $lookup: { from: 'users', localField: 'sellerDoc.user', foreignField: '_id', as: 'sellerUserDoc' }
+      },
+      { $unwind: { path: '$sellerUserDoc', preserveNullAndEmptyArrays: true } },
+      {
+        $lookup: { from: 'users', localField: '_id.endedBy', foreignField: '_id', as: 'endedByDoc' }
+      },
+      { $unwind: { path: '$endedByDoc', preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          _id: 0,
+          day: '$_id.day',
+          sellerId: '$_id.seller',
+          sellerName: { $ifNull: ['$sellerUserDoc.username', { $ifNull: ['$sellerUserDoc.email', { $toString: '$_id.seller' }] }] },
+          endedById: '$_id.endedBy',
+          endedByName: { $ifNull: ['$endedByDoc.username', { $ifNull: ['$endedByDoc.email', 'Unknown'] }] },
+          country: '$_id.country',
+          count: 1,
+          itemIds: 1,
+          lastEndedAt: 1
+        }
+      },
+      { $sort: { lastEndedAt: -1 } }
+    ]);
+
+    const dayMap = new Map();
+    for (const row of rows) {
+      if (!dayMap.has(row.day)) {
+        dayMap.set(row.day, { day: row.day, totalItemsEnded: 0, breakdown: [] });
+      }
+      const dayEntry = dayMap.get(row.day);
+      dayEntry.totalItemsEnded += row.count;
+      dayEntry.breakdown.push({
+        sellerId: row.sellerId,
+        sellerName: row.sellerName || 'Unknown',
+        endedById: row.endedById,
+        endedByName: row.endedByName || 'Unknown',
+        country: row.country || 'Unknown',
+        count: row.count,
+        itemIds: row.itemIds
+      });
+    }
+
+    for (const entry of dayMap.values()) {
+      entry.breakdown.sort((a, b) => a.sellerName.localeCompare(b.sellerName) || a.endedByName.localeCompare(b.endedByName));
+    }
+
+    const days = Array.from(dayMap.values()).sort((a, b) => b.day.localeCompare(a.day));
+
+    res.json({ days });
+  } catch (error) {
+    console.error('[EndListingLogs] Error fetching by-date stats:', error);
+    res.status(500).json({ error: 'Failed to fetch end-listing breakdown' });
+  }
+});
+
 export default router;

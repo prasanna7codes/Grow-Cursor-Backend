@@ -298,6 +298,7 @@ export const endListingStatsQuerySchema = z.object({
   sellerId: optionalObjectIdSchema,
   startDate: optionalDateStringSchema,
   endDate: optionalDateStringSchema,
+  country: z.string().trim().min(1).optional(),
 });
 
 // ── Price change logs ────────────────────────────────────────────────────────

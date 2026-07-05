@@ -15710,7 +15710,7 @@ router.get('/selling/summary', requireAuth, async (req, res) => {
  */
 router.post('/end-item', requireAuth, async (req, res) => {
   try {
-    const { sellerId, itemId, endingReason = 'NotAvailable', source, country, marketplaceId, sku } = req.body;
+    const { sellerId, itemId, endingReason = 'NotAvailable', source, country, marketplaceId, sku, run } = req.body;
 
     if (!sellerId || !itemId) {
       return res.status(400).json({ error: 'Missing sellerId or itemId' });
@@ -15770,6 +15770,7 @@ router.post('/end-item', requireAuth, async (req, res) => {
           endedBy: req.user?.userId || null,
           country: typeof country === 'string' && country.trim() ? country.trim() : null,
           marketplaceId: typeof marketplaceId === 'string' && marketplaceId.trim() ? marketplaceId.trim() : null,
+          run: mongoose.Types.ObjectId.isValid(String(run || '')) ? run : null,
         });
       } catch (logErr) {
         console.error('[End Item] Failed to write EndListingLog:', logErr.message);
