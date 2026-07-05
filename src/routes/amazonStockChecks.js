@@ -352,6 +352,77 @@ async function reviseInventoryQuantity({ sellerId, itemId, quantity, runId, item
   }
 }
 
+function escapeXmlText(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+// Revises title/price on eBay (ReviseFixedPriceItem) and logs the action —
+// self-contained like reviseInventoryQuantity/end-item, not tied to a
+// specific run or AmazonStockCheckItem, so it works the same regardless of
+// which run/seller page triggered it.
+async function reviseListingDetails({ sellerId, itemId, title, price, previousTitle, previousPrice, sku, asin, requestedBy }) {
+  const log = await AmazonStockActionLog.create({
+    sku: sku || '',
+    asin: asin || '',
+    seller: sellerId,
+    itemId,
+    actionType: 'revise_listing',
+    requestedBy,
+    status: 'pending',
+    requestPayload: { title, price, previousTitle, previousPrice }
+  });
+
+  try {
+    const seller = await Seller.findById(sellerId);
+    if (!seller) throw new Error('Seller not found');
+
+    const accessToken = await ensureValidToken(seller);
+    let itemContent = `<ItemID>${itemId}</ItemID>`;
+    if (title) itemContent += `<Title>${escapeXmlText(title)}</Title>`;
+    if (price != null) itemContent += `<StartPrice>${Number(price).toFixed(2)}</StartPrice>`;
+
+    const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+<ReviseFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials><eBayAuthToken>${accessToken}</eBayAuthToken></RequesterCredentials>
+  <ErrorLanguage>en_US</ErrorLanguage>
+  <WarningLevel>Low</WarningLevel>
+  <Item>${itemContent}</Item>
+</ReviseFixedPriceItemRequest>`;
+
+    const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
+      headers: {
+        'X-EBAY-API-SITEID': '0',
+        'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
+        'X-EBAY-API-CALL-NAME': 'ReviseFixedPriceItem',
+        'Content-Type': 'text/xml'
+      },
+      timeout: 45000
+    });
+
+    const parsed = await parseStringPromise(response.data, { explicitArray: false });
+    const ack = parsed?.ReviseFixedPriceItemResponse?.Ack;
+    if (ack !== 'Success' && ack !== 'Warning') {
+      const errors = parsed?.ReviseFixedPriceItemResponse?.Errors;
+      const errorMsg = (Array.isArray(errors) ? errors[0]?.LongMessage : errors?.LongMessage) || 'Unknown eBay revise error';
+      throw new Error(errorMsg);
+    }
+
+    await AmazonStockActionLog.findByIdAndUpdate(log._id, { status: 'success', responseSummary: { ack } });
+    return { ok: true };
+  } catch (error) {
+    await AmazonStockActionLog.findByIdAndUpdate(log._id, {
+      status: 'failed',
+      error: error.message || 'Revise failed'
+    });
+    return { ok: false, error: error.message || 'Revise failed' };
+  }
+}
+
 async function getSellerNameMap(sellerIds) {
   const sellers = await Seller.find({ _id: { $in: sellerIds } }).populate('user', 'username name email').lean();
   return new Map(sellers.map((seller) => [
@@ -1264,9 +1335,9 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
     const itemIds = [...new Set(sellerItems.map((row) => row.itemId).filter(Boolean))];
     const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
 
-    // Seller names, prior end-listing actions, and order history are
-    // independent lookups — run them in parallel.
-    const [sellerNameMap, endLogs, orders] = await Promise.all([
+    // Seller names, prior end-listing actions, prior revisions, and order
+    // history are independent lookups — run them in parallel.
+    const [sellerNameMap, endLogs, reviseLogs, orders] = await Promise.all([
       indexRows.length
         ? getSellerNameMap([...new Set(indexRows.map((row) => row.seller).filter(Boolean))])
         : Promise.resolve(new Map()),
@@ -1274,6 +1345,12 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
         ? EndListingLog.find({ itemId: { $in: itemIds } })
             .populate('endedBy', 'username name email')
             .sort({ endedAt: -1 })
+            .lean()
+        : Promise.resolve([]),
+      itemIds.length
+        ? AmazonStockActionLog.find({ itemId: { $in: itemIds }, actionType: 'revise_listing', status: 'success' })
+            .populate('requestedBy', 'username name email')
+            .sort({ createdAt: -1 })
             .lean()
         : Promise.resolve([]),
       itemIds.length
@@ -1306,6 +1383,20 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
         endedAt: log.endedAt,
         endedBy: log.endedBy?.username || log.endedBy?.name || log.endedBy?.email || null,
         source: log.source
+      });
+    }
+
+    const revisedByKey = new Map();
+    for (const log of reviseLogs) {
+      const key = `${String(log.seller)}:${log.itemId}`;
+      if (revisedByKey.has(key)) continue; // keep the most recent log per item
+      revisedByKey.set(key, {
+        revisedAt: log.createdAt,
+        revisedBy: log.requestedBy?.username || log.requestedBy?.name || log.requestedBy?.email || null,
+        previousTitle: log.requestPayload?.previousTitle || '',
+        newTitle: log.requestPayload?.title || '',
+        previousPrice: log.requestPayload?.previousPrice ?? null,
+        newPrice: log.requestPayload?.price ?? null
       });
     }
 
@@ -1366,7 +1457,8 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
         orders: recentOrders.slice(0, 20),
         lifetimeOrderCount: allOrders.length,
         monthlyOrders: monthKeys.map((month) => ({ month, count: countsByMonth.get(month) || 0 })),
-        endedInfo: endedByKey.get(key) || null
+        endedInfo: endedByKey.get(key) || null,
+        revisedInfo: revisedByKey.get(key) || null
       };
     });
 
@@ -1722,6 +1814,48 @@ router.post('/items/:itemId/set-quantity-one', requireAuth, requirePageAccess(ST
       ? `Quantity set to one for item ${sellerItem.itemId}`
       : result.error || `Failed to set quantity to one for item ${sellerItem.itemId}`
   });
+});
+
+// POST /amazon-stock-checks/revise-listing
+// Revises title/price for one item ID on eBay. Self-contained (not scoped to
+// a specific AmazonStockCheckItem/run) so it works from the verify panel
+// regardless of which run or seller the item was found under — same pattern
+// as /ebay/end-item.
+router.post('/revise-listing', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
+  try {
+    const { sellerId, itemId, title, price, previousTitle, previousPrice, sku, asin } = req.body || {};
+    if (!sellerId || !itemId) {
+      return res.status(400).json({ error: 'sellerId and itemId are required.' });
+    }
+
+    const newTitle = typeof title === 'string' ? title.trim() : '';
+    const newPrice = price !== undefined && price !== null && price !== '' ? Number(price) : null;
+    if (!newTitle && newPrice == null) {
+      return res.status(400).json({ error: 'Provide a title and/or price to revise.' });
+    }
+    if (newPrice != null && !Number.isFinite(newPrice)) {
+      return res.status(400).json({ error: 'Price must be a number.' });
+    }
+
+    const result = await reviseListingDetails({
+      sellerId,
+      itemId,
+      title: newTitle || undefined,
+      price: newPrice,
+      previousTitle: previousTitle || '',
+      previousPrice: previousPrice ?? null,
+      sku: sku || '',
+      asin: asin || '',
+      requestedBy: req.user?.userId || null
+    });
+
+    res.status(result.ok ? 200 : 500).json({
+      ...result,
+      message: result.ok ? `Revised item ${itemId}` : result.error || `Failed to revise item ${itemId}`
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to revise listing' });
+  }
 });
 
 export default router;
