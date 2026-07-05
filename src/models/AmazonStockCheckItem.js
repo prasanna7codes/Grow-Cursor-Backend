@@ -43,12 +43,6 @@ const AmazonStockCheckItemSchema = new mongoose.Schema(
     availabilityText: { type: String, default: '' },
     scraperStatusCode: { type: Number, default: null },
     scraperResponseSummary: { type: Object, default: {} },
-    // Full raw Scrapingdog payload — saved ONLY when status is
-    // unknown_stock_text, so the actual response shape can be inspected to
-    // diagnose why no recognizable stock text was found (e.g. a differently
-    // structured purchase-options block, or a degraded response under load).
-    // Left unset otherwise to avoid bloating the ~95% of items that parse fine.
-    rawScraperResponse: { type: mongoose.Schema.Types.Mixed, default: undefined },
     // True when the ambiguous unknown_stock_text retry ran for this item
     // (see parseStockStatus's returns-policy fallback in the route).
     retryAttempted: { type: Boolean, default: false },

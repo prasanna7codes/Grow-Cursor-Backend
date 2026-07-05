@@ -805,8 +805,6 @@ async function processStockItem({ itemDoc, run, runId }) {
         stock: scraper.data?.purchase_options?.single_offer?.stock || ''
       },
       retryAttempted: creditMultiplier > 1,
-      // Keep the full payload only for the failing case, for diagnosis.
-      ...(parsed.status === 'unknown_stock_text' ? { rawScraperResponse: scraper.data } : {}),
       previousStatus: previous?.lastStatus || '',
       becameAvailable,
       sellerItems,
@@ -1289,10 +1287,7 @@ router.get('/seller-summary', requireAuth, requirePageAccess(STOCK_CHECK_PAGES),
 // their orders from the last 30 days.
 router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
   try {
-    // rawScraperResponse is diagnostic-only (read directly from the database);
-    // exclude it here so a batch of unknown_stock_text verifies doesn't ship
-    // several KB of raw payload the panel never uses.
-    const item = await AmazonStockCheckItem.findById(req.params.itemId).select('-rawScraperResponse').lean();
+    const item = await AmazonStockCheckItem.findById(req.params.itemId).lean();
     if (!item) return res.status(404).json({ error: 'Item result not found' });
 
     const run = await AmazonStockCheckRun.findById(item.run).select('seller').lean();
@@ -1721,9 +1716,7 @@ router.get('/runs/:runId/items', requireAuth, requirePageAccess(STOCK_CHECK_PAGE
     AmazonStockCheckItem.find(query)
       // Raw scraper payload fields are never rendered by the UI; excluding
       // them keeps the list response small (they can be large per row).
-      // rawScraperResponse in particular is diagnostic-only and can be
-      // several KB — only meant to be read directly from the database.
-      .select('-scraperResponseSummary -previousStatus -scraperStatusCode -rawScraperResponse')
+      .select('-scraperResponseSummary -previousStatus -scraperStatusCode')
       .sort({ status: 1, sku: 1 })
       .skip(skip)
       .limit(limit)
