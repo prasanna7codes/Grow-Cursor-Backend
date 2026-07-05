@@ -26,11 +26,14 @@ import { ensureValidToken } from './ebay.js';
 const router = express.Router();
 const activeRuns = new Set();
 
+// postalCode pins the Amazon delivery location the scraper sees, so stock
+// results are measured from a consistent place instead of a random datacenter
+// location. Override per country via env if needed; set to '' to disable.
 const COUNTRY_CONFIG = {
-  USD: { currency: 'USD', country: 'United States', domain: 'com', scrapingdogCountry: 'us', credits: 1 },
-  AUD: { currency: 'AUD', country: 'Australia', domain: 'com.au', scrapingdogCountry: 'au', credits: 5 },
-  CAD: { currency: 'CAD', country: 'Canada', domain: 'ca', scrapingdogCountry: 'ca', credits: 5 },
-  GBP: { currency: 'GBP', country: 'United Kingdom', domain: 'co.uk', scrapingdogCountry: 'gb', credits: 5 }
+  USD: { currency: 'USD', country: 'United States', domain: 'com', scrapingdogCountry: 'us', credits: 1, postalCode: process.env.SCRAPINGDOG_POSTAL_USD ?? '82801' },
+  AUD: { currency: 'AUD', country: 'Australia', domain: 'com.au', scrapingdogCountry: 'au', credits: 5, postalCode: process.env.SCRAPINGDOG_POSTAL_AUD ?? '2000' },
+  CAD: { currency: 'CAD', country: 'Canada', domain: 'ca', scrapingdogCountry: 'ca', credits: 5, postalCode: process.env.SCRAPINGDOG_POSTAL_CAD ?? 'A1A 1A1' },
+  GBP: { currency: 'GBP', country: 'United Kingdom', domain: 'co.uk', scrapingdogCountry: 'gb', credits: 5, postalCode: process.env.SCRAPINGDOG_POSTAL_GBP ?? 'SW1A 1AA' }
 };
 
 const PILOT_OPTION_B_LIMITS = {
@@ -40,6 +43,15 @@ const PILOT_OPTION_B_LIMITS = {
   GBP: 4
 };
 const SCRAPINGDOG_CONCURRENT = Math.max(1, Number.parseInt(process.env.SCRAPINGDOG_CONCURRENT || '40', 10));
+// Delay before the single retry attempt for "ambiguous" unknown_stock_text
+// results (has a returns policy, but stock/price text didn't render) — gives
+// Amazon's async buy-box widget a moment longer to populate on re-scrape.
+const UNKNOWN_STOCK_RETRY_DELAY_MS = Math.max(500, Number.parseInt(process.env.AMAZON_STOCK_UNKNOWN_RETRY_DELAY_MS || '3000', 10));
+// Delay before the single retry attempt for outright request failures
+// (timeouts, 429, 5xx) that classifyStockCheckError marks retryable — these
+// are transient Scrapingdog/Amazon infrastructure hiccups, not data-shape
+// issues, so a plain re-request (no special parsing) is the fix.
+const ERROR_RETRY_DELAY_MS = Math.max(500, Number.parseInt(process.env.AMAZON_STOCK_ERROR_RETRY_DELAY_MS || '3000', 10));
 const EBAY_QUANTITY_CONCURRENT = Math.max(1, Number.parseInt(process.env.EBAY_QUANTITY_CONCURRENT || '5', 10));
 const STOCK_PROCESS_BATCH_SIZE = Math.max(100, Number.parseInt(process.env.AMAZON_STOCK_PROCESS_BATCH_SIZE || '1000', 10));
 const PREPARE_CHUNK_SIZE = Math.max(100, Number.parseInt(process.env.AMAZON_STOCK_PREPARE_CHUNK_SIZE || '1000', 10));
@@ -170,10 +182,31 @@ function parseStockStatus(payload, threshold = 10) {
     return { status: 'in_stock', stockQuantity: null, availabilityText: text || 'In Stock' };
   }
 
+  if (text) {
+    return { status: 'in_stock', stockQuantity: null, availabilityText: text };
+  }
+
+  // No stock/availability text anywhere in the response. Amazon only renders
+  // a returns/refund policy line when a listing has an active, purchasable
+  // offer; a dead ("Currently unavailable") listing's purchase box shows only
+  // the ships_from/sold_by headers with no returns entry at all. Confirmed
+  // against several real listings (both dead and live) in production data.
+  const features = singleOffer.features || null;
+  const hasActiveOfferSignal = Boolean(features) && Object.prototype.hasOwnProperty.call(features, 'returns');
+
+  if (features && !hasActiveOfferSignal) {
+    return {
+      status: 'out_of_stock',
+      stockQuantity: null,
+      availabilityText: 'No active offer detected (no returns policy shown)'
+    };
+  }
+
   return {
-    status: text ? 'in_stock' : 'unknown_stock_text',
+    status: 'unknown_stock_text',
     stockQuantity: null,
-    availabilityText: text || 'No stock availability text found'
+    availabilityText: 'No stock availability text found',
+    hasActiveOfferSignal
   };
 }
 
@@ -229,6 +262,7 @@ async function fetchScrapingdogProduct({ asin, currency }) {
       api_key: apiKey,
       domain: config.domain,
       country: config.scrapingdogCountry,
+      ...(config.postalCode ? { postal_code: config.postalCode } : {}),
       asin
     },
     timeout: 45000
@@ -573,6 +607,10 @@ async function processStockItem({ itemDoc, run, runId }) {
   );
   if (claim.modifiedCount !== 1) return;
 
+  // Tracked outside the try block so the catch handler can still record it
+  // if the retry itself ends up failing too.
+  let errorRetryAttempted = false;
+
   try {
     const previous = await AmazonStockSkuState.findOne({
       sku: row.sku,
@@ -580,15 +618,52 @@ async function processStockItem({ itemDoc, run, runId }) {
       currency: row.currency
     }).lean();
 
-    const scraper = await fetchScrapingdogProduct({ asin: row.asin, currency: row.currency });
-    const parsed = parseStockStatus(scraper.data, run.threshold);
+    let scraper;
+    try {
+      scraper = await fetchScrapingdogProduct({ asin: row.asin, currency: row.currency });
+    } catch (fetchError) {
+      const classified = classifyStockCheckError(fetchError);
+      if (!classified.retryable) throw fetchError;
+
+      // Transient Scrapingdog/Amazon failure (timeout, 429, 5xx) — retry once
+      // after a short delay. If this also throws, it propagates to the outer
+      // catch below exactly as an unretried failure would have.
+      errorRetryAttempted = true;
+      await sleep(ERROR_RETRY_DELAY_MS);
+      scraper = await fetchScrapingdogProduct({ asin: row.asin, currency: row.currency });
+    }
+
+    let parsed = parseStockStatus(scraper.data, run.threshold);
+    let creditMultiplier = errorRetryAttempted ? 2 : 1;
+
+    // Ambiguous case: no stock/availability text, but a returns policy is
+    // present, meaning there's likely a live offer that just didn't fully
+    // render. One retry after a short delay usually resolves this — if it
+    // doesn't, we accept the extra credit and leave it as unknown_stock_text
+    // rather than retry indefinitely or guess a status without evidence.
+    if (parsed.status === 'unknown_stock_text' && parsed.hasActiveOfferSignal) {
+      await sleep(UNKNOWN_STOCK_RETRY_DELAY_MS);
+      try {
+        const retryScraper = await fetchScrapingdogProduct({ asin: row.asin, currency: row.currency });
+        scraper = retryScraper;
+        parsed = parseStockStatus(retryScraper.data, run.threshold);
+        creditMultiplier += 1;
+      } catch (retryError) {
+        stockCheckWarn('processStockItem:retryFailed', {
+          sku: row.sku,
+          asin: row.asin,
+          error: retryError.message
+        });
+      }
+    }
+
     const becameAvailable = ['low_stock', 'out_of_stock'].includes(previous?.lastStatus) && parsed.status === 'in_stock';
     let sellerItems = row.sellerItems;
 
     await AmazonStockCheckRun.findByIdAndUpdate(runId, {
       $inc: {
         checkedCount: 1,
-        creditsUsed: getConfig(row.currency)?.credits || 0,
+        creditsUsed: (getConfig(row.currency)?.credits || 0) * creditMultiplier,
         inStockCount: parsed.status === 'in_stock' ? 1 : 0,
         lowStockCount: parsed.status === 'low_stock' ? 1 : 0,
         outOfStockCount: parsed.status === 'out_of_stock' ? 1 : 0,
@@ -640,6 +715,9 @@ async function processStockItem({ itemDoc, run, runId }) {
         availability_status: scraper.data?.availability_status || '',
         stock: scraper.data?.purchase_options?.single_offer?.stock || ''
       },
+      retryAttempted: creditMultiplier > 1,
+      // Keep the full payload only for the failing case, for diagnosis.
+      ...(parsed.status === 'unknown_stock_text' ? { rawScraperResponse: scraper.data } : {}),
       previousStatus: previous?.lastStatus || '',
       becameAvailable,
       sellerItems,
@@ -669,6 +747,7 @@ async function processStockItem({ itemDoc, run, runId }) {
       errorType: classified.errorType,
       errorSource: classified.errorSource,
       retryable: classified.retryable,
+      retryAttempted: errorRetryAttempted,
       checkedAt: new Date()
     });
     await AmazonStockCheckRun.findByIdAndUpdate(runId, {
@@ -1117,7 +1196,10 @@ router.get('/seller-summary', requireAuth, requirePageAccess(STOCK_CHECK_PAGES),
 // their orders from the last 30 days.
 router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
   try {
-    const item = await AmazonStockCheckItem.findById(req.params.itemId).lean();
+    // rawScraperResponse is diagnostic-only (read directly from the database);
+    // exclude it here so a batch of unknown_stock_text verifies doesn't ship
+    // several KB of raw payload the panel never uses.
+    const item = await AmazonStockCheckItem.findById(req.params.itemId).select('-rawScraperResponse').lean();
     if (!item) return res.status(404).json({ error: 'Item result not found' });
 
     const run = await AmazonStockCheckRun.findById(item.run).select('seller').lean();
@@ -1525,7 +1607,9 @@ router.get('/runs/:runId/items', requireAuth, requirePageAccess(STOCK_CHECK_PAGE
     AmazonStockCheckItem.find(query)
       // Raw scraper payload fields are never rendered by the UI; excluding
       // them keeps the list response small (they can be large per row).
-      .select('-scraperResponseSummary -previousStatus -scraperStatusCode')
+      // rawScraperResponse in particular is diagnostic-only and can be
+      // several KB — only meant to be read directly from the database.
+      .select('-scraperResponseSummary -previousStatus -scraperStatusCode -rawScraperResponse')
       .sort({ status: 1, sku: 1 })
       .skip(skip)
       .limit(limit)
