@@ -12,10 +12,12 @@ const AmazonStockCheckRunSchema = new mongoose.Schema(
     },
     mode: {
       type: String,
-      enum: ['pilot_option_b', 'custom', 'full'],
+      enum: ['pilot_option_b', 'custom', 'full', 'seller'],
       default: 'custom'
     },
-    threshold: { type: Number, default: 10 },
+    // Optional seller scope: when set, only this seller's SKU index rows are checked.
+    seller: { type: mongoose.Schema.Types.ObjectId, ref: 'Seller', default: null, index: true },
+    threshold: { type: Number, default: 5 },
     autoZeroQuantity: { type: Boolean, default: false },
     requestedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     totalSkus: { type: Number, default: 0 },
@@ -23,6 +25,10 @@ const AmazonStockCheckRunSchema = new mongoose.Schema(
     noAsinCount: { type: Number, default: 0 },
     checkedCount: { type: Number, default: 0 },
     inStockCount: { type: Number, default: 0 },
+    // Inferred available (a price was found but Amazon gave no explicit
+    // stock/availability text) — kept separate from inStockCount so it's
+    // never conflated with Amazon-confirmed availability.
+    inStockUnconfirmedCount: { type: Number, default: 0 },
     lowStockCount: { type: Number, default: 0 },
     outOfStockCount: { type: Number, default: 0 },
     errorCount: { type: Number, default: 0 },

@@ -35,7 +35,7 @@ const AmazonStockCheckItemSchema = new mongoose.Schema(
     country: { type: String, required: true },
     status: {
       type: String,
-      enum: ['queued', 'processing', 'in_stock', 'low_stock', 'out_of_stock', 'unknown_stock_text', 'no_asin', 'error'],
+      enum: ['queued', 'processing', 'in_stock', 'in_stock_unconfirmed', 'low_stock', 'out_of_stock', 'unknown_stock_text', 'no_asin', 'error'],
       default: 'queued',
       index: true
     },
@@ -43,6 +43,9 @@ const AmazonStockCheckItemSchema = new mongoose.Schema(
     availabilityText: { type: String, default: '' },
     scraperStatusCode: { type: Number, default: null },
     scraperResponseSummary: { type: Object, default: {} },
+    // True when the ambiguous unknown_stock_text retry ran for this item
+    // (see parseStockStatus's returns-policy fallback in the route).
+    retryAttempted: { type: Boolean, default: false },
     sellerItems: { type: [SellerItemSchema], default: [] },
     previousStatus: { type: String, default: '' },
     becameAvailable: { type: Boolean, default: false, index: true },

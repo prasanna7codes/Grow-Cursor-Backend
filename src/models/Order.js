@@ -217,6 +217,9 @@ OrderSchema.index({ dateSold: 1 }); // Index for date range searches
 OrderSchema.index({ subtotal: 1, dateSold: -1 }); // Index for micro-orders range filter + sort
 OrderSchema.index({ cancelState: 1, creationDate: -1 }); // Index for cancelled orders queries
 OrderSchema.index({ policyMessageSent: 1, policyMessageDisabled: 1, policyMessageEligibleAt: 1 }); // Index for policy message processing
+// Item-ID lookups (Amazon stock check order summaries / verify panel).
+OrderSchema.index({ itemNumber: 1, dateSold: -1 });
+OrderSchema.index({ 'lineItems.legacyItemId': 1 });
 OrderSchema.index({ 'lineItems.sku': 1, dateSold: -1 });
 OrderSchema.index({ 'lineItems.SKU': 1, dateSold: -1 });
 OrderSchema.index({ 'lineItems.sellerSku': 1, dateSold: -1 });

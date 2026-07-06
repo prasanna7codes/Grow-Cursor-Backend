@@ -22,5 +22,7 @@ SellerSkuIndexSchema.index({ seller: 1, baseSku: 1 });
 // Fast exact-SKU lookups used by SKU Seller Profit.
 SellerSkuIndexSchema.index({ seller: 1, sku: 1 });
 SellerSkuIndexSchema.index({ sku: 1 });
+// Base-SKU grouping for Amazon stock checks (candidates + verify panel).
+SellerSkuIndexSchema.index({ baseSku: 1 });
 
 export default mongoose.model('SellerSkuIndex', SellerSkuIndexSchema);
