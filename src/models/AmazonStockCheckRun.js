@@ -18,7 +18,6 @@ const AmazonStockCheckRunSchema = new mongoose.Schema(
     // Optional seller scope: when set, only this seller's SKU index rows are checked.
     seller: { type: mongoose.Schema.Types.ObjectId, ref: 'Seller', default: null, index: true },
     threshold: { type: Number, default: 5 },
-    autoZeroQuantity: { type: Boolean, default: false },
     requestedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     totalSkus: { type: Number, default: 0 },
     asinFoundCount: { type: Number, default: 0 },

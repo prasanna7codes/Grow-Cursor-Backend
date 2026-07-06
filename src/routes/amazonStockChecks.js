@@ -57,7 +57,6 @@ const STOCK_PROCESS_BATCH_SIZE = Math.max(100, Number.parseInt(process.env.AMAZO
 const PREPARE_CHUNK_SIZE = Math.max(100, Number.parseInt(process.env.AMAZON_STOCK_PREPARE_CHUNK_SIZE || '1000', 10));
 const RUN_ITEM_INSERT_BATCH_SIZE = Math.max(100, Number.parseInt(process.env.AMAZON_STOCK_ITEM_INSERT_BATCH_SIZE || '2000', 10));
 const scrapingdogLimit = pLimit(SCRAPINGDOG_CONCURRENT);
-const ebayQuantityLimit = pLimit(EBAY_QUANTITY_CONCURRENT);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -462,6 +461,7 @@ async function buildOrderSummaryMapForSellerItems(sellerItems) {
     elapsedMs: getElapsedMs(startedAt)
   });
 
+  const since90 = Date.now() - 90 * 24 * 60 * 60 * 1000;
   const orderMap = new Map();
   for (const order of orders) {
     const ids = new Set();
@@ -471,9 +471,10 @@ async function buildOrderSummaryMapForSellerItems(sellerItems) {
     }
     for (const itemId of ids) {
       const key = `${String(order.seller)}:${itemId}`;
-      const current = orderMap.get(key) || { count: 0, lastOrderDate: null };
+      const current = orderMap.get(key) || { count: 0, count90: 0, lastOrderDate: null };
       const orderDate = order.dateSold || order.creationDate || null;
       current.count += 1;
+      if (orderDate && new Date(orderDate).getTime() >= since90) current.count90 += 1;
       if (orderDate && (!current.lastOrderDate || new Date(orderDate) > new Date(current.lastOrderDate))) {
         current.lastOrderDate = orderDate;
       }
@@ -490,6 +491,7 @@ function attachOrderSummariesFromMap(sellerItems, orderMap) {
     return {
       ...row,
       orderCount: summary?.count || 0,
+      orderCount90d: summary?.count90 || 0,
       lastOrderDate: summary?.lastOrderDate || null
     };
   });
@@ -746,7 +748,7 @@ async function processStockItem({ itemDoc, run, runId }) {
 
     const becameAvailable = ['low_stock', 'out_of_stock'].includes(previous?.lastStatus)
       && ['in_stock', 'in_stock_unconfirmed'].includes(parsed.status);
-    let sellerItems = row.sellerItems;
+    const sellerItems = row.sellerItems;
 
     await AmazonStockCheckRun.findByIdAndUpdate(runId, {
       $inc: {
@@ -760,39 +762,6 @@ async function processStockItem({ itemDoc, run, runId }) {
         becameAvailableCount: becameAvailable ? 1 : 0
       }
     });
-
-    const shouldZero = run.autoZeroQuantity && ['low_stock', 'out_of_stock', 'unknown_stock_text'].includes(parsed.status);
-    if (shouldZero) {
-      const updatedSellerItems = await Promise.all(sellerItems.map((sellerItem) => (
-        ebayQuantityLimit(async () => {
-          if (!sellerItem.sellerId || !sellerItem.itemId) {
-            return { ...sellerItem, quantityZeroStatus: 'skipped' };
-          }
-          await AmazonStockCheckRun.findByIdAndUpdate(runId, { $inc: { quantityZeroAttemptedCount: 1 } });
-          const result = await reviseInventoryQuantity({
-            sellerId: sellerItem.sellerId,
-            itemId: sellerItem.itemId,
-            quantity: 0,
-            runId,
-            itemDocId: row._id,
-            sku: row.sku,
-            asin: row.asin,
-            requestedBy: run.requestedBy
-          });
-          if (result.ok) {
-            await AmazonStockCheckRun.findByIdAndUpdate(runId, { $inc: { quantityZeroSuccessCount: 1 } });
-          } else {
-            await AmazonStockCheckRun.findByIdAndUpdate(runId, { $inc: { quantityZeroFailedCount: 1 } });
-          }
-          return {
-            ...sellerItem,
-            quantityZeroStatus: result.ok ? 'success' : 'failed',
-            quantityZeroError: result.error || ''
-          };
-        })
-      )));
-      sellerItems = updatedSellerItems;
-    }
 
     await AmazonStockCheckItem.findByIdAndUpdate(row._id, {
       status: parsed.status,
@@ -943,6 +912,7 @@ async function initializeRunItems(run) {
     const batch = [];
     for (const row of enriched) {
       existingKeys.add(`${row.currency}:${row.sku}`);
+      const hasRecentOrder90d = (row.sellerItems || []).some((si) => (si.orderCount90d || 0) > 0);
       batch.push(row.asin
         ? {
             run: runId,
@@ -951,7 +921,8 @@ async function initializeRunItems(run) {
             currency: row.currency,
             country: row.country,
             status: 'queued',
-            sellerItems: row.sellerItems
+            sellerItems: row.sellerItems,
+            hasRecentOrder90d
           }
         : {
             run: runId,
@@ -961,6 +932,7 @@ async function initializeRunItems(run) {
             country: row.country,
             status: 'no_asin',
             sellerItems: row.sellerItems,
+            hasRecentOrder90d,
             error: 'No ASIN found from TemplateListing._asinReference',
             errorType: 'no_asin_found',
             errorSource: 'template_listing',
@@ -1135,6 +1107,11 @@ function getItemFilterCondition(filter) {
   if (filter === 'in_stock') return { status: 'in_stock' };
   if (filter === 'in_stock_unconfirmed') return { status: 'in_stock_unconfirmed' };
   if (filter === 'low_stock') return { status: 'low_stock' };
+  // $ne true (not a strict false check) so items checked before this field
+  // existed — which simply lack it — still fall into the "no orders" bucket
+  // instead of vanishing from both counts.
+  if (filter === 'low_stock_no_orders') return { status: 'low_stock', hasRecentOrder90d: { $ne: true } };
+  if (filter === 'low_stock_with_orders') return { status: 'low_stock', hasRecentOrder90d: true };
   if (filter === 'out_of_stock') return { status: 'out_of_stock' };
   if (filter === 'unknown_stock_text') return { status: 'unknown_stock_text' };
   if (filter === 'errors') return { status: 'error' };
@@ -1148,7 +1125,7 @@ function getItemFilterCondition(filter) {
   return null;
 }
 
-function buildItemFilterQuery(runId, filter) {
+function buildItemFilterQuery(runId, filter, sellerId) {
   const query = { run: runId };
   const conditions = normalizeItemFilters(filter)
     .filter((value) => value !== 'all')
@@ -1159,17 +1136,21 @@ function buildItemFilterQuery(runId, filter) {
   } else if (conditions.length > 1) {
     query.$and = conditions;
   }
+  if (sellerId && mongoose.Types.ObjectId.isValid(String(sellerId))) {
+    query['sellerItems.sellerId'] = new mongoose.Types.ObjectId(String(sellerId));
+  }
   return query;
 }
 
-async function getItemFilterCounts(runId) {
+async function getItemFilterCounts(runId, sellerId) {
   const [
     all,
     actionable,
     checked,
     inStock,
     inStockUnconfirmed,
-    lowStock,
+    lowStockNoOrders,
+    lowStockWithOrders,
     outOfStock,
     unknownStockText,
     errors,
@@ -1179,20 +1160,21 @@ async function getItemFilterCounts(runId) {
     qtyZeroFailed,
     hasOrders
   ] = await Promise.all([
-    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'all')),
-    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'actionable')),
-    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'checked')),
-    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'in_stock')),
-    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'in_stock_unconfirmed')),
-    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'low_stock')),
-    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'out_of_stock')),
-    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'unknown_stock_text')),
-    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'errors')),
-    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'no_asin')),
-    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'restocked')),
-    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'qty_zero_success')),
-    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'qty_zero_failed')),
-    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'has_orders'))
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'all', sellerId)),
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'actionable', sellerId)),
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'checked', sellerId)),
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'in_stock', sellerId)),
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'in_stock_unconfirmed', sellerId)),
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'low_stock_no_orders', sellerId)),
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'low_stock_with_orders', sellerId)),
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'out_of_stock', sellerId)),
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'unknown_stock_text', sellerId)),
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'errors', sellerId)),
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'no_asin', sellerId)),
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'restocked', sellerId)),
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'qty_zero_success', sellerId)),
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'qty_zero_failed', sellerId)),
+    AmazonStockCheckItem.countDocuments(buildItemFilterQuery(runId, 'has_orders', sellerId))
   ]);
 
   return {
@@ -1201,7 +1183,9 @@ async function getItemFilterCounts(runId) {
     checked,
     in_stock: inStock,
     in_stock_unconfirmed: inStockUnconfirmed,
-    low_stock: lowStock,
+    low_stock: lowStockNoOrders + lowStockWithOrders,
+    low_stock_no_orders: lowStockNoOrders,
+    low_stock_with_orders: lowStockWithOrders,
     out_of_stock: outOfStock,
     unknown_stock_text: unknownStockText,
     errors,
@@ -1329,6 +1313,7 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
 
     const itemIds = [...new Set(sellerItems.map((row) => row.itemId).filter(Boolean))];
     const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    const since90 = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
 
     // Seller names, prior end-listing actions, prior revisions, and order
     // history are independent lookups — run them in parallel.
@@ -1432,6 +1417,7 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
       const key = `${String(row.sellerId)}:${row.itemId}`;
       const allOrders = (ordersByKey.get(key) || []).sort((a, b) => new Date(b.date) - new Date(a.date));
       const recentOrders = allOrders.filter((order) => new Date(order.date) >= since);
+      const recentOrders90d = allOrders.filter((order) => new Date(order.date) >= since90);
       const countsByMonth = new Map();
       for (const order of allOrders) {
         const d = new Date(order.date);
@@ -1449,6 +1435,7 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
         quantityZeroStatus: row.quantityZeroStatus || 'not_needed',
         isRunSeller: runSellerId ? String(row.sellerId) === runSellerId : false,
         orderCount30d: recentOrders.length,
+        orderCount90d: recentOrders90d.length,
         orders: recentOrders.slice(0, 20),
         lifetimeOrderCount: allOrders.length,
         monthlyOrders: monthKeys.map((month) => ({ month, count: countsByMonth.get(month) || 0 })),
@@ -1467,6 +1454,10 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
       availabilityText: item.availabilityText,
       amazonUrl,
       runSellerId,
+      // Live recompute (not the stored snapshot) so it reflects orders placed
+      // since the run last checked this SKU — true if ANY seller listing has
+      // sold in the last 90 days, used client-side to withhold auto-select.
+      hasRecentOrder90d: enrichedSellerItems.some((row) => (row.orderCount90d || 0) > 0),
       sellerItems: enrichedSellerItems
     });
   } catch (error) {
@@ -1607,7 +1598,6 @@ router.post('/runs', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), requireF
       mode,
       seller: sellerId,
       threshold: Number.parseInt(req.body?.threshold, 10) || 5,
-      autoZeroQuantity: Boolean(req.body?.autoZeroQuantity),
       requestedBy: req.user?.userId || null
     });
 
@@ -1701,7 +1691,7 @@ router.get('/runs', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (re
 router.get('/runs/:runId', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
   const run = await AmazonStockCheckRun.findById(req.params.runId).populate('requestedBy', 'username name email').lean();
   if (!run) return res.status(404).json({ error: 'Run not found' });
-  const itemCounts = await getItemFilterCounts(req.params.runId);
+  const itemCounts = await getItemFilterCounts(req.params.runId, req.query.sellerId);
   res.json({ run, itemCounts });
 });
 
@@ -1709,7 +1699,7 @@ router.get('/runs/:runId/items', requireAuth, requirePageAccess(STOCK_CHECK_PAGE
   const filter = String(req.query.filter || 'actionable').trim();
   const page = Math.max(1, Number.parseInt(req.query.page || '1', 10));
   const limit = Math.min(500, Math.max(25, Number.parseInt(req.query.limit || '100', 10)));
-  const query = buildItemFilterQuery(req.params.runId, filter);
+  const query = buildItemFilterQuery(req.params.runId, filter, req.query.sellerId);
   const skip = (page - 1) * limit;
 
   const [items, total] = await Promise.all([
