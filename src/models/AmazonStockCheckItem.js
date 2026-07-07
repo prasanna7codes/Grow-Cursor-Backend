@@ -9,6 +9,7 @@ const SellerItemSchema = new mongoose.Schema(
     price: { type: Number, default: null },
     currency: { type: String, default: '' },
     orderCount: { type: Number, default: 0 },
+    orderCount90d: { type: Number, default: 0 },
     lastOrderDate: { type: Date, default: null },
     quantityZeroStatus: {
       type: String,
@@ -47,6 +48,9 @@ const AmazonStockCheckItemSchema = new mongoose.Schema(
     // (see parseStockStatus's returns-policy fallback in the route).
     retryAttempted: { type: Boolean, default: false },
     sellerItems: { type: [SellerItemSchema], default: [] },
+    // True when any seller carrying this SKU sold at least one unit in the
+    // last 90 days — drives the Low Stock (No Orders 90d) / (Orders 90d) split.
+    hasRecentOrder90d: { type: Boolean, default: false, index: true },
     previousStatus: { type: String, default: '' },
     becameAvailable: { type: Boolean, default: false, index: true },
     error: { type: String, default: '' },
@@ -59,6 +63,7 @@ const AmazonStockCheckItemSchema = new mongoose.Schema(
 );
 
 AmazonStockCheckItemSchema.index({ run: 1, status: 1 });
+AmazonStockCheckItemSchema.index({ run: 1, status: 1, hasRecentOrder90d: 1 });
 AmazonStockCheckItemSchema.index({ run: 1, status: 1, asin: 1 });
 AmazonStockCheckItemSchema.index({ run: 1, becameAvailable: 1 });
 AmazonStockCheckItemSchema.index({ run: 1, 'sellerItems.quantityZeroStatus': 1 });
