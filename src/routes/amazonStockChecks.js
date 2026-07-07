@@ -122,7 +122,7 @@ function normalizeCurrency(value) {
   return cur;
 }
 
-function getConfig(currency) {
+export function getConfig(currency) {
   return COUNTRY_CONFIG[normalizeCurrency(currency)] || null;
 }
 
@@ -154,7 +154,7 @@ function estimateCredits(candidates) {
   return candidates.reduce((sum, row) => sum + (getConfig(row.currency)?.credits || 0), 0);
 }
 
-function parseStockStatus(payload, threshold = 5) {
+export function parseStockStatus(payload, threshold = 5) {
   const singleOffer = payload?.purchase_options?.single_offer || {};
   const text = String(singleOffer.stock || payload?.availability_status || '').trim();
   const normalized = text.toLowerCase();
@@ -225,15 +225,22 @@ function parseStockStatus(payload, threshold = 5) {
   };
 }
 
-function classifyStockCheckError(error) {
+export function classifyStockCheckError(error) {
   const status = error?.response?.status || null;
   const message = error?.message || 'Stock check failed';
   if (status) {
+    // axios's own message is just "Request failed with status code 404" —
+    // Scrapingdog's response body usually explains the actual reason (invalid
+    // ASIN, plan/credit limit, concurrent-request limit, etc.), so surface it
+    // when present instead of discarding it.
+    const body = error?.response?.data;
+    const bodyText = typeof body === 'string' ? body : (body ? JSON.stringify(body) : '');
+    const detail = bodyText ? bodyText.slice(0, 300) : '';
     return {
       errorType: `scrapingdog_http_${status}`,
       errorSource: 'scrapingdog',
       retryable: status === 408 || status === 429 || status >= 500,
-      message
+      message: detail ? `${message}: ${detail}` : message
     };
   }
   if (error?.code === 'ECONNABORTED' || /timeout/i.test(message)) {
@@ -265,7 +272,11 @@ async function getRunStatus(runId) {
   return run?.status || '';
 }
 
-async function fetchScrapingdogProduct({ asin, currency }) {
+// includePostalCode defaults to false: Scrapingdog confirmed passing
+// postal_code was the root cause of a large, sustained wave of 400 errors
+// (see amazonStockChecks.js processStockItem call sites) — opt back in
+// explicitly only if deliberately testing with it again.
+export async function fetchScrapingdogProduct({ asin, currency, timeoutMs = 45000, includePostalCode = false }) {
   const config = getConfig(currency);
   const apiKey = process.env.SCRAPINGDOG_API_KEY;
   if (!apiKey) {
@@ -277,10 +288,10 @@ async function fetchScrapingdogProduct({ asin, currency }) {
       api_key: apiKey,
       domain: config.domain,
       country: config.scrapingdogCountry,
-      ...(config.postalCode ? { postal_code: config.postalCode } : {}),
+      ...(includePostalCode && config.postalCode ? { postal_code: config.postalCode } : {}),
       asin
     },
-    timeout: 45000
+    timeout: timeoutMs
   });
 
   return {
@@ -709,7 +720,7 @@ async function processStockItem({ itemDoc, run, runId }) {
 
     let scraper;
     try {
-      scraper = await fetchScrapingdogProduct({ asin: row.asin, currency: row.currency });
+      scraper = await fetchScrapingdogProduct({ asin: row.asin, currency: row.currency, includePostalCode: false });
     } catch (fetchError) {
       const classified = classifyStockCheckError(fetchError);
       if (!classified.retryable) throw fetchError;
@@ -719,7 +730,7 @@ async function processStockItem({ itemDoc, run, runId }) {
       // catch below exactly as an unretried failure would have.
       errorRetryAttempted = true;
       await sleep(ERROR_RETRY_DELAY_MS);
-      scraper = await fetchScrapingdogProduct({ asin: row.asin, currency: row.currency });
+      scraper = await fetchScrapingdogProduct({ asin: row.asin, currency: row.currency, includePostalCode: false });
     }
 
     let parsed = parseStockStatus(scraper.data, run.threshold);
@@ -733,7 +744,7 @@ async function processStockItem({ itemDoc, run, runId }) {
     if (parsed.status === 'unknown_stock_text' && parsed.hasActiveOfferSignal) {
       await sleep(UNKNOWN_STOCK_RETRY_DELAY_MS);
       try {
-        const retryScraper = await fetchScrapingdogProduct({ asin: row.asin, currency: row.currency });
+        const retryScraper = await fetchScrapingdogProduct({ asin: row.asin, currency: row.currency, includePostalCode: false });
         scraper = retryScraper;
         parsed = parseStockStatus(retryScraper.data, run.threshold);
         creditMultiplier += 1;
