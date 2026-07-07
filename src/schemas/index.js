@@ -479,3 +479,106 @@ export const adminProfileFieldsSchema = z.object({
   workingMode: z.string().optional(),
   workingHours: z.union([z.string(), z.number()]).optional(),
 });
+
+// ── Listing stats ────────────────────────────────────────────────────────────
+
+export const listingStatsDayWiseQuerySchema = z.object({
+  startDate: optionalDateStringSchema,
+  endDate: optionalDateStringSchema,
+  sellerId: optionalObjectIdSchema,
+});
+
+export const listingStatsSummaryQuerySchema = z.object({
+  startDate: optionalDateStringSchema,
+  endDate: optionalDateStringSchema,
+});
+
+// ── Seller pricing config ────────────────────────────────────────────────────
+
+export const sellerPricingConfigQuerySchema = z.object({
+  sellerId: objectIdSchema,
+  templateId: objectIdSchema,
+});
+
+export const sellerPricingConfigBodySchema = z.object({
+  sellerId: objectIdSchema,
+  templateId: objectIdSchema,
+  pricingConfig: z.record(z.string(), z.any()),
+});
+
+// ── Exchange rates ────────────────────────────────────────────────────────────
+
+export const exchangeRateCurrentQuerySchema = z.object({
+  marketplace: z.string().trim().optional(),
+});
+
+export const exchangeRateHistoryQuerySchema = z.object({
+  marketplace: z.string().trim().optional(),
+  limit: z.coerce.number().int().positive().max(500).optional(),
+});
+
+export const exchangeRateForDateQuerySchema = z.object({
+  date: z.string().trim().min(1, 'date is required'),
+  marketplace: z.string().trim().optional(),
+});
+
+export const createExchangeRateSchema = z.object({
+  rate: z.coerce.number({ invalid_type_error: 'rate must be a number' }).positive('rate must be a positive number'),
+  effectiveDate: z.string().trim().min(1, 'effectiveDate is required'),
+  marketplace: z.string().trim().optional(),
+  notes: z.string().optional(),
+  applicationMode: z.enum(['effective', 'specific-date'], {
+    errorMap: () => ({ message: 'applicationMode must be either effective or specific-date' }),
+  }).optional(),
+  updateExistingOrders: z.boolean().optional(),
+});
+
+// ── Payoneer ──────────────────────────────────────────────────────────────────
+
+export const payoneerListQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+  startDate: optionalDateStringSchema,
+  endDate: optionalDateStringSchema,
+  store: optionalObjectIdSchema,
+});
+
+export const createPayoneerRecordSchema = z.object({
+  bankAccount: objectIdSchema,
+  paymentDate: z.string().trim().min(1, 'paymentDate is required'),
+  amount: z.coerce.number({ invalid_type_error: 'amount must be a number' }).positive('amount must be a positive number'),
+  exchangeRate: z.coerce.number({ invalid_type_error: 'exchangeRate must be a number' }).positive('exchangeRate must be a positive number'),
+  store: objectIdSchema,
+  periodStart: z.string().optional(),
+  periodEnd: z.string().optional(),
+  profit: z.union([z.literal(''), z.coerce.number()]).optional(),
+});
+
+export const updatePayoneerRecordSchema = createPayoneerRecordSchema.partial();
+
+// ── User category targets ────────────────────────────────────────────────────
+
+const USER_CATEGORY_TARGET_MARKETPLACES = ['US', 'UK', 'AU', 'Canada'];
+
+export const userCategoryTargetsPerformanceQuerySchema = z.object({
+  startDate: optionalDateStringSchema,
+  endDate: optionalDateStringSchema,
+  userId: optionalObjectIdSchema,
+  sellerId: optionalObjectIdSchema,
+  marketplace: z.string().trim().optional(),
+  categoryId: optionalObjectIdSchema,
+  rangeId: optionalObjectIdSchema,
+});
+
+export const createUserCategoryTargetSchema = z.object({
+  userId: objectIdSchema,
+  sellerId: objectIdSchema,
+  marketplace: z.enum(USER_CATEGORY_TARGET_MARKETPLACES, {
+    errorMap: () => ({ message: 'marketplace must be one of: US, UK, AU, Canada' }),
+  }),
+  categoryId: objectIdSchema,
+  rangeId: optionalObjectIdSchema,
+  dailyDesiredQuantity: z.coerce.number({
+    invalid_type_error: 'Daily desired quantity must be a number greater than or equal to 0',
+  }).min(0, 'Daily desired quantity must be a number greater than or equal to 0'),
+});

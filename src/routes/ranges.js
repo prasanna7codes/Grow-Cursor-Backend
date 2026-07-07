@@ -74,7 +74,7 @@ router.get('/', requireAuth, async (req, res) => {
     query.category = categoryId;
   }
   
-  const items = await Range.find(query).populate('category').sort({ name: 1 });
+  const items = await Range.find(query).populate('category').sort({ name: 1 }).lean();
   res.json(items);
 });
 

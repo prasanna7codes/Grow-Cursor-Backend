@@ -78,7 +78,7 @@ router.post('/', requireAuth, requirePageAccess('ManagePlatforms'), validate(cre
 router.get('/', requireAuth, async (req, res) => {
   const { type } = req.query;
   const query = type ? { type } : {};
-  const items = await Platform.find(query).sort({ name: 1 });
+  const items = await Platform.find(query).sort({ name: 1 }).lean();
   res.json(items);
 });
 

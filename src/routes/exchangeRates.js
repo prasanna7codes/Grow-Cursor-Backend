@@ -13,6 +13,14 @@ import {
   getPurchaseMarketplaceQueryForRateMarketplace,
   isAmazonRateMarketplace
 } from '../utils/exchangeRateUtils.js';
+import { validate } from '../utils/validate.js';
+import {
+  exchangeRateCurrentQuerySchema,
+  exchangeRateHistoryQuerySchema,
+  exchangeRateForDateQuerySchema,
+  createExchangeRateSchema,
+  idParamsSchema
+} from '../schemas/index.js';
 
 const router = express.Router();
 
@@ -39,7 +47,7 @@ const router = express.Router();
  *       500:
  *         description: Internal server error
  */
-router.get('/current', requireAuth, async (req, res) => {
+router.get('/current', requireAuth, validate(exchangeRateCurrentQuerySchema, 'query'), async (req, res) => {
   try {
     const { marketplace = 'EBAY_US' } = req.query;
     const currentRate = await getCurrentExchangeRateRecord(marketplace);
@@ -87,13 +95,13 @@ router.get('/current', requireAuth, async (req, res) => {
  *       500:
  *         description: Internal server error
  */
-router.get('/history', requireAuth, async (req, res) => {
+router.get('/history', requireAuth, validate(exchangeRateHistoryQuerySchema, 'query'), async (req, res) => {
   try {
     const { marketplace = 'EBAY_US', limit = 50 } = req.query;
-    
+
     const history = await ExchangeRate.find({ marketplace })
       .sort({ effectiveDate: -1 })
-      .limit(parseInt(limit));
+      .limit(limit);
     
     res.json(history);
   } catch (err) {
@@ -130,14 +138,10 @@ router.get('/history', requireAuth, async (req, res) => {
  *       500:
  *         description: Internal server error
  */
-router.get('/for-date', requireAuth, async (req, res) => {
+router.get('/for-date', requireAuth, validate(exchangeRateForDateQuerySchema, 'query'), async (req, res) => {
   try {
     const { date, marketplace = 'EBAY_US' } = req.query;
-    
-    if (!date) {
-      return res.status(400).json({ error: 'Date parameter is required' });
-    }
-    
+
     const rate = await getExchangeRateRecordForDate(date, marketplace);
     
     if (!rate) {
@@ -195,7 +199,7 @@ router.get('/for-date', requireAuth, async (req, res) => {
  *       500:
  *         description: Internal server error
  */
-router.post('/', requireAuth, async (req, res) => {
+router.post('/', requireAuth, validate(createExchangeRateSchema), async (req, res) => {
   try {
     const {
       rate,
@@ -205,14 +209,6 @@ router.post('/', requireAuth, async (req, res) => {
       applicationMode = 'effective',
       updateExistingOrders = true
     } = req.body;
-    
-    if (!rate || !effectiveDate) {
-      return res.status(400).json({ error: 'Rate and effectiveDate are required' });
-    }
-
-    if (!['effective', 'specific-date'].includes(applicationMode)) {
-      return res.status(400).json({ error: 'applicationMode must be either effective or specific-date' });
-    }
 
     const parsedEffectiveDate = new Date(effectiveDate);
     const normalizedEffectiveDate = applicationMode === 'specific-date'
@@ -333,7 +329,7 @@ router.post('/', requireAuth, async (req, res) => {
  *       500:
  *         description: Internal server error
  */
-router.delete('/:id', requireAuth, async (req, res) => {
+router.delete('/:id', requireAuth, validate(idParamsSchema, 'params'), async (req, res) => {
   try {
     const { id } = req.params;
     
