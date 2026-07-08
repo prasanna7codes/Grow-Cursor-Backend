@@ -8430,6 +8430,39 @@ router.get('/stored-returns', requireAuth, async (req, res) => {
  *       500:
  *         description: Internal server error
  */
+// The search API's respondByDate is the deadline for whoever must act NEXT — it is
+// only the seller's deadline in these statuses. In WAITING_BUYER_RESPONSE it is the
+// BUYER's deadline and must never be shown as the seller's "resolve by" date.
+const SELLER_TURN_STATUSES = ['OPEN', 'WAITING_SELLER_RESPONSE'];
+const CLOSED_STATUSES = ['CLOSED', 'CS_CLOSED', 'CLOSED_WITH_ESCALATION'];
+
+// Fetch the fixed seller-facing "resolve by" deadline (inquiryDetails.expirationDate)
+// and live status from GET /inquiry/{id} — the search API does not return the deadline.
+// Returns null on failure so a single bad case can't break the whole sync.
+async function fetchInquiryDetails(accessToken, inquiryId) {
+  try {
+    const detailRes = await axios.get(`https://api.ebay.com/post-order/v2/inquiry/${inquiryId}`, {
+      headers: {
+        'Authorization': `IAF ${accessToken}`,
+        'Content-Type': 'application/json',
+        'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
+      },
+      timeout: 15000
+    });
+    const deadline = detailRes.data?.inquiryDetails?.expirationDate?.value
+      || detailRes.data?.sellerMakeItRightByDate?.value;
+    return {
+      caseDeadline: deadline ? new Date(deadline) : null,
+      status: detailRes.data?.status || null,
+      closedDate: detailRes.data?.inquiryClosureDate?.value ? new Date(detailRes.data.inquiryClosureDate.value) : null,
+      escalationDate: detailRes.data?.inquiryDetails?.escalationDate?.value ? new Date(detailRes.data.inquiryDetails.escalationDate.value) : null
+    };
+  } catch (err) {
+    console.error(`[Fetch INR Cases] getInquiry failed for ${inquiryId}:`, err.response?.status || err.message);
+    return null;
+  }
+}
+
 router.post('/fetch-inr-cases', requireAuth, requirePageAccess('Disputes'), async (req, res) => {
   try {
     const sellers = await Seller.find({ 'ebayTokens.access_token': { $exists: true } })
@@ -8452,23 +8485,33 @@ router.post('/fetch-inr-cases', requireAuth, requirePageAccess('Disputes'), asyn
         try {
           const accessToken = await ensureValidToken(seller);
 
-          // Fetch INR cases from Post-Order API
+          // Fetch INR cases from Post-Order API. The search window is creation-date
+          // based and a from-only range covers 90 days forward, so 90 days back is the
+          // widest single-query window. Cases older than that are refreshed individually
+          // below via getInquiry, so nothing goes stale.
           const inquiryUrl = 'https://api.ebay.com/post-order/v2/inquiry/search';
-          const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+          const ninetyDaysAgo = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
 
-          const inquiryRes = await axios.get(inquiryUrl, {
-            headers: {
-              'Authorization': `IAF ${accessToken}`,
-              'Content-Type': 'application/json',
-              'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
-            },
-            params: {
-              'creation_date_range_from': thirtyDaysAgo,
-              'limit': 200
-            }
-          });
-
-          const cases = inquiryRes.data.members || [];
+          const cases = [];
+          let offset = 0;
+          while (true) {
+            const inquiryRes = await axios.get(inquiryUrl, {
+              headers: {
+                'Authorization': `IAF ${accessToken}`,
+                'Content-Type': 'application/json',
+                'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
+              },
+              params: {
+                'creation_date_range_from': ninetyDaysAgo,
+                'limit': 200,
+                'offset': offset
+              }
+            });
+            const page = inquiryRes.data.members || [];
+            cases.push(...page);
+            if (page.length < 200) break;
+            offset += 200;
+          }
           console.log(`[Fetch INR Cases] Seller ${sellerName}: Found ${cases.length} INR cases`);
 
           let newCases = 0;
@@ -8512,6 +8555,12 @@ router.post('/fetch-inr-cases', requireAuth, requirePageAccess('Disputes'), asyn
               }
             }
 
+            const status = ebayCase.inquiryStatusEnum || ebayCase.state || ebayCase.status || 'OPEN';
+            const respondByDate = ebayCase.respondByDate?.value
+              ? new Date(ebayCase.respondByDate.value)
+              : (ebayCase.sellerResponseDue?.respondByDate?.value ? new Date(ebayCase.sellerResponseDue.respondByDate.value) : null);
+            const isSellerTurn = SELLER_TURN_STATUSES.includes(status);
+
             const caseData = {
               seller: seller._id,
               caseId: ebayCase.inquiryId,
@@ -8519,14 +8568,12 @@ router.post('/fetch-inr-cases', requireAuth, requirePageAccess('Disputes'), asyn
               orderId: orderId,
               buyerUsername: ebayCase.buyer || ebayCase.buyerLoginName,
               // FIX: eBay returns 'inquiryStatusEnum' not 'state' or 'status'
-              status: ebayCase.inquiryStatusEnum || ebayCase.state || ebayCase.status || 'OPEN',
+              status,
 
               // Dates
               creationDate: ebayCase.creationDate?.value ? new Date(ebayCase.creationDate.value) : null,
-              // FIX: eBay returns 'respondByDate' directly, not nested under 'sellerResponseDue'
-              sellerResponseDueDate: ebayCase.respondByDate?.value
-                ? new Date(ebayCase.respondByDate.value)
-                : (ebayCase.sellerResponseDue?.respondByDate?.value ? new Date(ebayCase.sellerResponseDue.respondByDate.value) : null),
+              nextActionBy: respondByDate ? (isSellerTurn ? 'SELLER' : 'BUYER') : 'NONE',
+              nextActionDue: respondByDate,
               escalationDate: ebayCase.escalationDate?.value ? new Date(ebayCase.escalationDate.value) : null,
               closedDate: ebayCase.closedDate?.value ? new Date(ebayCase.closedDate.value) : null,
               // FIX: Also store lastModifiedDate from eBay
@@ -8551,14 +8598,33 @@ router.post('/fetch-inr-cases', requireAuth, requirePageAccess('Disputes'), asyn
 
             const existing = await Case.findOne({ caseId: ebayCase.inquiryId });
 
+            const statusChanged = existing && existing.status !== caseData.status;
+            const nextDueChanged = existing && (existing.nextActionDue?.getTime() || 0) !==
+              (caseData.nextActionDue?.getTime() || 0);
+
+            // The fixed "resolve by" deadline only comes from GET /inquiry/{id}. Fetch it
+            // for new cases, on any change, or to backfill cases synced before this field
+            // existed — but never for closed cases (deadline no longer applies).
+            const isClosed = CLOSED_STATUSES.includes(caseData.status);
+            let caseDeadline = existing?.caseDeadline || null;
+            if (!isClosed && (!existing || !caseDeadline || statusChanged || nextDueChanged)) {
+              const details = await fetchInquiryDetails(accessToken, ebayCase.inquiryId);
+              if (details?.caseDeadline) caseDeadline = details.caseDeadline;
+            }
+            caseData.caseDeadline = caseDeadline;
+            // Legacy display field: always the SELLER's deadline. Prefer the fixed case
+            // deadline; fall back to respondByDate only while it's the seller's turn.
+            caseData.sellerResponseDueDate = caseDeadline || (isSellerTurn ? respondByDate : null);
+
             if (existing) {
-              // Compare for changes
-              const statusChanged = existing.status !== caseData.status;
-              const dueDateChanged = (existing.sellerResponseDueDate?.getTime() || 0) !==
+              const deadlineChanged = (existing.caseDeadline?.getTime() || 0) !==
+                (caseData.caseDeadline?.getTime() || 0);
+              const legacyDueChanged = (existing.sellerResponseDueDate?.getTime() || 0) !==
                 (caseData.sellerResponseDueDate?.getTime() || 0);
 
-              if (statusChanged || dueDateChanged) {
-                console.log(`[Update] Case ${ebayCase.inquiryId}: Status ${existing.status} -> ${caseData.status}`);
+              if (statusChanged || nextDueChanged || deadlineChanged || legacyDueChanged) {
+                const previousStatus = existing.status;
+                console.log(`[Update] Case ${ebayCase.inquiryId}: Status ${previousStatus} -> ${caseData.status}`);
                 existing.set(caseData);
                 await existing.save();
                 updatedCases++;
@@ -8567,13 +8633,60 @@ router.post('/fetch-inr-cases', requireAuth, requirePageAccess('Disputes'), asyn
                   caseId: ebayCase.inquiryId,
                   orderId: caseData.orderId,
                   changes: {
-                    ...(statusChanged && { status: { from: existing.status, to: caseData.status } })
+                    ...(statusChanged && { status: { from: previousStatus, to: caseData.status } })
                   }
                 });
               }
             } else {
               await Case.create(caseData);
               newCases++;
+            }
+          }
+
+          // Second pass: refresh open cases that did NOT appear in the search results.
+          // This happens when a case ages past the 90-day creation window, or when an
+          // inquiry is escalated (eBay excludes escalated inquiries from searchInquiries).
+          // Without this, those cases would stay "open" with stale deadlines forever.
+          const seenCaseIds = new Set(cases.map(c => String(c.inquiryId)));
+          const staleCases = await Case.find({
+            seller: seller._id,
+            status: { $nin: CLOSED_STATUSES },
+            caseId: { $nin: [...seenCaseIds] }
+          });
+
+          for (const stale of staleCases) {
+            const details = await fetchInquiryDetails(accessToken, stale.caseId);
+            if (!details) continue;
+
+            const liveStatus = details.status || stale.status;
+            const statusChanged = liveStatus !== stale.status;
+            const deadlineChanged = details.caseDeadline &&
+              (stale.caseDeadline?.getTime() || 0) !== details.caseDeadline.getTime();
+
+            if (statusChanged || deadlineChanged || !stale.caseDeadline) {
+              const previousStatus = stale.status;
+              stale.status = liveStatus;
+              if (details.caseDeadline) {
+                stale.caseDeadline = details.caseDeadline;
+                stale.sellerResponseDueDate = details.caseDeadline;
+              }
+              if (details.closedDate) stale.closedDate = details.closedDate;
+              if (details.escalationDate) stale.escalationDate = details.escalationDate;
+              if (CLOSED_STATUSES.includes(liveStatus)) {
+                stale.nextActionBy = 'NONE';
+                stale.nextActionDue = null;
+              }
+              await stale.save();
+              updatedCases++;
+              console.log(`[Refresh Stale] Case ${stale.caseId}: Status ${previousStatus} -> ${liveStatus}`);
+
+              if (statusChanged) {
+                updateDetails.push({
+                  caseId: stale.caseId,
+                  orderId: stale.orderId,
+                  changes: { status: { from: previousStatus, to: liveStatus } }
+                });
+              }
             }
           }
 

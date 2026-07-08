@@ -15,7 +15,15 @@ const CaseSchema = new mongoose.Schema({
   
   // Dates
   creationDate: Date,
+  // Fixed seller-facing "resolve by" deadline (expirationDate from GET /inquiry/{id}).
+  // Does NOT move when the case flips to waiting-on-buyer — matches eBay's seller page.
+  caseDeadline: Date,
+  // Always mirrors caseDeadline when known (safe to display as the seller deadline).
   sellerResponseDueDate: Date,
+  // eBay's respondByDate is the deadline for whoever must act next, NOT always the
+  // seller: it applies to the buyer when status is WAITING_BUYER_RESPONSE.
+  nextActionBy: { type: String, enum: ['SELLER', 'BUYER', 'NONE'], default: 'NONE' },
+  nextActionDue: Date,
   escalationDate: Date,
   closedDate: Date,
   lastModifiedDate: Date,
