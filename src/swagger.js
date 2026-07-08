@@ -158,7 +158,7 @@ const swaggerDefinition = {
                         type: 'string',
                         nullable: true,
                         enum: ['INR', 'Cancellation', 'Return', 'Refund', 'Replace',
-                            'Out of Stock', 'Issue with Product', 'Inquiry', ''],
+                            'Out of Stock', 'Issue with Product', 'Issue with Delivery', 'Inquiry', ''],
                         description: 'The "About" classification of the conversation'
                     },
                     caseStatus: {
@@ -1055,7 +1055,7 @@ const swaggerDefinition = {
                                         type: 'string',
                                         nullable: true,
                                         enum: ['', 'INR', 'Cancellation', 'Return', 'Refund', 'Replace',
-                                            'Out of Stock', 'Issue with Product', 'Inquiry']
+                                            'Out of Stock', 'Issue with Product', 'Issue with Delivery', 'Inquiry']
                                     },
                                     caseStatus: {
                                         type: 'string',
