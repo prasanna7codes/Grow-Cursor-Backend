@@ -9511,11 +9511,22 @@ router.post('/send-message', requireAuth, requirePageAccess('BuyerMessages'), as
     const ack = result[responseKey].Ack[0];
 
     if (ack === 'Success' || ack === 'Warning') {
+      // Carry the item title over from the thread so replies don't create
+      // title-less messages (the thread list falls back to the raw item ID
+      // when no message in view has a title).
+      const titledMessage = await Message.findOne({
+        seller: seller._id,
+        buyerUsername: finalBuyer,
+        itemId: finalItemId,
+        itemTitle: { $nin: [null, ''] }
+      }).sort({ messageDate: -1 }).select('itemTitle').lean();
+
       // Save to database
       const newMsg = await Message.create({
         seller: seller._id,
         orderId: orderId || null,
         itemId: finalItemId,
+        itemTitle: titledMessage?.itemTitle || undefined,
         buyerUsername: finalBuyer,
         sender: 'SELLER',
         subject: subject || 'Reply',
@@ -9590,7 +9601,10 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
         lastMessage: { $first: "$body" },
         lastDate: { $first: "$messageDate" },
         sender: { $first: "$sender" },
-        itemTitle: { $first: "$itemTitle" },
+        // $max, not $first: seller replies may lack itemTitle, and $first
+        // would take the newest message's (missing) title. $max ignores
+        // null/missing and returns the title from any message in the thread.
+        itemTitle: { $max: "$itemTitle" },
         messageType: { $first: "$messageType" },
         unreadCount: {
           $sum: { $cond: [{ $and: [{ $eq: ["$read", false] }, { $eq: ["$sender", "BUYER"] }] }, 1, 0] }
@@ -9601,8 +9615,24 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
       }
     });
 
-    // 4. LOOKUP ORDER DETAILS (For Buyer Name)
+    // 3.1 Flatten group keys to the root so filters can run before the heavy
+    // display stages below.
     pipeline.push({
+      $addFields: {
+        orderId: "$_id.orderId",
+        buyerUsername: "$_id.buyer",
+        itemId: "$_id.item"
+      }
+    });
+
+    // Heavy display stages (order/listing lookups + projections). They add
+    // display-only fields and never filter rows, so unless a search or
+    // marketplace filter needs their output, they run after $skip/$limit on
+    // a single page of threads instead of every thread.
+    const displayStages = [];
+
+    // 4. LOOKUP ORDER DETAILS (For Buyer Name)
+    displayStages.push({
       $lookup: {
         from: 'orders',
         localField: '_id.orderId',
@@ -9612,7 +9642,7 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
     });
 
     // 5. FLATTEN & FORMAT
-    pipeline.push({
+    displayStages.push({
       $project: {
         orderId: "$_id.orderId",
         buyerUsername: "$_id.buyer",
@@ -9660,7 +9690,7 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
     });
 
     // 5.0 LOOKUP LISTING DETAILS (For Currency -> Marketplace fallback AND Product Image)
-    pipeline.push({
+    displayStages.push({
       $lookup: {
         from: 'listings',
         localField: 'itemId',
@@ -9670,7 +9700,7 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
     });
 
     // 5.1 COMPUTE MARKETPLACE ID & EXTRACT IMAGE URL & FIX MESSAGE TYPE
-    pipeline.push({
+    displayStages.push({
       $addFields: {
         listingCurrency: { $arrayElemAt: ["$listingDetails.currency", 0] },
         // Extract product thumbnail for display (try listing first, then order lineItem as fallback)
@@ -9704,7 +9734,7 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
       }
     });
 
-    pipeline.push({
+    displayStages.push({
       $addFields: {
         computedMarketplaceId: {
           $switch: {
@@ -9729,6 +9759,22 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
       }
     });
 
+    // Drop the raw lookup output — the fields the client needs
+    // (productImageUrl, listingCurrency, computedMarketplaceId) were extracted
+    // above, and the full listing documents were most of the response payload.
+    displayStages.push({ $project: { listingDetails: 0, orderImageUrl: 0 } });
+
+    // Search matches buyerName (from the orders lookup) and the marketplace
+    // filter matches computedMarketplaceId (from the listings lookup), so only
+    // those two need the display stages to run before filtering/pagination.
+    const needsDisplayBeforePagination =
+      Boolean(search && search.trim() !== '') ||
+      Boolean(filterMarketplace && filterMarketplace !== '');
+
+    if (needsDisplayBeforePagination) {
+      pipeline.push(...displayStages);
+    }
+
     // 5.2. FILTER BY TYPE
     if (filterType === 'ORDER') {
       pipeline.push({
@@ -9752,9 +9798,11 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
 
     // 5.3 FILTER BY MARKETPLACE (NEW)
     if (filterMarketplace && filterMarketplace !== '') {
-      // If filtering by specific marketplace
+      // Keep 'Unknown' candidates too: their marketplace gets resolved via the
+      // eBay API after aggregation and re-filtered there, so inquiries whose
+      // listing details are missing from the DB are not silently dropped.
       pipeline.push({
-        $match: { computedMarketplaceId: filterMarketplace }
+        $match: { computedMarketplaceId: { $in: [filterMarketplace, 'Unknown'] } }
       });
     }
 
@@ -9774,61 +9822,6 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
         }
       });
     }
-
-    // 5.5 FILTER OUT RESOLVED CONVERSATIONS (Lookup ConversationMeta)
-    pipeline.push({
-      $lookup: {
-        from: 'conversationmetas',
-        let: {
-          orderId: '$orderId',
-          buyerUsername: '$buyerUsername',
-          itemId: '$itemId',
-          sellerId: '$sellerId'
-        },
-        pipeline: [
-          {
-            $match: {
-              $expr: {
-                $and: [
-                  { $eq: ['$seller', '$$sellerId'] },
-                  {
-                    $or: [
-                      // Order conversation: matched by orderId
-                      {
-                        $and: [
-                          { $ne: ['$$orderId', null] },
-                          { $eq: ['$orderId', '$$orderId'] }
-                        ]
-                      },
-                      // Inquiry: matched by buyerUsername + itemId + orderId is null
-                      {
-                        $and: [
-                          { $eq: ['$$orderId', null] },
-                          { $eq: ['$orderId', null] },
-                          { $eq: ['$buyerUsername', '$$buyerUsername'] },
-                          { $eq: ['$itemId', '$$itemId'] }
-                        ]
-                      }
-                    ]
-                  }
-                ]
-              }
-            }
-          }
-        ],
-        as: 'conversationMeta'
-      }
-    });
-
-    // Exclude threads where ConversationMeta exists and status is 'Resolved'
-    pipeline.push({
-      $match: {
-        $or: [
-          { 'conversationMeta': { $size: 0 } },          // No meta record → not resolved
-          { 'conversationMeta.0.status': { $ne: 'Resolved' } } // Meta exists but not resolved
-        ]
-      }
-    });
 
     // 5.6 FILTER BY DATE RANGE — date strings are interpreted as UTC calendar days
     // matching the UTC storage format of messageDate in the DB.
@@ -9868,15 +9861,53 @@ router.get('/chat/threads', requireAuth, async (req, res) => {
       {
         $facet: {
           metadata: [{ $count: "total" }],
-          data: [{ $skip: skip }, { $limit: limitNum }]
+          // Fast path: heavy display lookups run on one page of threads only.
+          data: needsDisplayBeforePagination
+            ? [{ $skip: skip }, { $limit: limitNum }]
+            : [{ $skip: skip }, { $limit: limitNum }, ...displayStages]
         }
       }
     ];
 
-    const result = await Message.aggregate(facetedPipeline).allowDiskUse(true);
+    let threads;
+    let total;
 
-    let threads = result[0].data;
-    let total = result[0].metadata[0] ? result[0].metadata[0].total : 0;
+    if (filterMarketplace && filterMarketplace !== '') {
+      // Marketplace filter: the pipeline kept 'Unknown' candidates. Resolve
+      // their marketplace via the eBay API BEFORE filtering and paginating,
+      // so threads with scrubbed/missing listing details are matched
+      // correctly instead of being dropped. (fetchItemSiteFromApi is a
+      // hoisted function declaration defined below.)
+      const candidates = await Message.aggregate(pipeline).allowDiskUse(true);
+
+      await Promise.all(candidates.map(async (thread) => {
+        if (thread.computedMarketplaceId !== 'Unknown') return;
+        if (!thread.itemId || thread.itemId === 'DIRECT_MESSAGE') return;
+
+        const apiResult = await fetchItemSiteFromApi(thread.itemId, thread.sellerId);
+        if (!apiResult) return;
+        thread.computedMarketplaceId = apiResult.marketplaceId;
+
+        // Save to Listing DB so next time the pipeline resolves it directly
+        try {
+          await Listing.findOneAndUpdate(
+            { itemId: thread.itemId },
+            { seller: thread.sellerId, itemId: thread.itemId, currency: apiResult.currency },
+            { upsert: true, setDefaultsOnInsert: true }
+          );
+        } catch (e) {
+          console.error('Failed to cache listing marketplace', e);
+        }
+      }));
+
+      const matching = candidates.filter((thread) => thread.computedMarketplaceId === filterMarketplace);
+      total = matching.length;
+      threads = matching.slice(skip, skip + limitNum);
+    } else {
+      const result = await Message.aggregate(facetedPipeline).allowDiskUse(true);
+      threads = result[0].data;
+      total = result[0].metadata[0] ? result[0].metadata[0].total : 0;
+    }
 
     // --- ORDER FALLBACK SEARCH ---
     // If a search term is provided, also look up matching Orders directly.

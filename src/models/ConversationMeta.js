@@ -48,4 +48,9 @@ ConversationMetaSchema.index(
   { unique: true, partialFilterExpression: { orderId: null } }
 );
 
+// 3. Non-partial index for the chat-threads $lookup ($expr match on seller +
+// orderId/buyer/item). The partial indexes above cannot serve $expr queries,
+// which otherwise collection-scan conversationmetas once per thread.
+ConversationMetaSchema.index({ seller: 1, orderId: 1, buyerUsername: 1, itemId: 1 });
+
 export default mongoose.model('ConversationMeta', ConversationMetaSchema);
