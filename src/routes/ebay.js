@@ -15096,6 +15096,7 @@ async function processPendingPolicyMessages(limit = 50) {
 
   let successCount = 0;
   let failCount = 0;
+  let attemptedCount = 0;
 
   for (const order of orders) {
     if (!order.seller) {
@@ -15103,14 +15104,42 @@ async function processPendingPolicyMessages(limit = 50) {
       continue;
     }
 
+    // Atomically CLAIM this order before sending. This guards against the same
+    // policy message going out twice when runs overlap — e.g. the fire-and-forget
+    // trigger after polling running alongside a manual /orders/send-auto-messages
+    // click, or two clicks. Only the run whose update matches an as-yet-unsent
+    // order wins the claim; any concurrent run gets null here and skips it.
+    const claimed = await Order.findOneAndUpdate(
+      {
+        _id: order._id,
+        policyMessageSent: { $ne: true },
+        policyMessageDisabled: { $ne: true }
+      },
+      { $set: { policyMessageSent: true, policyMessageSentAt: new Date() } }
+    );
+
+    if (!claimed) {
+      // Another concurrent run already claimed/sent this order — skip it.
+      continue;
+    }
+
+    attemptedCount++;
     const result = await sendPolicyMessage(order, order.seller);
-    if (result.success) successCount++;
-    else failCount++;
+    if (result.success) {
+      successCount++;
+    } else {
+      failCount++;
+      // Send genuinely failed — release the claim so a later run can retry it.
+      await Order.findByIdAndUpdate(order._id, {
+        $set: { policyMessageSent: false },
+        $unset: { policyMessageSentAt: '' }
+      });
+    }
 
     await new Promise(resolve => setTimeout(resolve, 500));
   }
 
-  return { processed: orders.length, sent: successCount, failed: failCount };
+  return { processed: attemptedCount, sent: successCount, failed: failCount };
 }
 
 // Compatibility endpoint path kept to avoid breaking existing UI button
