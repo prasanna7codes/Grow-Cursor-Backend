@@ -1,9 +1,11 @@
 /**
  * Discounts (Promotions) routes — eBay Sell Marketing API
  *
- * GET /api/ebay/discounts         — getPromotions (list of one seller's discounts)
- * GET /api/ebay/discounts/all     — discounts for every seller visible to the user
- * GET /api/ebay/discounts/detail  — full discount details via its promotionHref
+ * GET /api/ebay/discounts             — getPromotions (list of one seller's discounts)
+ * GET /api/ebay/discounts/all         — live fetch of all sellers' discounts (non-default page filters)
+ * GET /api/ebay/discounts/cached      — cached snapshot of all sellers' active coupons/sale events
+ * GET /api/ebay/discounts/ending-soon — cached alerts for the header bell
+ * GET /api/ebay/discounts/detail      — full discount details via its promotionHref
  *
  * Mounted at /api/ebay in server/src/index.js.
  * Note: eBay renamed "promotions" to "discounts" in Seller Hub (Jul 2024);
@@ -211,9 +213,10 @@ router.get('/discounts', requireAuth, async (req, res) => {
 // =============================================================================
 // GET /discounts/all
 // Query: status, type, q, sort
-// Fetches discounts for every seller visible to the requesting user
-// (5 sellers at a time). One seller failing does not fail the request —
-// each result carries its own error message instead.
+// LIVE fetch from eBay for every seller (5 at a time). Used by the Discounts
+// page only for non-default filters (Scheduled/Paused/Ended/Draft/All);
+// the default Active view is served by /discounts/cached instead. One seller
+// failing does not fail the request — each result carries its own error.
 // =============================================================================
 /**
  * @swagger
@@ -333,6 +336,57 @@ export async function refreshDiscountAlertsCache() {
 
   return alertsRefreshInFlight;
 }
+
+// =============================================================================
+// GET /discounts/cached
+// Query: refresh (optional)
+// The full cached snapshot — every seller's RUNNING coupons & sale events.
+// Backs the Discounts page's default "Active" view so simply opening the
+// page never calls eBay. "Refresh All" passes refresh=true, which re-fetches
+// from eBay and updates the shared cache (the bell benefits too).
+// =============================================================================
+/**
+ * @swagger
+ * /ebay/discounts/cached:
+ *   get:
+ *     tags: [Discounts]
+ *     summary: Cached snapshot of all sellers' active coupons and sale events (refreshed every 12 hours)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: refresh
+ *         schema: { type: boolean }
+ *         description: Pass true to force an immediate re-fetch from eBay (explicit user action only)
+ *     responses:
+ *       200:
+ *         description: Per-seller cached results
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:   { type: boolean }
+ *                 fetchedAt: { type: string, format: date-time }
+ *                 results:   { type: array, items: { type: object } }
+ *       500:
+ *         description: Internal server error
+ */
+router.get('/discounts/cached', requireAuth, async (req, res) => {
+  try {
+    if (req.query.refresh === 'true' || !discountAlertsCache) {
+      await refreshDiscountAlertsCache();
+    }
+    return res.json({
+      success: true,
+      fetchedAt: discountAlertsCache.fetchedAt,
+      results: discountAlertsCache.results,
+    });
+  } catch (err) {
+    console.error('[Discounts] cached error:', err.message);
+    return res.status(500).json({ error: 'Failed to read discounts cache', details: err.message });
+  }
+});
 
 /**
  * @swagger
