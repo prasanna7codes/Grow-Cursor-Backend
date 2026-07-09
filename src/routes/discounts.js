@@ -14,7 +14,6 @@ import express from 'express';
 import axios from 'axios';
 import { requireAuth } from '../middleware/auth.js';
 import Seller from '../models/Seller.js';
-import UserSellerAssignment from '../models/UserSellerAssignment.js';
 import { ensureValidToken } from './ebay.js';
 
 const router = express.Router();
@@ -136,21 +135,6 @@ function parseTypes(typesQuery) {
     .split(',')
     .map((t) => t.trim())
     .filter((t) => VALID_TYPES.includes(t));
-}
-
-// Sellers the requesting user may see — mirrors GET /sellers/all:
-// superadmin sees everyone; others see their assignments (or everyone when
-// they have no explicit assignments, for backward compatibility).
-async function getVisibleSellers(user) {
-  if (user.role === 'superadmin') {
-    return Seller.find().populate('user', 'username email');
-  }
-  const assignments = await UserSellerAssignment.find({ user: user.userId }).select('seller').lean();
-  const assignedSellerIds = assignments.map((a) => a.seller);
-  if (assignedSellerIds.length === 0) {
-    return Seller.find().populate('user', 'username email');
-  }
-  return Seller.find({ _id: { $in: assignedSellerIds } }).populate('user', 'username email');
 }
 
 // =============================================================================
@@ -282,7 +266,8 @@ router.get('/discounts/all', requireAuth, async (req, res) => {
     const types = parseTypes(req.query.types);
     const singleType = types.length === 1 ? types[0] : type;
 
-    const sellers = await getVisibleSellers(req.user);
+    // Every user sees ALL sellers' discounts — no per-user visibility filtering
+    const sellers = await Seller.find().populate('user', 'username email');
     let results = await fetchDiscountsForSellers(sellers, { status, type: singleType, q, sort });
 
     if (types.length > 1) {
@@ -391,10 +376,8 @@ router.get('/discounts/ending-soon', requireAuth, async (req, res) => {
       await refreshDiscountAlertsCache();
     }
 
-    // Filter the global snapshot down to the sellers this user may see
-    const visibleSellers = await getVisibleSellers(req.user);
-    const visibleIds = new Set(visibleSellers.map((s) => String(s._id)));
-    const visibleResults = discountAlertsCache.results.filter((r) => visibleIds.has(r.sellerId));
+    // Every user sees alerts for ALL sellers — no per-user visibility filtering
+    const visibleResults = discountAlertsCache.results;
 
     const now = Date.now();
     const windowMs = days * 24 * 60 * 60 * 1000;
