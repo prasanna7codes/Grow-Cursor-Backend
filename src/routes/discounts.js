@@ -86,6 +86,14 @@ async function fetchSellerDiscounts(seller, filters) {
 const ebayErrorMessage = (err) =>
   err.response?.data?.errors?.[0]?.message ?? err.message ?? 'Unknown error';
 
+// Sellers whose fetch failures should be silently ignored (never surfaced in
+// the Discounts page error panel or the header bell) — e.g. in-house accounts
+// that are not connected to eBay.
+const ERROR_IGNORED_SELLERS = ['growmentality'];
+
+const isErrorIgnoredSeller = (sellerName) =>
+  ERROR_IGNORED_SELLERS.includes(String(sellerName || '').trim().toLowerCase());
+
 // Fetch discounts for many sellers, 5 at a time. One seller failing does not
 // throw — its result carries an error message instead.
 async function fetchDiscountsForSellers(sellers, filters) {
@@ -106,7 +114,12 @@ async function fetchDiscountsForSellers(sellers, filters) {
         results[idx] = { ...base, discounts, total, error: null };
       } catch (err) {
         console.error(`[Discounts] fetch failed for seller ${base.sellerName}:`, err.response?.data ?? err.message);
-        results[idx] = { ...base, discounts: [], total: 0, error: ebayErrorMessage(err) };
+        results[idx] = {
+          ...base,
+          discounts: [],
+          total: 0,
+          error: isErrorIgnoredSeller(base.sellerName) ? null : ebayErrorMessage(err),
+        };
       }
     }
   }
