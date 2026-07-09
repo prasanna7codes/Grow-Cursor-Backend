@@ -14676,6 +14676,10 @@ Please note that once an order is processed, cancellation may not be possible. A
 As a small business, your support means a lot to us. Thank you for your understanding!`;
 
 const POLICY_MESSAGE_DELAY_MS = 20 * 60 * 1000; // 20 minutes
+// A claim held longer than this without delivery is treated as abandoned (e.g. the
+// process crashed or was redeployed mid-send) and may be reclaimed by a later run.
+// Must be comfortably longer than a full processing run + a single send's latency.
+const POLICY_MESSAGE_STALE_CLAIM_MS = 10 * 60 * 1000; // 10 minutes
 
 function getPolicyEligibilityDate(creationDate) {
   const createdAt = creationDate ? new Date(creationDate) : new Date();
@@ -14956,6 +14960,8 @@ async function processPendingPolicyMessages(limit = 50) {
 
   let successCount = 0;
   let failCount = 0;
+  let attemptedCount = 0;
+  const staleBefore = new Date(Date.now() - POLICY_MESSAGE_STALE_CLAIM_MS);
 
   for (const order of orders) {
     if (!order.seller) {
@@ -14963,14 +14969,50 @@ async function processPendingPolicyMessages(limit = 50) {
       continue;
     }
 
+    // Atomically CLAIM this order before sending. This guards against the same
+    // policy message going out twice when runs overlap — e.g. the fire-and-forget
+    // trigger after polling running alongside a manual /orders/send-auto-messages
+    // click, or two clicks. The update only matches an order that isn't already
+    // delivered/disabled AND is either unclaimed or whose claim has gone stale
+    // (a run that crashed/redeployed mid-send), so an abandoned claim is recovered
+    // instead of being lost. Only one run can win the atomic update; concurrent
+    // runs get null here and skip. Delivery (policyMessageSent) is set separately,
+    // only after eBay confirms, inside sendPolicyMessage().
+    const claimed = await Order.findOneAndUpdate(
+      {
+        _id: order._id,
+        policyMessageSent: { $ne: true },
+        policyMessageDisabled: { $ne: true },
+        $or: [
+          { policyMessageClaimedAt: null },
+          { policyMessageClaimedAt: { $exists: false } },
+          { policyMessageClaimedAt: { $lte: staleBefore } }
+        ]
+      },
+      { $set: { policyMessageClaimedAt: new Date() } },
+      { new: true }
+    );
+
+    if (!claimed) {
+      // Already delivered/disabled, or actively claimed by another run — skip.
+      continue;
+    }
+
+    attemptedCount++;
     const result = await sendPolicyMessage(order, order.seller);
-    if (result.success) successCount++;
-    else failCount++;
+    if (result.success) {
+      successCount++;
+    } else {
+      failCount++;
+      // Send genuinely failed — release the claim now so a later run retries
+      // promptly rather than waiting out the stale window.
+      await Order.findByIdAndUpdate(order._id, { $set: { policyMessageClaimedAt: null } });
+    }
 
     await new Promise(resolve => setTimeout(resolve, 500));
   }
 
-  return { processed: orders.length, sent: successCount, failed: failCount };
+  return { processed: attemptedCount, sent: successCount, failed: failCount };
 }
 
 // Compatibility endpoint path kept to avoid breaking existing UI button

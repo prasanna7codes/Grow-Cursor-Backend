@@ -160,8 +160,12 @@ const OrderSchema = new mongoose.Schema(
     logs: { type: String, default: '' },
 
     // Policy message feature (20-minute follow-up message)
-    policyMessageSent: { type: Boolean, default: false },
+    policyMessageSent: { type: Boolean, default: false },     // true only after eBay confirms delivery
     policyMessageSentAt: Date,
+    // In-progress claim marker: set when a run grabs this order to send, distinct
+    // from policyMessageSent (delivery). Lets a claim abandoned by a crashed/redeployed
+    // run be reclaimed after a stale window so the message isn't silently lost.
+    policyMessageClaimedAt: { type: Date, default: null },
     policyMessageDisabled: { type: Boolean, default: false },
     policyMessageEligibleAt: {
       type: Date,
