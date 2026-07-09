@@ -86,6 +86,45 @@ async function fetchSellerDiscounts(seller, filters) {
 const ebayErrorMessage = (err) =>
   err.response?.data?.errors?.[0]?.message ?? err.message ?? 'Unknown error';
 
+// Fetch discounts for many sellers, 5 at a time. One seller failing does not
+// throw — its result carries an error message instead.
+async function fetchDiscountsForSellers(sellers, filters) {
+  const results = new Array(sellers.length);
+  const CONCURRENCY = 5;
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < sellers.length) {
+      const idx = cursor++;
+      const seller = sellers[idx];
+      const base = {
+        sellerId: seller._id,
+        sellerName: seller.user?.username || String(seller._id),
+      };
+      try {
+        const { discounts, total } = await fetchSellerDiscounts(seller, filters);
+        results[idx] = { ...base, discounts, total, error: null };
+      } catch (err) {
+        console.error(`[Discounts] fetch failed for seller ${base.sellerName}:`, err.response?.data ?? err.message);
+        results[idx] = { ...base, discounts: [], total: 0, error: ebayErrorMessage(err) };
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, sellers.length) }, worker));
+  return results;
+}
+
+// Parse ?types=A,B into validated list. eBay's promotion_type param only takes
+// one value, so a single type is pushed down to eBay and multiple types are
+// filtered after fetching.
+function parseTypes(typesQuery) {
+  return String(typesQuery || '')
+    .split(',')
+    .map((t) => t.trim())
+    .filter((t) => VALID_TYPES.includes(t));
+}
+
 // Sellers the requesting user may see — mirrors GET /sellers/all:
 // superadmin sees everyone; others see their assignments (or everyone when
 // they have no explicit assignments, for backward compatibility).
@@ -226,31 +265,19 @@ router.get('/discounts', requireAuth, async (req, res) => {
 router.get('/discounts/all', requireAuth, async (req, res) => {
   try {
     const { status, type, q, sort } = req.query;
+    // ?types=A,B (multiple) takes precedence over ?type=A (single)
+    const types = parseTypes(req.query.types);
+    const singleType = types.length === 1 ? types[0] : type;
+
     const sellers = await getVisibleSellers(req.user);
+    let results = await fetchDiscountsForSellers(sellers, { status, type: singleType, q, sort });
 
-    const results = new Array(sellers.length);
-    const CONCURRENCY = 5;
-    let cursor = 0;
-
-    async function worker() {
-      while (cursor < sellers.length) {
-        const idx = cursor++;
-        const seller = sellers[idx];
-        const base = {
-          sellerId: seller._id,
-          sellerName: seller.user?.username || String(seller._id),
-        };
-        try {
-          const { discounts, total } = await fetchSellerDiscounts(seller, { status, type, q, sort });
-          results[idx] = { ...base, discounts, total, error: null };
-        } catch (err) {
-          console.error(`[Discounts] fetch failed for seller ${base.sellerName}:`, err.response?.data ?? err.message);
-          results[idx] = { ...base, discounts: [], total: 0, error: ebayErrorMessage(err) };
-        }
-      }
+    if (types.length > 1) {
+      results = results.map((r) => {
+        const discounts = r.discounts.filter((d) => types.includes(d.promotionType));
+        return { ...r, discounts, total: discounts.length };
+      });
     }
-
-    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, sellers.length) }, worker));
 
     const ok = results.filter((r) => !r.error).length;
     console.log(`[Discounts] all-sellers fetch: ${ok}/${results.length} seller(s) succeeded`);
@@ -259,6 +286,131 @@ router.get('/discounts/all', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('[Discounts] all-sellers error:', err.message);
     return res.status(500).json({ error: 'Failed to fetch discounts for all sellers', details: err.message });
+  }
+});
+
+// =============================================================================
+// Discount alerts cache — ONE global snapshot shared by every user.
+//
+// Refreshed only by:
+//   1. server startup (warm), and
+//   2. a cron job every 12 hours (see scheduledJobs.js), and
+//   3. an explicit "Refresh now" click in the bell popover (?refresh=true).
+//
+// User activity (page loads, navigation, many users being online) only ever
+// reads this snapshot — it never triggers eBay API calls. The snapshot stores
+// every RUNNING coupon / sale event; the "ending within N days" window is
+// evaluated against the current time on each read, so urgency stays accurate
+// even between refreshes.
+// =============================================================================
+const ALERT_TYPES = ['CODED_COUPON', 'MARKDOWN_SALE'];
+
+let discountAlertsCache = null; // { fetchedAt, results: [{ sellerId, sellerName, discounts, error }] }
+let alertsRefreshInFlight = null; // dedupes concurrent refreshes
+
+export async function refreshDiscountAlertsCache() {
+  if (alertsRefreshInFlight) return alertsRefreshInFlight;
+
+  alertsRefreshInFlight = (async () => {
+    const sellers = await Seller.find().populate('user', 'username email');
+    const results = await fetchDiscountsForSellers(sellers, { status: 'RUNNING' });
+
+    discountAlertsCache = {
+      fetchedAt: new Date().toISOString(),
+      results: results.map((r) => ({
+        sellerId: String(r.sellerId),
+        sellerName: r.sellerName,
+        // only coupons & sale events are alert-worthy — keep the cache small
+        discounts: r.discounts.filter((d) => ALERT_TYPES.includes(d.promotionType)),
+        error: r.error,
+      })),
+    };
+
+    const ok = results.filter((r) => !r.error).length;
+    console.log(`[Discounts] alerts cache refreshed: ${ok}/${results.length} seller(s) succeeded`);
+    return discountAlertsCache;
+  })().finally(() => {
+    alertsRefreshInFlight = null;
+  });
+
+  return alertsRefreshInFlight;
+}
+
+/**
+ * @swagger
+ * /ebay/discounts/ending-soon:
+ *   get:
+ *     tags: [Discounts]
+ *     summary: Active coupons and sale events ending within N days (served from a global cache refreshed every 12 hours)
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: days
+ *         schema: { type: integer, default: 3, minimum: 1, maximum: 30 }
+ *       - in: query
+ *         name: refresh
+ *         schema: { type: boolean }
+ *         description: Pass true to force an immediate re-fetch from eBay (explicit user action only)
+ *     responses:
+ *       200:
+ *         description: Discounts ending soon plus per-seller fetch errors
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 success:   { type: boolean }
+ *                 fetchedAt: { type: string, format: date-time }
+ *                 days:      { type: integer }
+ *                 alerts:    { type: array, items: { type: object } }
+ *                 errors:    { type: array, items: { type: object } }
+ *       500:
+ *         description: Internal server error
+ */
+router.get('/discounts/ending-soon', requireAuth, async (req, res) => {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days) || 3, 1), 30);
+
+    // Only an explicit refresh click — or an empty cache right after server
+    // start — touches eBay. Everything else reads the shared snapshot.
+    if (req.query.refresh === 'true' || !discountAlertsCache) {
+      await refreshDiscountAlertsCache();
+    }
+
+    // Filter the global snapshot down to the sellers this user may see
+    const visibleSellers = await getVisibleSellers(req.user);
+    const visibleIds = new Set(visibleSellers.map((s) => String(s._id)));
+    const visibleResults = discountAlertsCache.results.filter((r) => visibleIds.has(r.sellerId));
+
+    const now = Date.now();
+    const windowMs = days * 24 * 60 * 60 * 1000;
+
+    const alerts = visibleResults.flatMap((r) =>
+      r.discounts
+        .filter((d) => {
+          if (!d.endDate) return false;
+          const diff = new Date(d.endDate).getTime() - now;
+          return diff > 0 && diff <= windowMs;
+        })
+        .map((d) => ({ ...d, sellerId: r.sellerId, sellerName: r.sellerName }))
+    );
+    alerts.sort((a, b) => new Date(a.endDate) - new Date(b.endDate));
+
+    const errors = visibleResults
+      .filter((r) => r.error)
+      .map((r) => ({ sellerId: r.sellerId, sellerName: r.sellerName, error: r.error }));
+
+    return res.json({
+      success: true,
+      fetchedAt: discountAlertsCache.fetchedAt,
+      days,
+      alerts,
+      errors,
+    });
+  } catch (err) {
+    console.error('[Discounts] ending-soon error:', err.message);
+    return res.status(500).json({ error: 'Failed to fetch ending-soon discounts', details: err.message });
   }
 });
 
