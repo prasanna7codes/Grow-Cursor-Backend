@@ -1,6 +1,7 @@
 import cron from 'node-cron';
 import Attendance from './models/Attendance.js';
 import { runScheduledUploads } from './lib/ebayFeedUpload.js';
+import { refreshDiscountAlertsCache } from './routes/discounts.js';
 import {
     scheduledSyncAllSellers,
     scheduledRunAutoCompatForDate,
@@ -90,6 +91,29 @@ export function initializeScheduledJobs() {
     });
 
     console.log('[CRON] Scheduled job initialized: Auto-upload CSV (every minute)');
+
+    // Discount alerts cache — refresh from eBay every 12 hours. The header
+    // bell and its endpoint only read this cache; user activity never
+    // triggers eBay calls. Runs only on the Render runner so a local dev
+    // server doesn't duplicate eBay fetches (locally the cache still
+    // populates lazily on the first bell request).
+    if (IS_RENDER_RUNNER) {
+        cron.schedule('0 */12 * * *', async () => {
+            try {
+                console.log('[CRON] Refreshing discount alerts cache...');
+                await refreshDiscountAlertsCache();
+            } catch (error) {
+                console.error('[CRON] Discount alerts cache refresh error:', error.message);
+            }
+        });
+
+        // Warm once at startup so the first user doesn't wait on a cold cache
+        refreshDiscountAlertsCache().catch((error) =>
+            console.error('[CRON] Initial discount alerts cache warm failed:', error.message)
+        );
+
+        console.log('[CRON] Scheduled job initialized: Discount alerts cache refresh (every 12 hours, Render runner only)');
+    }
 
     if (IS_SKU_INDEX_RUNNER) {
         // SKU Index Sync at 12:30 PM IST daily.
