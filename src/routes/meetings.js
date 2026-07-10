@@ -205,7 +205,8 @@ router.get('/', requireAuth, requirePageAccess('Meetings', MEETING_PAGE_ROLES), 
 
         const meetings = await Meeting.find(query)
             .populate(userSummaryPopulate)
-            .sort({ scheduledFor: -1, updatedAt: -1 });
+            .sort({ scheduledFor: -1, updatedAt: -1 })
+            .lean();
 
         res.json(meetings);
     } catch (error) {
