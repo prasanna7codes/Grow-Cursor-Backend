@@ -199,7 +199,7 @@ router.post('/', requireAuth, validate(createUserSchema), async (req, res) => {
  *       403: { description: Forbidden }
  */
 router.get('/listers', requireAuth, requirePageAccess('AddUser'), async (req, res) => {
-  const listers = await User.find({ role: 'lister', active: true }).select('email username role');
+  const listers = await User.find({ role: 'lister', active: true }).select('email username role').lean();
   res.json(listers);
 });
 
@@ -220,7 +220,7 @@ router.get('/listers', requireAuth, requirePageAccess('AddUser'), async (req, re
  *       403: { description: Forbidden }
  */
 router.get('/compatibility-editors', requireAuth, requirePageAccess('AddCompatibilityEditor'), async (req, res) => {
-  const editors = await User.find({ role: 'compatibilityeditor', active: true }).select('email username role');
+  const editors = await User.find({ role: 'compatibilityeditor', active: true }).select('email username role').lean();
   res.json(editors);
 });
 
@@ -283,7 +283,7 @@ router.get('/check-exists', requireAuth, async (req, res) => {
  */
 router.get('/', requireAuth, async (req, res) => {
   try {
-    const users = await User.find({ active: true }).select('username email role department pagePermissions useCustomPermissions');
+    const users = await User.find({ active: true }).select('username email role department pagePermissions useCustomPermissions').lean();
     res.json(users);
   } catch (e) {
     res.status(500).json({ error: 'Error fetching users' });

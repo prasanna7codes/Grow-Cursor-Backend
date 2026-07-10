@@ -30,7 +30,7 @@ const router = Router();
  */
 // List all sellers (for admin dashboard)
 router.get('/all', requireAuth, requirePageAccess('SelectSeller'), async (req, res) => {
-  const sellers = await Seller.find().populate('user', 'username email');
+  const sellers = await Seller.find().populate('user', 'username email').lean();
   res.json(sellers);
 });
 
