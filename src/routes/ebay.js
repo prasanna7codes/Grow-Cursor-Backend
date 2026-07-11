@@ -13003,8 +13003,42 @@ router.post('/compatibility/values', requireAuth, async (req, res) => {
 
 
 
+// --- CONVERSATION META AUDIT HELPERS ---
+// Resolves the acting user's username for the changeLog (the JWT payload only
+// carries userId/role, not username).
+async function getAuditUsername(req) {
+  try {
+    const u = await User.findById(req.user.userId).select('username').lean();
+    return u?.username || 'Unknown';
+  } catch {
+    return 'Unknown';
+  }
+}
+
+// Diffs the three workflow dropdowns against the existing doc and returns
+// changeLog entries. A field is only diffed when `updates` actually carries it.
+function buildMetaChangeEntries(existing, updates, changedBy) {
+  const norm = (v) => (v === undefined || v === null || v === '' ? null : String(v));
+  const now = new Date();
+  const entries = [];
+  const track = [
+    ['About', 'category'],
+    ['Status', 'status'],
+    ['Picked Up By', 'pickedUpBy']
+  ];
+  for (const [field, key] of track) {
+    if (!(key in updates)) continue;
+    const oldValue = norm(existing?.[key]);
+    const newValue = norm(updates[key]);
+    if (oldValue !== newValue) {
+      entries.push({ field, oldValue, newValue, changedBy, changedAt: now });
+    }
+  }
+  return entries;
+}
+
 // --- NEW ROUTE 1: UPSERT CONVERSATION TAGS (Called from BuyerChatPage) ---
-// 
+//
 router.post('/conversation-meta', requireAuth, async (req, res) => {
   const { sellerId, buyerUsername, orderId, itemId, category, caseStatus, status, pickedUpBy } = req.body;
 
@@ -13037,9 +13071,20 @@ router.post('/conversation-meta', requireAuth, async (req, res) => {
     };
     if (pickedUpBy !== undefined) updateData.pickedUpBy = pickedUpBy;
 
+    const [existing, changedBy] = await Promise.all([
+      ConversationMeta.findOne(query).lean(),
+      getAuditUsername(req)
+    ]);
+    const changeEntries = buildMetaChangeEntries(existing, updateData, changedBy);
+
+    const update = { $set: updateData };
+    if (changeEntries.length > 0) {
+      update.$push = { changeLog: { $each: changeEntries, $slice: -100 } };
+    }
+
     const meta = await ConversationMeta.findOneAndUpdate(
       query,
-      updateData,
+      update,
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
@@ -13457,17 +13502,28 @@ router.patch('/conversation-management/:id/resolve', requireAuth, async (req, re
   const { notes, status, pickedUpBy } = req.body;
 
   try {
+    const [existing, changedBy] = await Promise.all([
+      ConversationMeta.findById(id).lean(),
+      getAuditUsername(req)
+    ]);
+
     const updateData = {
       notes,
       status,
       resolvedAt: status === 'Resolved' ? new Date() : null,
-      resolvedBy: req.user.username
+      resolvedBy: changedBy
     };
     if (pickedUpBy !== undefined) updateData.pickedUpBy = pickedUpBy;
 
+    const changeEntries = buildMetaChangeEntries(existing, updateData, changedBy);
+    const update = { $set: updateData };
+    if (changeEntries.length > 0) {
+      update.$push = { changeLog: { $each: changeEntries, $slice: -100 } };
+    }
+
     const meta = await ConversationMeta.findByIdAndUpdate(
       id,
-      updateData,
+      update,
       { new: true }
     );
     res.json({ success: true, meta });
@@ -13513,9 +13569,21 @@ router.patch('/conversation-management/:id/resolve', requireAuth, async (req, re
 router.patch('/conversation-management/:id/pick-up', requireAuth, async (req, res) => {
   const { pickedUpBy } = req.body;
   try {
+    const [existing, changedBy] = await Promise.all([
+      ConversationMeta.findById(req.params.id).lean(),
+      getAuditUsername(req)
+    ]);
+
+    const updateData = { pickedUpBy: pickedUpBy || null };
+    const changeEntries = buildMetaChangeEntries(existing, updateData, changedBy);
+    const update = { $set: updateData };
+    if (changeEntries.length > 0) {
+      update.$push = { changeLog: { $each: changeEntries, $slice: -100 } };
+    }
+
     const meta = await ConversationMeta.findByIdAndUpdate(
       req.params.id,
-      { pickedUpBy: pickedUpBy || null },
+      update,
       { new: true }
     );
     res.json({ success: true, meta });
