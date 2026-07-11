@@ -4,7 +4,7 @@ const apiUsageSchema = new mongoose.Schema({
   service: {
     type: String,
     required: true,
-    enum: ['ScraperAPI', 'PAAPI', 'Gemini', 'OpenAI'],
+    enum: ['ScraperAPI', 'Scrapingdog', 'PAAPI', 'Gemini', 'OpenAI'],
     index: true
   },
   asin: {
