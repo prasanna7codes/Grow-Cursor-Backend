@@ -351,6 +351,16 @@ export const idParamsSchema = z.object({
   id: objectIdSchema,
 });
 
+// ── Feature permissions ──────────────────────────────────────────────────────
+
+export const featurePermissionParamsSchema = z.object({
+  featureId: z.string().min(1, 'Feature ID is required'),
+});
+
+export const updateFeaturePermissionSchema = z.object({
+  allowedUserIds: z.array(objectIdSchema),
+});
+
 export const createUserSellerAssignmentSchema = z.object({
   userId: objectIdSchema,
   sellerId: objectIdSchema,
