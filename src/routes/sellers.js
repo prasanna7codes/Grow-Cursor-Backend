@@ -56,7 +56,7 @@ router.get('/all', requireAuth, async (req, res) => {
   try {
     if (req.user.role === 'superadmin') {
       // Superadmin sees all sellers
-      const sellers = await Seller.find().populate('user', 'username email');
+      const sellers = await Seller.find().populate('user', 'username email').lean();
       return res.json(sellers);
     }
 
@@ -67,12 +67,12 @@ router.get('/all', requireAuth, async (req, res) => {
     if (assignedSellerIds.length === 0) {
       // No assignments — return all sellers (backward compat for roles that had full access before)
       // This preserves existing behavior for users who haven't been explicitly assigned sellers
-      const sellers = await Seller.find().populate('user', 'username email');
+      const sellers = await Seller.find().populate('user', 'username email').lean();
       return res.json(sellers);
     }
 
     // Filter to only assigned sellers
-    const sellers = await Seller.find({ _id: { $in: assignedSellerIds } }).populate('user', 'username email');
+    const sellers = await Seller.find({ _id: { $in: assignedSellerIds } }).populate('user', 'username email').lean();
     res.json(sellers);
   } catch (err) {
     console.error('Error fetching sellers:', err);
@@ -98,7 +98,7 @@ router.get('/all', requireAuth, async (req, res) => {
  */
 router.get('/all-unfiltered', requireAuth, async (req, res) => {
   try {
-    const sellers = await Seller.find().populate('user', 'username email');
+    const sellers = await Seller.find().populate('user', 'username email').lean();
     res.json(sellers);
   } catch (err) {
     console.error('Error fetching sellers:', err);

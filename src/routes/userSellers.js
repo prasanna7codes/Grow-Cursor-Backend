@@ -46,7 +46,8 @@ router.get('/assignments', requireAuth, requirePageAccess('UserSellerAssignments
                 select: 'ebayMarketplaces user',
                 populate: { path: 'user', select: 'username email' }
             })
-            .sort({ createdAt: -1 });
+            .sort({ createdAt: -1 })
+            .lean();
 
         res.json(assignments);
     } catch (err) {

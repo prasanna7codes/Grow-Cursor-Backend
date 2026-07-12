@@ -340,7 +340,8 @@ router.get('/', requireAuth, pageAccess, async (req, res) => {
       })
       .populate('category', 'name')
       .populate('range', 'name categoryId')
-      .sort({ updatedAt: -1 });
+      .sort({ updatedAt: -1 })
+      .lean();
 
     res.json(targets);
   } catch (err) {

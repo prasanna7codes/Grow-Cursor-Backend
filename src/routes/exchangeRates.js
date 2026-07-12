@@ -101,7 +101,8 @@ router.get('/history', requireAuth, validate(exchangeRateHistoryQuerySchema, 'qu
 
     const history = await ExchangeRate.find({ marketplace })
       .sort({ effectiveDate: -1 })
-      .limit(limit);
+      .limit(limit)
+      .lean();
     
     res.json(history);
   } catch (err) {
