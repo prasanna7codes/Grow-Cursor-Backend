@@ -8492,6 +8492,210 @@ router.get('/api/openai-usage-summary', requireAuth, async (req, res) => {
   }
 });
 
+// ASIN Precheck AI usage (eBay Motors title eligibility checks) — kept separate
+// from the Add Template Listings usage above (that endpoint excludes fieldType 'precheck').
+router.get('/api/precheck-usage-summary', requireAuth, async (req, res) => {
+  try {
+    const {
+      startDate,
+      endDate,
+      startDateTime,
+      endDateTime,
+      userId,
+      sellerId,
+      templateId,
+      limit = 500
+    } = req.query;
+
+    const match = { service: 'OpenAI', fieldType: 'precheck' };
+
+    if (startDateTime || endDateTime) {
+      match.timestamp = {};
+      if (startDateTime) match.timestamp.$gte = parseIstDateTime(startDateTime);
+      if (endDateTime) match.timestamp.$lte = parseIstDateTime(endDateTime);
+    } else if (startDate || endDate) {
+      match.timestamp = {};
+      if (startDate) match.timestamp.$gte = parseIstDateBoundary(startDate);
+      if (endDate) match.timestamp.$lte = parseIstDateBoundary(endDate, true);
+    }
+
+    if (userId && userId !== 'all' && mongoose.Types.ObjectId.isValid(userId)) {
+      match.userId = new mongoose.Types.ObjectId(userId);
+    }
+    if (sellerId && sellerId !== 'all' && mongoose.Types.ObjectId.isValid(sellerId)) {
+      match.sellerId = new mongoose.Types.ObjectId(sellerId);
+    }
+    if (templateId && templateId !== 'all' && mongoose.Types.ObjectId.isValid(templateId)) {
+      match.templateId = new mongoose.Types.ObjectId(templateId);
+    }
+
+    const maxRows = Math.min(parseInt(limit, 10) || 500, 2000);
+
+    const [rows, totalsAgg, filterOptionsAgg] = await Promise.all([
+      ApiUsage.aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: { userId: '$userId', sellerId: '$sellerId', templateId: '$templateId' },
+            aiCalls: { $sum: 1 },
+            successfulCalls: { $sum: { $cond: ['$success', 1, 0] } },
+            failedCalls: { $sum: { $cond: ['$success', 0, 1] } },
+            asins: {
+              $addToSet: {
+                $cond: [{ $and: [{ $ne: ['$asin', null] }, { $ne: ['$asin', ''] }] }, '$asin', '$$REMOVE']
+              }
+            },
+            totalTokens: { $sum: { $ifNull: ['$totalTokens', 0] } },
+            promptTokens: { $sum: { $ifNull: ['$promptTokens', 0] } },
+            completionTokens: { $sum: { $ifNull: ['$completionTokens', 0] } },
+            firstUsedAt: { $min: '$timestamp' },
+            lastUsedAt: { $max: '$timestamp' }
+          }
+        },
+        { $lookup: { from: 'users', localField: '_id.userId', foreignField: '_id', as: 'user' } },
+        { $lookup: { from: 'sellers', localField: '_id.sellerId', foreignField: '_id', as: 'seller' } },
+        { $lookup: { from: 'users', localField: 'seller.user', foreignField: '_id', as: 'sellerUser' } },
+        { $lookup: { from: 'listingtemplates', localField: '_id.templateId', foreignField: '_id', as: 'template' } },
+        { $sort: { lastUsedAt: -1 } },
+        { $limit: maxRows },
+        {
+          $project: {
+            _id: 0,
+            userId: '$_id.userId',
+            sellerId: '$_id.sellerId',
+            templateId: '$_id.templateId',
+            username: { $ifNull: [{ $arrayElemAt: ['$user.username', 0] }, 'Unknown user'] },
+            userEmail: { $arrayElemAt: ['$user.email', 0] },
+            sellerName: { $ifNull: [{ $arrayElemAt: ['$sellerUser.username', 0] }, 'Unknown seller'] },
+            templateName: { $ifNull: [{ $arrayElemAt: ['$template.name', 0] }, 'Unknown template'] },
+            asinCount: { $size: '$asins' },
+            aiCalls: 1,
+            successfulCalls: 1,
+            failedCalls: 1,
+            totalTokens: 1,
+            promptTokens: 1,
+            completionTokens: 1,
+            firstUsedAt: 1,
+            lastUsedAt: 1
+          }
+        }
+      ]),
+      ApiUsage.aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: null,
+            aiCalls: { $sum: 1 },
+            successfulCalls: { $sum: { $cond: ['$success', 1, 0] } },
+            failedCalls: { $sum: { $cond: ['$success', 0, 1] } },
+            asins: {
+              $addToSet: {
+                $cond: [{ $and: [{ $ne: ['$asin', null] }, { $ne: ['$asin', ''] }] }, '$asin', '$$REMOVE']
+              }
+            },
+            users: { $addToSet: '$userId' },
+            templates: { $addToSet: '$templateId' },
+            totalTokens: { $sum: { $ifNull: ['$totalTokens', 0] } },
+            promptTokens: { $sum: { $ifNull: ['$promptTokens', 0] } },
+            completionTokens: { $sum: { $ifNull: ['$completionTokens', 0] } }
+          }
+        },
+        {
+          $project: {
+            _id: 0,
+            aiCalls: 1,
+            successfulCalls: 1,
+            failedCalls: 1,
+            asinCount: { $size: '$asins' },
+            userCount: { $size: '$users' },
+            templateCount: { $size: '$templates' },
+            totalTokens: 1,
+            promptTokens: 1,
+            completionTokens: 1
+          }
+        }
+      ]),
+      ApiUsage.aggregate([
+        { $match: match },
+        {
+          $facet: {
+            users: [
+              { $match: { userId: { $ne: null } } },
+              { $group: { _id: '$userId', count: { $sum: 1 } } },
+              { $sort: { count: -1 } },
+              { $limit: 500 },
+              { $lookup: { from: 'users', localField: '_id', foreignField: '_id', as: 'user' } },
+              {
+                $project: {
+                  _id: 0,
+                  id: { $toString: '$_id' },
+                  label: { $ifNull: [{ $arrayElemAt: ['$user.username', 0] }, 'Unknown user'] },
+                  secondary: { $arrayElemAt: ['$user.email', 0] },
+                  count: 1
+                }
+              }
+            ],
+            sellers: [
+              { $match: { sellerId: { $ne: null } } },
+              { $group: { _id: '$sellerId', count: { $sum: 1 } } },
+              { $sort: { count: -1 } },
+              { $limit: 500 },
+              { $lookup: { from: 'sellers', localField: '_id', foreignField: '_id', as: 'seller' } },
+              { $lookup: { from: 'users', localField: 'seller.user', foreignField: '_id', as: 'sellerUser' } },
+              {
+                $project: {
+                  _id: 0,
+                  id: { $toString: '$_id' },
+                  label: { $ifNull: [{ $arrayElemAt: ['$sellerUser.username', 0] }, 'Unknown seller'] },
+                  secondary: { $arrayElemAt: ['$sellerUser.email', 0] },
+                  count: 1
+                }
+              }
+            ],
+            templates: [
+              { $match: { templateId: { $ne: null } } },
+              { $group: { _id: '$templateId', count: { $sum: 1 } } },
+              { $sort: { count: -1 } },
+              { $limit: 500 },
+              { $lookup: { from: 'listingtemplates', localField: '_id', foreignField: '_id', as: 'template' } },
+              {
+                $project: {
+                  _id: 0,
+                  id: { $toString: '$_id' },
+                  label: { $ifNull: [{ $arrayElemAt: ['$template.name', 0] }, 'Unknown template'] },
+                  count: 1
+                }
+              }
+            ]
+          }
+        }
+      ])
+    ]);
+
+    const totals = totalsAgg[0] || {
+      aiCalls: 0,
+      successfulCalls: 0,
+      failedCalls: 0,
+      asinCount: 0,
+      userCount: 0,
+      templateCount: 0,
+      totalTokens: 0,
+      promptTokens: 0,
+      completionTokens: 0
+    };
+
+    res.json({
+      success: true,
+      rows,
+      totals,
+      filterOptions: filterOptionsAgg[0] || { users: [], sellers: [], templates: [] }
+    });
+  } catch (error) {
+    console.error('[Precheck Usage Summary] Error:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch precheck usage summary' });
+  }
+});
+
 /**
  * @swagger
  * /template-listings/api/seller/{sellerId}/template-listings/api-usage-stats:
