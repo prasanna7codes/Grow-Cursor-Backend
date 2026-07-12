@@ -19,6 +19,10 @@ const AmazonStockCheckRunSchema = new mongoose.Schema(
     seller: { type: mongoose.Schema.Types.ObjectId, ref: 'Seller', default: null, index: true },
     threshold: { type: Number, default: 5 },
     requestedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    // Which server instance owns/processes this run ('render' | 'local'), same
+    // convention as AutoCompatibilityBatch. Empty/missing = legacy run created
+    // before ownership tracking — only the Render runner adopts those on boot.
+    runnerId: { type: String, default: '' },
     totalSkus: { type: Number, default: 0 },
     asinFoundCount: { type: Number, default: 0 },
     noAsinCount: { type: Number, default: 0 },

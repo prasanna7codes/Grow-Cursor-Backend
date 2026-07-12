@@ -43,6 +43,10 @@ const PILOT_OPTION_B_LIMITS = {
   GBP: 4
 };
 const SCRAPINGDOG_CONCURRENT = Math.max(1, Number.parseInt(process.env.SCRAPINGDOG_CONCURRENT || '40', 10));
+// Identifies which server instance owns/resumes stock check runs — same
+// convention as auto-compat batches (ebay.js). Set RUNNER_ID=render in
+// Render's env vars, leave unset (defaults to 'local') on dev machines.
+const RUNNER_ID = (process.env.RUNNER_ID || 'local').trim().toLowerCase();
 // Delay before the single retry attempt for "ambiguous" unknown_stock_text
 // results (has a returns policy, but stock/price text didn't render) — gives
 // Amazon's async buy-box widget a moment longer to populate on re-scrape.
@@ -1065,9 +1069,21 @@ async function processRun(runId) {
 }
 
 export async function resumeRunningAmazonStockCheckRuns() {
+  // Boot-resume only adopts runs THIS server owns, so a restart on one server
+  // can never steal a run being processed by the other. Runs with no runnerId
+  // are legacy (created before ownership tracking) — only the Render runner
+  // adopts those. Explicit Start/Resume clicks (processRun via the routes)
+  // still work anywhere and take ownership of the run.
+  const ownershipFilter = RUNNER_ID === 'render'
+    ? { $or: [{ runnerId: { $in: [null, ''] } }, { runnerId: RUNNER_ID }] }
+    : { runnerId: RUNNER_ID };
+
   const runs = await AmazonStockCheckRun.find({
-    status: { $in: ['queued', 'running'] }
+    status: { $in: ['queued', 'running'] },
+    ...ownershipFilter
   }).sort({ createdAt: 1 }).lean();
+
+  stockCheckLog('resume:scan', { runnerId: RUNNER_ID, adoptableRunCount: runs.length });
 
   for (const run of runs) {
     await AmazonStockCheckItem.updateMany(
@@ -1609,7 +1625,8 @@ router.post('/runs', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), requireF
       mode,
       seller: sellerId,
       threshold: Number.parseInt(req.body?.threshold, 10) || 5,
-      requestedBy: req.user?.userId || null
+      requestedBy: req.user?.userId || null,
+      runnerId: RUNNER_ID
     });
 
     setTimeout(() => processRun(run._id), 0);
@@ -1645,6 +1662,9 @@ router.post('/runs/:runId/resume', requireAuth, requirePageAccess(STOCK_CHECK_PA
   run.status = 'queued';
   run.completedAt = null;
   run.error = '';
+  // Explicit resume transfers ownership: whichever server handles this click
+  // becomes the run's processor (and the only one that auto-resumes it on boot).
+  run.runnerId = RUNNER_ID;
   await run.save();
   await AmazonStockCheckItem.updateMany(
     { run: run._id, status: 'processing' },
