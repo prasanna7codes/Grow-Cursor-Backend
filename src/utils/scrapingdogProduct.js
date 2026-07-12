@@ -232,6 +232,27 @@ function slimRawData(data) {
   delete slim.brand_images;
   delete slim.media_block;
   delete slim.customer_reviews;
+
+  // rawData.product_information is consumed downstream against the ScraperAPI
+  // shape (snake_case keys, nested customer_reviews.{stars, ratings_count}):
+  // AsinReviewModal's Product Information panel + its skip-key set, the Rating
+  // row, and the AI prompt placeholder in asinAutofill. Rewrite it to that
+  // shape so both providers look identical past this point.
+  const info = normalizeProductInformation(slim.product_information);
+  // "Customer Reviews" usually normalizes to the right nested object already
+  // ({stars, ratings_count}); synthesize it from the top-level fields when
+  // product_information is missing or carries a different shape
+  if (!(info.customer_reviews && typeof info.customer_reviews === 'object' && info.customer_reviews.stars)
+      && (data.average_rating || data.total_reviews || data.total_ratings)) {
+    info.customer_reviews = {
+      stars: data.average_rating ?? null,
+      ratings_count: data.total_reviews ?? data.total_ratings ?? null
+    };
+  }
+  if (Object.keys(info).length > 0) {
+    slim.product_information = info;
+  }
+
   return slim;
 }
 
@@ -278,20 +299,29 @@ export async function scrapeAmazonProductWithScrapingdog(asin, region = 'US', re
         const responseTime = Date.now() - startTime;
 
         // Extract product data (brand/product_information are absent on some
-        // products, e.g. Amazon first-party devices — all extractors tolerate that)
+        // products, e.g. unavailable listings — all extractors tolerate that)
+        const info = normalizeProductInformation(data.product_information);
         const title = cleanText(data.title || '');
-        const brand = cleanText(data.brand?.replace(/^Visit the /, '').replace(/ Store$/, '').replace(/^Brand:\s*/i, '') || '');
+        // Top-level brand is often missing even when product_information.Brand
+        // exists (e.g. B01N5IB20Q) — fall back so we don't report 'Unbranded'
+        // where ScraperAPI reports the real brand
+        const rawBrand = data.brand || info.brand || '';
+        const brand = cleanText(String(rawBrand).replace(/^Visit the /, '').replace(/ Store$/, '').replace(/^Brand:\s*/i, ''));
         const price = extractPrice(data);
 
-        // Scrapingdog has no full_description field — feature_bullets is the
-        // only description source
+        // feature_bullets first (matches ScraperAPI), then the prose
+        // description field — mirrors ScraperAPI's full_description fallback
         const features = data.feature_bullets || [];
-        const description = features.join('\n');
+        let description = features.join('\n');
         if (!description) {
-          console.warn(`[Scrapingdog] ⚠️ No description found for ${asin}. Top-level keys: ${Object.keys(data).join(', ')}`);
+          if (data.description) {
+            description = cleanText(String(data.description));
+            console.log(`[Scrapingdog] ℹ️ Used fallback description for ${asin}`);
+          } else {
+            console.warn(`[Scrapingdog] ⚠️ No description found for ${asin}. Top-level keys: ${Object.keys(data).join(', ')}`);
+          }
         }
 
-        const info = normalizeProductInformation(data.product_information);
         const color = extractColor(info, data);
         const compatibility = extractCompatibility(info);
         const model = extractModel(info);
