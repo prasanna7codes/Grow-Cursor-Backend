@@ -464,6 +464,8 @@ Title: ${cleanTitle}
       asin,
       fieldName: 'ebay_motors_title_eligibility',
       fieldType: 'precheck',
+      // Dedicated key for ASIN precheck AI; falls back to OPENAI_API_KEY if unset
+      apiKey: process.env.OPENAI_PRECHECK_API_KEY,
       ...usageContext
     });
     const parsed = parseJsonObject(response);

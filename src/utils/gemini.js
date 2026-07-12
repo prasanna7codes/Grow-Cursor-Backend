@@ -2,7 +2,8 @@ import OpenAI from 'openai';
 import pLimit from 'p-limit';
 import { trackApiUsage } from './apiUsageTracker.js';
 
-let openaiClient = null;
+// One client per API key (default key + any dedicated keys like the precheck key)
+const openaiClients = new Map();
 
 // Concurrency limiter for AI requests - OpenAI Tier 2 can handle high concurrency
 const AI_CONCURRENT_REQUESTS = parseInt(process.env.OPENAI_CONCURRENT_REQUESTS) || 30;
@@ -10,11 +11,12 @@ const aiLimit = pLimit(AI_CONCURRENT_REQUESTS);
 
 console.log(`[OpenAI] 🤖 Initialized with ${AI_CONCURRENT_REQUESTS} concurrent request limit`);
 
-function getOpenAIClient() {
-  if (!openaiClient) {
-    openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+function getOpenAIClient(apiKey) {
+  const key = apiKey || process.env.OPENAI_API_KEY;
+  if (!openaiClients.has(key)) {
+    openaiClients.set(key, new OpenAI({ apiKey: key }));
   }
-  return openaiClient;
+  return openaiClients.get(key);
 }
 
 /**
@@ -41,11 +43,12 @@ export async function generateWithGemini(prompt, options = {}) {
       ipSource,
       forwardedFor,
       userAgent,
-      model = 'gpt-4o-mini'
+      model = 'gpt-4o-mini',
+      apiKey
     } = options;
 
     try {
-      const openai = getOpenAIClient();
+      const openai = getOpenAIClient(apiKey);
       const completion = await openai.chat.completions.create({
         messages: [
           {
