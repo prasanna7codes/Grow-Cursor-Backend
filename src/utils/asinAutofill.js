@@ -2,6 +2,7 @@ import { generateWithGemini, replacePlaceholders } from './gemini.js';
 import { calculateStartPrice } from './pricingCalculator.js';
 import { processImagePlaceholders } from './imageReplacer.js';
 import { scrapeAmazonProductWithScraperAPI } from './scraperApiProduct.js';
+import { scrapeAmazonProductWithScrapingdog } from './scrapingdogProduct.js';
 import { trackApiUsage } from './apiUsageTracker.js';
 import { getCachedAsinData, setCachedAsinData } from './asinCache.js';
 
@@ -29,8 +30,13 @@ export async function fetchAmazonData(asin, region = 'US', options = {}) {
       console.log(`[fetchAmazonData] 🔄 Force refresh enabled for ${asin} (${region})`);
     }
     
-    // Single ScraperAPI call for ALL data
-    const scrapedData = await scrapeAmazonProductWithScraperAPI(asin, region);
+    // Single provider call for ALL data. Provider is env-switchable so a bad
+    // rollout can be reverted by flipping AMAZON_PRODUCT_PROVIDER on Render —
+    // no code change needed. Both clients return the identical object shape.
+    const provider = (process.env.AMAZON_PRODUCT_PROVIDER || 'scraperapi').toLowerCase();
+    const scrapedData = provider === 'scrapingdog'
+      ? await scrapeAmazonProductWithScrapingdog(asin, region)
+      : await scrapeAmazonProductWithScraperAPI(asin, region);
     
     const responseTime = Date.now() - startTime;
     

@@ -274,6 +274,13 @@ function parseNumericPrice(value) {
   return Number.isFinite(price) ? price : null;
 }
 
+// Scrapingdog returns counts as comma-grouped strings ("109,583") —
+// Number() alone would yield NaN and ?? does not fall through on NaN.
+function toNumeric(value) {
+  if (typeof value === 'string') return Number(value.replace(/,/g, '').trim());
+  return Number(value);
+}
+
 const MARKETPLACE_TIMEZONES = {
   US: 'America/Los_Angeles',
   UK: 'Europe/London',
@@ -339,10 +346,14 @@ function parseShippingDate(shippingValue, scrapedAt, timezone) {
 function getPrecheckEnrichment(amazonData = {}, region = 'US', scrapedAt = new Date()) {
   const rawData = amazonData.rawData?.rawData || amazonData.rawData || {};
   const customerReviews = rawData.product_information?.customer_reviews || {};
-  const rating = Number(rawData.average_rating ?? customerReviews.stars ?? 0);
-  const reviewCount = Number(rawData.total_reviews ?? rawData.total_ratings ?? customerReviews.ratings_count ?? 0);
+  const rating = toNumeric(rawData.average_rating ?? customerReviews.stars ?? 0);
+  const reviewCount = toNumeric(rawData.total_reviews ?? rawData.total_ratings ?? customerReviews.ratings_count ?? 0);
   const availabilityStatus = String(rawData.availability_status || '').trim();
-  const shippingTime = String(rawData.shipping_time || '').trim();
+  // shipping_time is ScraperAPI's name; Scrapingdog exposes the same info as
+  // shipping_info (string) and delivery (array of strings). Keep the old name
+  // first so cached ScraperAPI-shape entries and rollback mode still resolve.
+  const deliveryLines = Array.isArray(rawData.delivery) ? rawData.delivery.filter(Boolean).map(String) : [];
+  const shippingTime = String(rawData.shipping_time || rawData.shipping_info || deliveryLines[0] || '').trim();
   const shippingCondition = String(rawData.shipping_condition || '').trim();
   const marketplaceTimezone = MARKETPLACE_TIMEZONES[region] || MARKETPLACE_TIMEZONES.US;
   const delivery = parseShippingDate(shippingTime || shippingCondition, scrapedAt, marketplaceTimezone);
