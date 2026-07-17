@@ -23,6 +23,12 @@ const limit = pLimit(CONCURRENT_REQUESTS);
 
 console.log(`[Scrapingdog] 🚀 Initialized with ${CONCURRENT_REQUESTS} concurrent request limit`);
 
+// Delay before the single fresh re-fetch when a priced product's response is
+// missing ALL stock/delivery info (Amazon's buy-box widgets sometimes don't
+// render before the page is captured — same phenomenon as the stock check's
+// unknown_stock_text case, where one delayed retry usually resolves it).
+const AVAILABILITY_RETRY_DELAY_MS = Math.max(500, parseInt(process.env.SCRAPINGDOG_AVAILABILITY_RETRY_DELAY_MS) || 3000);
+
 // Scrapingdog keys requests by domain + country (not tld). Credits mirror the
 // per-country cost table used by amazonStockChecks.js.
 const REGION_CONFIG = {
@@ -257,6 +263,31 @@ function slimRawData(data) {
 }
 
 /**
+ * True when the response carries COMPLETE availability information:
+ * - stock text present (availability_status / single_offer.stock), AND
+ * - delivery info present (shipping_info / delivery) — except for
+ *   out-of-stock products, where Amazon's page legitimately shows no
+ *   delivery date, so stock text alone is complete.
+ * Anything less on a priced product means a buy-box widget didn't render in
+ * time — worth one fresh re-fetch before showing "Unknown" in the precheck.
+ */
+function hasAvailabilitySignals(data) {
+  const stockText = String(
+    data?.availability_status || data?.purchase_options?.single_offer?.stock || ''
+  ).trim().toLowerCase();
+  if (!stockText) return false;
+
+  const outOfStock = stockText.includes('unavailable') || stockText.includes('out of stock');
+  if (outOfStock) return true;
+
+  return Boolean(
+    data?.shipping_info
+    || (Array.isArray(data?.delivery) && data.delivery.length > 0)
+    || (Array.isArray(data?.purchase_options?.single_offer?.delivery) && data.purchase_options.single_offer.delivery.length > 0)
+  );
+}
+
+/**
  * Main function - Scrape complete Amazon product data using Scrapingdog
  * With intelligent retry and exponential backoff
  * @param {string} asin - Amazon ASIN
@@ -271,6 +302,12 @@ export async function scrapeAmazonProductWithScrapingdog(asin, region = 'US', re
     // Short timeouts proved to cause false failures at scale — keep generous.
     const timeout = parseInt(process.env.SCRAPINGDOG_PRODUCT_TIMEOUT_MS) || 45000;
     const maxRetries = parseInt(process.env.SCRAPINGDOG_PRODUCT_MAX_RETRIES) || retries;
+
+    // One-shot fresh re-fetch when stock/delivery info is missing — tracked
+    // outside the loop so it can only ever fire once per ASIN.
+    let availabilityRetryAttempted = false;
+    let availabilityRetryBilled = false;
+    let availabilityRetrySucceeded = false;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       const startTime = Date.now();
@@ -295,7 +332,45 @@ export async function scrapeAmazonProductWithScrapingdog(asin, region = 'US', re
           throw new Error(`Scrapingdog returned status ${response.status}`);
         }
 
-        const data = response.data;
+        let data = response.data;
+
+        // A priced product with NO availability_status / stock / shipping /
+        // delivery at all = the buy-box widgets didn't render before capture
+        // (the precheck would show Unknown). Re-fetch once after a short
+        // delay and prefer the retry only if it actually has the signals.
+        // This client sits BELOW the ASIN cache, so this is always a real
+        // Scrapingdog call, never a cached response.
+        if (!availabilityRetryAttempted
+            && !hasAvailabilitySignals(data)
+            && (data.price || data.purchase_options?.single_offer?.price)) {
+          availabilityRetryAttempted = true;
+          console.log(`[Scrapingdog] 🔄 Missing stock and/or delivery info for ${asin} — refetching once after ${AVAILABILITY_RETRY_DELAY_MS}ms...`);
+          await new Promise(resolve => setTimeout(resolve, AVAILABILITY_RETRY_DELAY_MS));
+          try {
+            const retryResponse = await axios.get(SCRAPINGDOG_PRODUCT_BASE, {
+              params: {
+                api_key: apiKey,
+                domain: regionConfig.domain,
+                country: regionConfig.country,
+                asin: asin
+              },
+              timeout
+            });
+            if (retryResponse.status === 200) {
+              availabilityRetryBilled = true;
+              if (hasAvailabilitySignals(retryResponse.data)) {
+                data = retryResponse.data;
+                availabilityRetrySucceeded = true;
+                console.log(`[Scrapingdog] ✅ Stock/delivery info found for ${asin} on retry`);
+              } else {
+                console.warn(`[Scrapingdog] ⚠️ Still no stock/delivery info for ${asin} after retry — keeping first response`);
+              }
+            }
+          } catch (retryError) {
+            console.warn(`[Scrapingdog] ⚠️ Availability retry failed for ${asin}: ${retryError.message} — keeping first response`);
+          }
+        }
+
         const responseTime = Date.now() - startTime;
 
         // Extract product data (brand/product_information are absent on some
@@ -364,7 +439,7 @@ export async function scrapeAmazonProductWithScrapingdog(asin, region = 'US', re
         trackApiUsage({
           service: 'Scrapingdog',
           asin,
-          creditsUsed: regionConfig.credits,
+          creditsUsed: regionConfig.credits * (availabilityRetryBilled ? 2 : 1),
           success: true,
           responseTime,
           extractedFields
@@ -378,6 +453,11 @@ export async function scrapeAmazonProductWithScrapingdog(asin, region = 'US', re
           price: price || '',
           brand: brand || 'Unbranded',
           description: description || '',
+          // Present only when the missing-stock-info re-fetch ran — lets the
+          // precheck flow count retries and their success rate.
+          availabilityRetry: availabilityRetryAttempted
+            ? { attempted: true, succeeded: availabilityRetrySucceeded }
+            : null,
           images: images,
           color: color || '',
           compatibility: compatibility || '',
