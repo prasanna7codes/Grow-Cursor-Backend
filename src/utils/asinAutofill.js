@@ -79,13 +79,17 @@ export async function fetchAmazonData(asin, region = 'US', options = {}) {
     // incomplete entry (a cached info-less result would pin the precheck's
     // Stock/Delivery columns to "Unknown" for the whole cache TTL).
     const raw = scrapedData.rawData || {};
-    const hasAvailabilityInfo = Boolean(
-      raw.availability_status
-      || raw.shipping_time // ScraperAPI name
+    // Complete = stock text present AND delivery info present (delivery not
+    // required for out-of-stock products — Amazon shows none for those).
+    const stockText = String(raw.availability_status || raw.purchase_options?.single_offer?.stock || '').trim().toLowerCase();
+    const outOfStock = stockText.includes('unavailable') || stockText.includes('out of stock');
+    const hasDeliveryInfo = Boolean(
+      raw.shipping_time || raw.shipping_condition // ScraperAPI names
       || raw.shipping_info // Scrapingdog name
       || (Array.isArray(raw.delivery) && raw.delivery.length > 0)
-      || raw.purchase_options?.single_offer?.stock
+      || (Array.isArray(raw.purchase_options?.single_offer?.delivery) && raw.purchase_options.single_offer.delivery.length > 0)
     );
+    const hasAvailabilityInfo = Boolean(stockText) && (outOfStock || hasDeliveryInfo);
     if (result.description && hasAvailabilityInfo) {
       // Strip the retry marker before caching: a cache hit made no fetch, so
       // it must not re-report the original fetch's retry to the stats.

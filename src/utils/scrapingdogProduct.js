@@ -263,16 +263,27 @@ function slimRawData(data) {
 }
 
 /**
- * True when the response carries any stock/delivery information. A priced
- * product missing ALL of these means the buy-box widgets didn't render in
- * time — worth one fresh re-fetch before accepting "Unknown".
+ * True when the response carries COMPLETE availability information:
+ * - stock text present (availability_status / single_offer.stock), AND
+ * - delivery info present (shipping_info / delivery) — except for
+ *   out-of-stock products, where Amazon's page legitimately shows no
+ *   delivery date, so stock text alone is complete.
+ * Anything less on a priced product means a buy-box widget didn't render in
+ * time — worth one fresh re-fetch before showing "Unknown" in the precheck.
  */
 function hasAvailabilitySignals(data) {
+  const stockText = String(
+    data?.availability_status || data?.purchase_options?.single_offer?.stock || ''
+  ).trim().toLowerCase();
+  if (!stockText) return false;
+
+  const outOfStock = stockText.includes('unavailable') || stockText.includes('out of stock');
+  if (outOfStock) return true;
+
   return Boolean(
-    data?.availability_status
-    || data?.purchase_options?.single_offer?.stock
-    || data?.shipping_info
+    data?.shipping_info
     || (Array.isArray(data?.delivery) && data.delivery.length > 0)
+    || (Array.isArray(data?.purchase_options?.single_offer?.delivery) && data.purchase_options.single_offer.delivery.length > 0)
   );
 }
 
@@ -333,7 +344,7 @@ export async function scrapeAmazonProductWithScrapingdog(asin, region = 'US', re
             && !hasAvailabilitySignals(data)
             && (data.price || data.purchase_options?.single_offer?.price)) {
           availabilityRetryAttempted = true;
-          console.log(`[Scrapingdog] 🔄 No stock/delivery info for ${asin} — refetching once after ${AVAILABILITY_RETRY_DELAY_MS}ms...`);
+          console.log(`[Scrapingdog] 🔄 Missing stock and/or delivery info for ${asin} — refetching once after ${AVAILABILITY_RETRY_DELAY_MS}ms...`);
           await new Promise(resolve => setTimeout(resolve, AVAILABILITY_RETRY_DELAY_MS));
           try {
             const retryResponse = await axios.get(SCRAPINGDOG_PRODUCT_BASE, {
