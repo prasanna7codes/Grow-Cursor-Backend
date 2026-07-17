@@ -67,15 +67,33 @@ export async function fetchAmazonData(asin, region = 'US', options = {}) {
       specialFeatures: specialFeatures || '',
       size: size || '',
       productInfo: scrapedData.rawData?.product_information || null,
+      // Set only on a fresh Scrapingdog fetch that re-tried for missing
+      // stock/delivery info; nulled when served from cache (no fetch = no retry)
+      availabilityRetry: scrapedData.availabilityRetry || null,
       rawData: scrapedData // Store scraped data for debugging
     };
     
-    // Cache the result — skip if description is empty so the next request
-    // triggers a fresh scrape rather than serving a stale empty-description entry
-    if (result.description) {
-      setCachedAsinData(asin, result, region);
-    } else {
+    // Cache the result — skip if description is empty, OR if the raw response
+    // carries no stock/delivery info at all (buy-box widgets not rendered), so
+    // the next request triggers a fresh scrape instead of serving a stale
+    // incomplete entry (a cached info-less result would pin the precheck's
+    // Stock/Delivery columns to "Unknown" for the whole cache TTL).
+    const raw = scrapedData.rawData || {};
+    const hasAvailabilityInfo = Boolean(
+      raw.availability_status
+      || raw.shipping_time // ScraperAPI name
+      || raw.shipping_info // Scrapingdog name
+      || (Array.isArray(raw.delivery) && raw.delivery.length > 0)
+      || raw.purchase_options?.single_offer?.stock
+    );
+    if (result.description && hasAvailabilityInfo) {
+      // Strip the retry marker before caching: a cache hit made no fetch, so
+      // it must not re-report the original fetch's retry to the stats.
+      setCachedAsinData(asin, { ...result, availabilityRetry: null }, region);
+    } else if (!result.description) {
       console.log(`[fetchAmazonData] ⚠️ Skipping cache for ${asin} (no description) — will retry on next request`);
+    } else {
+      console.log(`[fetchAmazonData] ⚠️ Skipping cache for ${asin} (no stock/delivery info) — will retry on next request`);
     }
     
     return result;

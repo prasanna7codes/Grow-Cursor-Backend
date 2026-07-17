@@ -14,6 +14,7 @@ import { getEffectiveTemplate } from '../utils/templateMerger.js';
 import { getUsageStats, getFieldExtractionStats, getRecentErrors, checkQuotaStatus } from '../utils/apiUsageTracker.js';
 import { getAsinCacheStats, clearAsinCache, invalidateAsinCache } from '../utils/asinCache.js';
 import AsinDirectory from '../models/AsinDirectory.js';
+import AsinPrecheckLog from '../models/AsinPrecheckLog.js';
 import ApiUsage from '../models/ApiUsage.js';
 import AiListingRun from '../models/AiListingRun.js';
 import SellerSkuIndex from '../models/SellerSkuIndex.js';
@@ -648,6 +649,21 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
       return res.end();
     }
 
+    // Log this batch for the Precheck Stats page (counts by country/date/user/
+    // seller). Fire-and-forget: a failed log never blocks the precheck. The
+    // doc is kept so per-item retry counters can be added to it below.
+    const precheckLogPromise = AsinPrecheckLog.create({
+      user: req.user?.userId || null,
+      seller: sellerId,
+      template: templateId,
+      region: ['US', 'UK', 'CA', 'AU'].includes(region) ? region : 'US',
+      asins,
+      asinCount: asins.length
+    }).catch((error) => {
+      console.error('[ASIN Precheck] Failed to log precheck batch:', error.message);
+      return null;
+    });
+
     const generatedRows = asins.map(asin => {
       const sku = generateSKUFromASIN(asin);
       return { asin, sku, baseSku: getBaseSku(sku) };
@@ -703,6 +719,20 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
 
         const scrapedAt = new Date();
         const amazonData = await fetchAmazonData(asin, region);
+
+        // Count the missing-stock-info re-fetch (fresh fetches only — cache
+        // hits carry availabilityRetry: null) on this batch's stats log.
+        if (amazonData.availabilityRetry?.attempted) {
+          const retrySucceeded = Boolean(amazonData.availabilityRetry.succeeded);
+          precheckLogPromise.then((logDoc) => {
+            if (!logDoc) return;
+            AsinPrecheckLog.updateOne(
+              { _id: logDoc._id },
+              { $inc: { availabilityRetryCount: 1, availabilityRetrySuccessCount: retrySucceeded ? 1 : 0 } }
+            ).catch((err) => console.error('[ASIN Precheck] Failed to log retry:', err.message));
+          });
+        }
+
         const sourceData = buildAmazonSourceData(amazonData);
         const active = activeSkuSet.has(generated.sku) || activeSkuSet.has(generated.baseSku);
         const enrichment = getPrecheckEnrichment(amazonData, region, scrapedAt);
@@ -3469,6 +3499,142 @@ router.get('/bulk-preview-from-directory-stream', requireAuthSSE, async (req, re
  *       404: { description: Listing not found }
  *       500: { description: Server error }
  */
+/**
+ * GET /template-listings/precheck-stats
+ * Aggregated counts of prechecked ASINs (from AsinPrecheckLog) for the
+ * Precheck Stats page: totals + breakdowns by country, day, user, and
+ * seller/template. Query: days (1-365, default 30), region (US|UK|CA|AU).
+ * NOTE: must be registered BEFORE the generic GET /:id below, or Express
+ * routes "precheck-stats" into the :id param and this is never reached.
+ */
+router.get('/precheck-stats', requireAuth, async (req, res) => {
+  try {
+    const days = Math.min(365, Math.max(1, Number.parseInt(req.query.days, 10) || 30));
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const match = { createdAt: { $gte: since } };
+    if (['US', 'UK', 'CA', 'AU'].includes(req.query.region)) {
+      match.region = req.query.region;
+    }
+
+    const [totals, byRegion, byDay, byUser, bySellerTemplate] = await Promise.all([
+      AsinPrecheckLog.aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: null,
+            asinCount: { $sum: '$asinCount' },
+            batchCount: { $sum: 1 },
+            availabilityRetryCount: { $sum: '$availabilityRetryCount' },
+            availabilityRetrySuccessCount: { $sum: '$availabilityRetrySuccessCount' }
+          }
+        }
+      ]),
+      AsinPrecheckLog.aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: '$region',
+            asinCount: { $sum: '$asinCount' },
+            batchCount: { $sum: 1 },
+            availabilityRetryCount: { $sum: '$availabilityRetryCount' },
+            availabilityRetrySuccessCount: { $sum: '$availabilityRetrySuccessCount' }
+          }
+        },
+        { $sort: { asinCount: -1 } }
+      ]),
+      AsinPrecheckLog.aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: {
+              day: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'America/Los_Angeles' } },
+              region: '$region'
+            },
+            asinCount: { $sum: '$asinCount' }
+          }
+        },
+        { $sort: { '_id.day': -1 } }
+      ]),
+      AsinPrecheckLog.aggregate([
+        { $match: match },
+        { $group: { _id: '$user', asinCount: { $sum: '$asinCount' }, batchCount: { $sum: 1 } } },
+        { $sort: { asinCount: -1 } }
+      ]),
+      AsinPrecheckLog.aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: { seller: '$seller', template: '$template' },
+            asinCount: { $sum: '$asinCount' },
+            batchCount: { $sum: 1 }
+          }
+        },
+        { $sort: { asinCount: -1 } },
+        { $limit: 100 }
+      ])
+    ]);
+
+    // Resolve ids to display names in one query per collection
+    const userIds = byUser.map((row) => row._id).filter(Boolean);
+    const sellerIds = bySellerTemplate.map((row) => row._id.seller).filter(Boolean);
+    const templateIds = bySellerTemplate.map((row) => row._id.template).filter(Boolean);
+
+    const [users, sellers, templates] = await Promise.all([
+      userIds.length
+        ? User.find({ _id: { $in: userIds } }).select('username email').lean()
+        : [],
+      sellerIds.length
+        ? Seller.find({ _id: { $in: sellerIds } }).populate('user', 'username email').lean()
+        : [],
+      templateIds.length
+        ? ListingTemplate.find({ _id: { $in: templateIds } }).select('name').lean()
+        : []
+    ]);
+
+    const userNameById = new Map(users.map((u) => [String(u._id), u.username || u.email || String(u._id)]));
+    const sellerNameById = new Map(sellers.map((s) => [String(s._id), s.user?.username || s.user?.email || String(s._id)]));
+    const templateNameById = new Map(templates.map((t) => [String(t._id), t.name || String(t._id)]));
+
+    res.json({
+      days,
+      since: since.toISOString(),
+      totals: totals[0]
+        ? {
+            asinCount: totals[0].asinCount,
+            batchCount: totals[0].batchCount,
+            availabilityRetryCount: totals[0].availabilityRetryCount || 0,
+            availabilityRetrySuccessCount: totals[0].availabilityRetrySuccessCount || 0
+          }
+        : { asinCount: 0, batchCount: 0, availabilityRetryCount: 0, availabilityRetrySuccessCount: 0 },
+      byRegion: byRegion.map((row) => ({
+        region: row._id,
+        asinCount: row.asinCount,
+        batchCount: row.batchCount,
+        availabilityRetryCount: row.availabilityRetryCount || 0,
+        availabilityRetrySuccessCount: row.availabilityRetrySuccessCount || 0
+      })),
+      byDay: byDay.map((row) => ({ day: row._id.day, region: row._id.region, asinCount: row.asinCount })),
+      byUser: byUser.map((row) => ({
+        userId: row._id ? String(row._id) : null,
+        userName: row._id ? (userNameById.get(String(row._id)) || String(row._id)) : 'Unknown',
+        asinCount: row.asinCount,
+        batchCount: row.batchCount
+      })),
+      bySellerTemplate: bySellerTemplate.map((row) => ({
+        sellerId: row._id.seller ? String(row._id.seller) : null,
+        sellerName: row._id.seller ? (sellerNameById.get(String(row._id.seller)) || String(row._id.seller)) : 'Unknown',
+        templateId: row._id.template ? String(row._id.template) : null,
+        templateName: row._id.template ? (templateNameById.get(String(row._id.template)) || String(row._id.template)) : 'Unknown',
+        asinCount: row.asinCount,
+        batchCount: row.batchCount
+      }))
+    });
+  } catch (error) {
+    console.error('[Precheck Stats] Failed:', error);
+    res.status(500).json({ error: error.message || 'Failed to load precheck stats' });
+  }
+});
+
 // Get single listing by ID
 router.get('/:id', requireAuth, async (req, res) => {
   try {
