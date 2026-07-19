@@ -207,6 +207,11 @@ templateListingSchema.index({ templateId: 1, sellerId: 1, customLabel: 1 }, { un
 // Compound index for seller + template filtering
 templateListingSchema.index({ templateId: 1, sellerId: 1 });
 
+// Serves the /stats today/week/month/total counters (polled constantly by the
+// Template Listings page) as pure COUNT_SCANs: equality on
+// templateId+sellerId+status, range on createdAt.
+templateListingSchema.index({ templateId: 1, sellerId: 1, status: 1, createdAt: 1 });
+
 // Additional indexes for database view performance
 templateListingSchema.index({ sellerId: 1, templateId: 1, createdAt: -1 });
 templateListingSchema.index({ customLabel: 1 });
