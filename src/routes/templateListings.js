@@ -3499,19 +3499,74 @@ router.get('/bulk-preview-from-directory-stream', requireAuthSSE, async (req, re
  *       404: { description: Listing not found }
  *       500: { description: Server error }
  */
+// ── Precheck-stats date helpers ──────────────────────────────────────────────
+// The stats page groups days in America/Los_Angeles (PDT/PST), so explicit
+// date filters must use that timezone's midnight as the day boundary. The
+// two-pass offset technique stays correct across the DST switch.
+const PRECHECK_STATS_TIMEZONE = 'America/Los_Angeles';
+
+function zoneOffsetMs(date, timeZone) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+  });
+  const parts = Object.fromEntries(dtf.formatToParts(date).map((p) => [p.type, p.value]));
+  const asUtc = Date.UTC(
+    Number(parts.year), Number(parts.month) - 1, Number(parts.day),
+    parts.hour === '24' ? 0 : Number(parts.hour), Number(parts.minute), Number(parts.second)
+  );
+  return asUtc - date.getTime();
+}
+
+function zonedMidnightUtc(dateStr, timeZone) {
+  const naive = new Date(`${dateStr}T00:00:00Z`);
+  const offset = zoneOffsetMs(naive, timeZone);
+  let utc = new Date(naive.getTime() - offset);
+  const refined = zoneOffsetMs(utc, timeZone);
+  if (refined !== offset) utc = new Date(naive.getTime() - refined);
+  return utc;
+}
+
+function nextDateStr(dateStr) {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
 /**
  * GET /template-listings/precheck-stats
  * Aggregated counts of prechecked ASINs (from AsinPrecheckLog) for the
  * Precheck Stats page: totals + breakdowns by country, day, user, and
- * seller/template. Query: days (1-365, default 30), region (US|UK|CA|AU).
+ * seller/template.
+ * Query: either startDate/endDate (YYYY-MM-DD, PDT days — endDate defaults to
+ * startDate for a single day) or days (1-365 rolling window, default 30);
+ * plus optional region (US|UK|CA|AU). Explicit dates keep the query bounded
+ * so a single-day lookup only scans that day's documents (createdAt index).
  * NOTE: must be registered BEFORE the generic GET /:id below, or Express
  * routes "precheck-stats" into the :id param and this is never reached.
  */
 router.get('/precheck-stats', requireAuth, async (req, res) => {
   try {
-    const days = Math.min(365, Math.max(1, Number.parseInt(req.query.days, 10) || 30));
-    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
-    const match = { createdAt: { $gte: since } };
+    const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+    const startDateParam = dateRe.test(String(req.query.startDate || '')) ? String(req.query.startDate) : null;
+    const endDateParam = dateRe.test(String(req.query.endDate || '')) ? String(req.query.endDate) : startDateParam;
+
+    let match;
+    let rangeInfo;
+    if (startDateParam) {
+      const from = zonedMidnightUtc(startDateParam, PRECHECK_STATS_TIMEZONE);
+      const toExclusive = zonedMidnightUtc(nextDateStr(endDateParam), PRECHECK_STATS_TIMEZONE);
+      if (toExclusive <= from) {
+        return res.status(400).json({ error: 'endDate must be on or after startDate' });
+      }
+      match = { createdAt: { $gte: from, $lt: toExclusive } };
+      rangeInfo = { mode: 'range', startDate: startDateParam, endDate: endDateParam };
+    } else {
+      const days = Math.min(365, Math.max(1, Number.parseInt(req.query.days, 10) || 30));
+      const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+      match = { createdAt: { $gte: since } };
+      rangeInfo = { mode: 'rolling', days, since: since.toISOString() };
+    }
     if (['US', 'UK', 'CA', 'AU'].includes(req.query.region)) {
       match.region = req.query.region;
     }
@@ -3547,7 +3602,7 @@ router.get('/precheck-stats', requireAuth, async (req, res) => {
         {
           $group: {
             _id: {
-              day: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: 'America/Los_Angeles' } },
+              day: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt', timezone: PRECHECK_STATS_TIMEZONE } },
               region: '$region'
             },
             asinCount: { $sum: '$asinCount' }
@@ -3596,8 +3651,7 @@ router.get('/precheck-stats', requireAuth, async (req, res) => {
     const templateNameById = new Map(templates.map((t) => [String(t._id), t.name || String(t._id)]));
 
     res.json({
-      days,
-      since: since.toISOString(),
+      ...rangeInfo,
       totals: totals[0]
         ? {
             asinCount: totals[0].asinCount,
