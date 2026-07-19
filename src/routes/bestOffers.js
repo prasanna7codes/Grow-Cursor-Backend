@@ -1,8 +1,10 @@
 /**
- * Best Offers routes — eBay Trading API
+ * Best Offers routes — eBay Trading API + Negotiation REST API
  *
- * GET  /api/ebay/best-offers            — GetBestOffers
- * POST /api/ebay/best-offers/respond    — RespondToBestOffer
+ * GET  /api/ebay/best-offers            — GetBestOffers (Trading API)
+ * POST /api/ebay/best-offers/respond    — RespondToBestOffer (Trading API)
+ * GET  /api/ebay/eligible-offers        — find_eligible_items (Negotiation API)
+ * POST /api/ebay/eligible-offers/send   — send_offer_to_interested_buyers (Negotiation API)
  *
  * Mounted at /api/ebay in server/src/index.js so the URL prefix
  * remains identical to what the frontend expects.
@@ -13,6 +15,7 @@ import axios from 'axios';
 import { parseStringPromise } from 'xml2js';
 import { requireAuth } from '../middleware/auth.js';
 import Seller from '../models/Seller.js';
+import TemplateListing from '../models/TemplateListing.js';
 import { ensureValidToken } from './ebay.js';
 
 const router = express.Router();
@@ -51,24 +54,87 @@ const escapeXml = (s) =>
 // ─── Normalise single-item eBay responses to arrays ───────────────────────────
 const toArray = (v) => (v == null ? [] : Array.isArray(v) ? v : [v]);
 
-// ─── Fetch SKU for a single item via GetItem ─────────────────────────────────
-// GetItem always returns Item.SKU (the seller's custom label / SKU) when set.
-async function fetchItemSku(token, siteId, itemId) {
+// ─── Base SKU (everything before the first hyphen) ────────────────────────────
+// Matches TemplateListing's own baseCustomLabel derivation (TemplateListing.js),
+// so this lines up with the value already indexed in that field.
+const getBaseCustomLabel = (sku) => String(sku || '').trim().split('-')[0].trim();
+
+// ─── Run async work over a list with a max number of in-flight calls ─────────
+async function mapWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const i = nextIndex++;
+      results[i] = await worker(items[i]);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+// ─── Fetch live title/image/price for a single item via GetItem ──────────────
+// Used to enrich buyer offers and eligible-offers listings with real-time eBay
+// data instead of a locally cached collection, which can be stale or missing
+// entries.
+async function fetchItemLiveDetails(token, siteId, itemId) {
   try {
     const xml = `<?xml version="1.0" encoding="utf-8"?>
 <GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
   <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
   <ItemID>${escapeXml(itemId)}</ItemID>
   <IncludeItemSpecifics>false</IncludeItemSpecifics>
+  <DetailLevel>ReturnAll</DetailLevel>
+  <OutputSelector>Title</OutputSelector>
+  <OutputSelector>PictureDetails</OutputSelector>
+  <OutputSelector>SellingStatus</OutputSelector>
+  <OutputSelector>SKU</OutputSelector>
+  <OutputSelector>BestOfferDetails</OutputSelector>
 </GetItemRequest>`;
     const resp = await axios.post(EBAY_TRADING_URL, xml, {
       headers: tradingHeaders('GetItem', siteId),
     });
     const parsed = await parseStringPromise(resp.data, { explicitArray: false });
-    return parsed?.GetItemResponse?.Item?.SKU ?? '';
+    const item = parsed?.GetItemResponse?.Item;
+    if (!item) return null;
+
+    const pictureUrls = toArray(item.PictureDetails?.PictureURL);
+
+    return {
+      title: item.Title ?? '',
+      sku: item.SKU ?? '',
+      imageUrl: pictureUrls[0] ?? '',
+      currentPrice: item.SellingStatus?.CurrentPrice?._ ?? item.SellingStatus?.CurrentPrice ?? null,
+      currentPriceCurrency: item.SellingStatus?.CurrentPrice?.['$']?.currencyID ?? 'USD',
+      // Counteroffers on a proactive send are only accepted by eBay when the
+      // listing itself has Best Offer enabled (Item.BestOfferDetails.BestOfferEnabled).
+      bestOfferEnabled: item.BestOfferDetails?.BestOfferEnabled === 'true',
+    };
   } catch {
-    return '';
+    return null;
   }
+}
+
+// ─── Fetch a single page of GetBestOffers ─────────────────────────────────────
+async function fetchBestOffersPage(token, siteId, pageNumber) {
+  const xml = `<?xml version="1.0" encoding="utf-8"?>
+<GetBestOffersRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
+  <ErrorLanguage>en_US</ErrorLanguage>
+  <WarningLevel>High</WarningLevel>
+  <DetailLevel>ReturnAll</DetailLevel>
+  <Pagination>
+    <EntriesPerPage>200</EntriesPerPage>
+    <PageNumber>${pageNumber}</PageNumber>
+  </Pagination>
+</GetBestOffersRequest>`;
+
+  const response = await axios.post(EBAY_TRADING_URL, xml, {
+    headers: tradingHeaders('GetBestOffers', siteId),
+  });
+
+  const parsed = await parseStringPromise(response.data, { explicitArray: false });
+  return parsed?.GetBestOffersResponse;
 }
 
 // ─── Normalise one eBay BestOffer node into a clean object ───────────────────
@@ -152,7 +218,7 @@ function parseOffer(item, offer) {
  */
 router.get('/best-offers', requireAuth, async (req, res) => {
   try {
-    const { sellerId, status = 'Active' } = req.query;
+    const { sellerId } = req.query;
 
     if (!sellerId) return res.status(400).json({ error: 'Missing sellerId' });
 
@@ -166,64 +232,98 @@ router.get('/best-offers', requireAuth, async (req, res) => {
     // only works together with an ItemID per the docs.
     // We omit <BestOfferStatus> entirely so eBay uses its default (Active),
     // which is the same behaviour the seller sees in Seller Hub.
-    const xml = `<?xml version="1.0" encoding="utf-8"?>
-<GetBestOffersRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-  <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
-  <ErrorLanguage>en_US</ErrorLanguage>
-  <WarningLevel>High</WarningLevel>
-  <DetailLevel>ReturnAll</DetailLevel>
-  <Pagination>
-    <EntriesPerPage>200</EntriesPerPage>
-    <PageNumber>1</PageNumber>
-  </Pagination>
-</GetBestOffersRequest>`;
-
-    const response = await axios.post(EBAY_TRADING_URL, xml, {
-      headers: tradingHeaders('GetBestOffers', siteId),
-    });
-
-    const parsed = await parseStringPromise(response.data, { explicitArray: false });
-    const root = parsed?.GetBestOffersResponse;
-
-    if (root?.Ack === 'Failure') {
-      const errs = toArray(root?.Errors);
-      return res.status(400).json({
-        error: 'eBay API error',
-        details: errs.map((e) => e.LongMessage).join('; '),
-      });
-    }
-
-    // eBay returns results in ItemBestOffersArray when no ItemID is given.
-    // Each entry groups one item with all its offers.
+    //
+    // eBay caps this account-wide call at 10,000 offer IDs for a seller, which
+    // at 200 entries/page is a max of 50 pages — we loop until TotalNumberOfPages
+    // is exhausted (or that cap) so sellers with >200 active offers aren't
+    // silently truncated to just the first page.
+    const MAX_PAGES = 50;
     const offers = [];
-    for (const entry of toArray(root?.ItemBestOffersArray?.ItemBestOffers)) {
-      const item = entry?.Item ?? {};
-      for (const offer of toArray(entry?.BestOfferArray?.BestOffer)) {
-        offers.push(parseOffer(item, offer));
+    let totalEntries = 0;
+    let totalPages = 1;
+
+    for (let pageNumber = 1; pageNumber <= totalPages && pageNumber <= MAX_PAGES; pageNumber++) {
+      const root = await fetchBestOffersPage(token, siteId, pageNumber);
+
+      if (root?.Ack === 'Failure') {
+        const errs = toArray(root?.Errors);
+        return res.status(400).json({
+          error: 'eBay API error',
+          details: errs.map((e) => e.LongMessage).join('; '),
+        });
       }
+
+      // eBay returns results in ItemBestOffersArray when no ItemID is given.
+      // Each entry groups one item with all its offers.
+      for (const entry of toArray(root?.ItemBestOffersArray?.ItemBestOffers)) {
+        const item = entry?.Item ?? {};
+        for (const offer of toArray(entry?.BestOfferArray?.BestOffer)) {
+          offers.push(parseOffer(item, offer));
+        }
+      }
+
+      const pagination = root?.PaginationResult ?? {};
+      totalEntries = parseInt(pagination.TotalNumberOfEntries) || offers.length;
+      totalPages = parseInt(pagination.TotalNumberOfPages) || 1;
     }
 
-    // ── Enrich with SKU via GetItem (parallel, one call per unique item ID) ──
-    // GetBestOffers does not return Item.SKU in its item stub; GetItem does.
+    // ── Enrich with SKU + image via GetItem (bounded concurrency, one call per unique item ID) ──
+    // GetBestOffers does not return Item.SKU or pictures in its item stub;
+    // GetItem does. Capped at 10 in flight so large sellers (now that
+    // pagination is uncapped above) don't blow through eBay's Trading API
+    // rate limits in one burst.
     if (offers.length > 0) {
       const uniqueItemIds = [...new Set(offers.map(o => o.itemId).filter(Boolean))];
-      const skuResults = await Promise.all(
-        uniqueItemIds.map(id => fetchItemSku(token, siteId, id).then(sku => [id, sku]))
+      const detailResults = await mapWithConcurrency(uniqueItemIds, 10, (id) =>
+        fetchItemLiveDetails(token, siteId, id).then((details) => [id, details])
       );
-      const skuMap = Object.fromEntries(skuResults);
+      const detailMap = Object.fromEntries(detailResults);
       for (const offer of offers) {
-        if (skuMap[offer.itemId]) offer.sku = skuMap[offer.itemId];
+        const details = detailMap[offer.itemId];
+        if (details?.sku) offer.sku = details.sku;
+        offer.imageUrl = details?.imageUrl ?? '';
       }
     }
 
-    console.log(`[BestOffers] fetched ${offers.length} offer(s) via single GetBestOffers call`);
+    // ── Enrich with ASIN/Amazon link via TemplateListing, matched on base SKU ──
+    // eBay SKUs often carry a variant/quantity suffix (e.g. ABC123-1) that the
+    // template's own customLabel doesn't have, so match on the part before the
+    // first hyphen — the same baseCustomLabel the model already indexes.
+    if (offers.length > 0) {
+      const baseSkus = [...new Set(offers.map(o => getBaseCustomLabel(o.sku)).filter(Boolean))];
+      if (baseSkus.length > 0) {
+        const templates = await TemplateListing.find(
+          { sellerId, baseCustomLabel: { $in: baseSkus } },
+          { baseCustomLabel: 1, amazonLink: 1 }
+        )
+          .select('+_asinReference')
+          .collation({ locale: 'en', strength: 2 })
+          .lean();
 
-    const pagination = root?.PaginationResult ?? {};
+        // The Mongo query matches case-insensitively (collation strength 2),
+        // so key the in-memory map case-insensitively too or offers whose SKU
+        // casing differs from the stored customLabel would silently miss.
+        const asinMap = {};
+        for (const t of templates) {
+          const key = String(t.baseCustomLabel || '').toUpperCase();
+          if (!t._asinReference || !key || asinMap[key]) continue;
+          asinMap[key] = { asin: t._asinReference, amazonLink: t.amazonLink || `https://www.amazon.com/dp/${t._asinReference}` };
+        }
+        for (const offer of offers) {
+          const match = asinMap[getBaseCustomLabel(offer.sku).toUpperCase()];
+          offer.asin = match?.asin ?? null;
+          offer.amazonLink = match?.amazonLink ?? null;
+        }
+      }
+    }
+
+    console.log(`[BestOffers] fetched ${offers.length} offer(s) via ${Math.min(totalPages, MAX_PAGES)} GetBestOffers page(s)`);
+
     return res.json({
       success: true,
       offers,
-      totalEntries: parseInt(pagination.TotalNumberOfEntries) || offers.length,
-      totalPages: parseInt(pagination.TotalNumberOfPages) || 1,
+      totalEntries,
+      totalPages: 1,
       currentPage: 1,
     });
   } catch (err) {
@@ -410,30 +510,65 @@ router.get('/eligible-offers', requireAuth, async (req, res) => {
 
     const token = await ensureValidToken(seller);
     const marketplaceId = seller.ebayMarketplaces?.[0] ?? 'EBAY_US';
+    const siteId = getSiteId(seller);
 
-    const response = await axios.get(
-      'https://api.ebay.com/sell/negotiation/v1/find_eligible_items',
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'X-EBAY-C-MARKETPLACE-ID': marketplaceId,
-          'Content-Type': 'application/json',
-        },
-        params: { limit: 200, offset: 0 },
-      }
+    // find_eligible_items is offset-paginated; loop until every page is
+    // fetched (capped so a very large catalog can't spin forever).
+    const PAGE_SIZE = 200;
+    const MAX_PAGES = 50;
+    const rawItems = [];
+    let total = 0;
+
+    for (let pageIndex = 0; pageIndex < MAX_PAGES; pageIndex++) {
+      const offset = pageIndex * PAGE_SIZE;
+      const response = await axios.get(
+        'https://api.ebay.com/sell/negotiation/v1/find_eligible_items',
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'X-EBAY-C-MARKETPLACE-ID': marketplaceId,
+            'Content-Type': 'application/json',
+          },
+          params: { limit: PAGE_SIZE, offset },
+        }
+      );
+
+      rawItems.push(...(response.data.eligibleItems ?? []));
+      total = response.data.total ?? rawItems.length;
+
+      if (rawItems.length >= total || !response.data.eligibleItems?.length) break;
+    }
+
+    // find_eligible_items doesn't return image/title/current price — pull
+    // those live from eBay via GetItem (bounded concurrency), one call per
+    // unique item, rather than relying on a locally cached collection.
+    const uniqueItemIds = [...new Set(rawItems.map((i) => i.itemId ?? i.listingId).filter(Boolean))];
+    const detailResults = await mapWithConcurrency(uniqueItemIds, 10, (id) =>
+      fetchItemLiveDetails(token, siteId, id).then((details) => [id, details])
     );
+    const detailMap = Object.fromEntries(detailResults);
 
-    const items = (response.data.eligibleItems ?? []).map((i) => ({
-      listingId: i.listingId,
-      itemId: i.itemId,
-      title: i.listingTitle ?? i.listingId,
-      listingStatus: i.listingStatus ?? 'ACTIVE',
-      minimumOfferPrice: i.minimumOfferPrice?.value ?? null,
-      minimumOfferCurrency: i.minimumOfferPrice?.currency ?? 'USD',
-      interestedBuyers: i.eligibleCounterPartiesCount ?? 0,
-    }));
+    const items = rawItems.map((i) => {
+      const details = detailMap[i.itemId ?? i.listingId];
+      return {
+        listingId: i.listingId,
+        itemId: i.itemId,
+        title: details?.title || i.listingTitle || i.listingId,
+        sku: details?.sku ?? '',
+        imageUrl: details?.imageUrl ?? '',
+        currentPrice: details?.currentPrice ?? null,
+        currentPriceCurrency: details?.currentPriceCurrency ?? 'USD',
+        // null when GetItem failed for this item — treat as "unknown" in the UI,
+        // not as "disabled".
+        bestOfferEnabled: details ? Boolean(details.bestOfferEnabled) : null,
+        listingStatus: i.listingStatus ?? 'ACTIVE',
+        minimumOfferPrice: i.minimumOfferPrice?.value ?? null,
+        minimumOfferCurrency: i.minimumOfferPrice?.currency ?? 'USD',
+        interestedBuyers: i.eligibleCounterPartiesCount ?? 0,
+      };
+    });
 
-    return res.json({ success: true, items, total: response.data.total ?? items.length });
+    return res.json({ success: true, items, total });
   } catch (err) {
     const ebayError = err.response?.data?.errors?.[0]?.message ?? err.message;
     console.error('[BestOffers] find_eligible_items error:', err.response?.data ?? err.message);
@@ -445,7 +580,12 @@ router.get('/eligible-offers', requireAuth, async (req, res) => {
 // POST /eligible-offers/send
 // Uses eBay Negotiation REST API — sends a seller-initiated offer to all
 // interested buyers on a listing.
-// Body: { sellerId, listingId, price, currency?, quantity?, message?, allowCounter? }
+// Body: { sellerId, listingId, discountType, discountValue, currency?, quantity?, message?, allowCounter? }
+// discountType: 'PERCENTAGE' (5-90, sent as offeredItems[].discountPercentage)
+//             | 'AMOUNT_OFF'  (dollar amount off current price, converted to an absolute price)
+//             | 'PRICE'       (discountValue is the exact final offer price)
+// Per eBay's OfferedItem schema, price and discountPercentage are mutually
+// exclusive — only one of them is ever sent to eBay.
 // =============================================================================
 /**
  * @swagger
@@ -461,15 +601,17 @@ router.get('/eligible-offers', requireAuth, async (req, res) => {
  *         application/json:
  *           schema:
  *             type: object
- *             required: [sellerId, listingId, price]
+ *             required: [sellerId, listingId, discountType, discountValue]
  *             properties:
- *               sellerId:     { type: string }
- *               listingId:    { type: string }
- *               price:        { type: number }
- *               currency:     { type: string, default: USD }
- *               quantity:     { type: integer, default: 1 }
- *               message:      { type: string }
- *               allowCounter: { type: boolean, default: true }
+ *               sellerId:      { type: string }
+ *               listingId:     { type: string }
+ *               discountType:  { type: string, enum: [PERCENTAGE, AMOUNT_OFF, PRICE] }
+ *               discountValue: { type: number, description: Percent (5-90) for PERCENTAGE, dollar amount for AMOUNT_OFF, final price for PRICE }
+ *               currentPrice:  { type: number, description: Required for AMOUNT_OFF to compute the resulting offer price }
+ *               currency:      { type: string, default: USD }
+ *               quantity:      { type: integer, default: 1 }
+ *               message:       { type: string }
+ *               allowCounter:  { type: boolean, default: false, description: If eBay rejects counteroffers for the listing, the send is retried automatically without them }
  *     responses:
  *       200:
  *         description: Offer sent successfully
@@ -489,10 +631,41 @@ router.get('/eligible-offers', requireAuth, async (req, res) => {
  */
 router.post('/eligible-offers/send', requireAuth, async (req, res) => {
   try {
-    const { sellerId, listingId, price, currency, quantity, message, allowCounter = true } = req.body;
+    const {
+      sellerId,
+      listingId,
+      discountType,
+      discountValue,
+      currentPrice,
+      currency,
+      quantity,
+      message,
+      // Defaults to false (not true): eBay rejects allowCounterOffer:true for
+      // listings where it isn't supported, so an omitted/undefined value from
+      // the client should never silently opt into the request that's more
+      // likely to fail.
+      allowCounter = false,
+    } = req.body;
 
-    if (!sellerId || !listingId || !price) {
-      return res.status(400).json({ error: 'Missing required fields: sellerId, listingId, price' });
+    if (!sellerId || !listingId || !discountType || discountValue == null) {
+      return res.status(400).json({
+        error: 'Missing required fields: sellerId, listingId, discountType, discountValue',
+      });
+    }
+
+    const VALID_DISCOUNT_TYPES = ['PERCENTAGE', 'AMOUNT_OFF', 'PRICE'];
+    if (!VALID_DISCOUNT_TYPES.includes(discountType)) {
+      return res.status(400).json({
+        error: `Invalid discountType. Must be one of: ${VALID_DISCOUNT_TYPES.join(', ')}`,
+      });
+    }
+
+    if (discountType === 'PERCENTAGE' && (discountValue < 5 || discountValue > 90)) {
+      return res.status(400).json({ error: 'discountValue for PERCENTAGE must be between 5 and 90' });
+    }
+
+    if (discountType === 'AMOUNT_OFF' && !currentPrice) {
+      return res.status(400).json({ error: 'currentPrice is required when discountType is AMOUNT_OFF' });
     }
 
     const seller = await Seller.findById(sellerId);
@@ -500,28 +673,83 @@ router.post('/eligible-offers/send', requireAuth, async (req, res) => {
 
     const token = await ensureValidToken(seller);
     const marketplaceId = seller.ebayMarketplaces?.[0] ?? 'EBAY_US';
+    const offerCurrency = currency || 'USD';
 
-    await axios.post(
-      'https://api.ebay.com/sell/negotiation/v1/send_offer_to_interested_buyers',
-      {
-        allowCounterOffer: Boolean(allowCounter),
-        message: message || undefined,
-        offeredItems: [{
-          listingId,
-          price: { currency: currency || 'USD', value: parseFloat(price).toFixed(2) },
-          quantity: parseInt(quantity) || 1,
-        }],
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'X-EBAY-C-MARKETPLACE-ID': marketplaceId,
-          'Content-Type': 'application/json',
+    // Per eBay's OfferedItem schema, price and discountPercentage are
+    // mutually exclusive — build exactly one of them.
+    const offeredItem = {
+      listingId,
+      quantity: parseInt(quantity) || 1,
+    };
+    if (discountType === 'PERCENTAGE') {
+      offeredItem.discountPercentage = String(discountValue);
+    } else {
+      const finalPrice =
+        discountType === 'AMOUNT_OFF'
+          ? Math.max(0, parseFloat(currentPrice) - parseFloat(discountValue))
+          : parseFloat(discountValue);
+      offeredItem.price = { currency: offerCurrency, value: finalPrice.toFixed(2) };
+    }
+
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      'X-EBAY-C-MARKETPLACE-ID': marketplaceId,
+      'Content-Type': 'application/json',
+    };
+    const sendUrl = 'https://api.ebay.com/sell/negotiation/v1/send_offer_to_interested_buyers';
+
+    let counterOfferDisabledByEbay = false;
+    try {
+      await axios.post(
+        sendUrl,
+        {
+          allowCounterOffer: Boolean(allowCounter),
+          message: message || undefined,
+          offeredItems: [offeredItem],
         },
-      }
-    );
+        { headers }
+      );
+    } catch (err) {
+      // eBay rejects allowCounterOffer:true for some listings (errorId 150009)
+      // for reasons not fully covered by our own bestOfferEnabled detection —
+      // rather than failing the whole send, retry once without it.
+      const errs = err.response?.data?.errors ?? [];
+      const isCounterOfferRejection =
+        allowCounter && errs.some((e) => e.errorId === 150009 || /allowCounterOffer/i.test(e.message ?? ''));
 
-    return res.json({ success: true, message: 'Offer sent to interested buyers' });
+      if (!isCounterOfferRejection) throw err;
+
+      counterOfferDisabledByEbay = true;
+      await axios.post(
+        sendUrl,
+        {
+          allowCounterOffer: false,
+          message: message || undefined,
+          offeredItems: [offeredItem],
+        },
+        { headers }
+      );
+    }
+
+    // The counteroffer status of the offer that actually went out — true only
+    // when the first attempt (with allowCounter as requested) succeeded as-is.
+    const allowCounterOfferSent = Boolean(allowCounter) && !counterOfferDisabledByEbay;
+
+    let sendMessage;
+    if (allowCounterOfferSent) {
+      sendMessage = 'Offer sent to interested buyers. Buyers can send a counteroffer.';
+    } else if (counterOfferDisabledByEbay) {
+      sendMessage = "Offer sent — eBay doesn't allow counteroffers for this listing, so it was sent without that option.";
+    } else {
+      sendMessage = 'Offer sent to interested buyers. Counteroffers are off for this offer.';
+    }
+
+    return res.json({
+      success: true,
+      message: sendMessage,
+      allowCounterOfferSent,
+      counterOfferDisabledByEbay,
+    });
   } catch (err) {
     const ebayError = err.response?.data?.errors?.[0]?.message ?? err.message;
     console.error('[BestOffers] send_offer_to_interested_buyers error:', err.response?.data ?? err.message);
