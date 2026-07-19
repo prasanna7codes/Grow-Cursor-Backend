@@ -27,7 +27,7 @@ console.log(`[Scrapingdog] 🚀 Initialized with ${CONCURRENT_REQUESTS} concurre
 // missing ALL stock/delivery info (Amazon's buy-box widgets sometimes don't
 // render before the page is captured — same phenomenon as the stock check's
 // unknown_stock_text case, where one delayed retry usually resolves it).
-const AVAILABILITY_RETRY_DELAY_MS = Math.max(500, parseInt(process.env.SCRAPINGDOG_AVAILABILITY_RETRY_DELAY_MS) || 3000);
+const AVAILABILITY_RETRY_DELAY_MS = Math.max(500, parseInt(process.env.SCRAPINGDOG_AVAILABILITY_RETRY_DELAY_MS) || 5000);
 
 // Scrapingdog keys requests by domain + country (not tld). Credits mirror the
 // per-country cost table used by amazonStockChecks.js.
