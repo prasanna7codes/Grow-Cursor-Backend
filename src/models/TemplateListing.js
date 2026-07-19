@@ -211,6 +211,9 @@ templateListingSchema.index({ templateId: 1, sellerId: 1 });
 templateListingSchema.index({ sellerId: 1, templateId: 1, createdAt: -1 });
 templateListingSchema.index({ customLabel: 1 });
 templateListingSchema.index({ deletedAt: 1 });
+// Serve /database-stats as pure COUNT_SCANs (no document fetches).
+templateListingSchema.index({ deletedAt: 1, status: 1 });
+templateListingSchema.index({ deletedAt: 1, templateId: 1 });
 templateListingSchema.index({ templateId: 1, sellerId: 1, downloadBatchId: 1 });
 
 // Covering index for database-view filtered + sorted queries (deletedAt + optional seller/template + sort)
