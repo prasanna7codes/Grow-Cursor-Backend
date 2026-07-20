@@ -107,6 +107,15 @@ csvStorageSchema.index(
     { sparse: true }
 );
 
+// The CSV list page sorts by createdAt. Without these, the sort loads every
+// ~192KB document (raw CSV buffer) just to order them — ~5GB disk read and
+// ~17s per query. With the index it sorts from the index and loads only the
+// page it returns.
+// - createdAt: unfiltered list, newest first
+// - seller + createdAt: per-seller list, newest first
+csvStorageSchema.index({ createdAt: -1 });
+csvStorageSchema.index({ seller: 1, createdAt: -1 });
+
 const CsvStorage = mongoose.model('CsvStorage', csvStorageSchema);
 
 export default CsvStorage;
