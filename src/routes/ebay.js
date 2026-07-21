@@ -15678,6 +15678,24 @@ router.get('/selling/summary', requireAuth, async (req, res) => {
  *       404:
  *         description: Seller not found
  */
+// Canonicalize country labels so every end-listing source agrees on one
+// vocabulary (US / UK / AU / Canada). The Amazon stock-check flow tags ends with
+// full names ("United States", "United Kingdom", "Australia") while the
+// duplicate-SKU and expiry flows use short codes; without this they split into
+// separate rows in the stats / daily-comparison country breakdowns and are missed
+// by country filters.
+const END_LISTING_COUNTRY_CANONICAL = {
+  'UNITED STATES': 'US', USA: 'US', US: 'US',
+  'UNITED KINGDOM': 'UK', 'GREAT BRITAIN': 'UK', GB: 'UK', UK: 'UK',
+  AUSTRALIA: 'AU', AU: 'AU',
+  CANADA: 'Canada', CA: 'Canada',
+};
+function normalizeEndListingCountry(country) {
+  if (typeof country !== 'string' || !country.trim()) return null;
+  const key = country.trim().toUpperCase();
+  return END_LISTING_COUNTRY_CANONICAL[key] || country.trim();
+}
+
 router.post('/end-item', requireAuth, async (req, res) => {
   try {
     const { sellerId, itemId, endingReason = 'NotAvailable', source, country, marketplaceId, sku, run } = req.body;
@@ -15738,7 +15756,7 @@ router.post('/end-item', requireAuth, async (req, res) => {
           sku: typeof sku === 'string' && sku.trim() ? sku.trim() : null,
           source,
           endedBy: req.user?.userId || null,
-          country: typeof country === 'string' && country.trim() ? country.trim() : null,
+          country: normalizeEndListingCountry(country),
           marketplaceId: typeof marketplaceId === 'string' && marketplaceId.trim() ? marketplaceId.trim() : null,
           run: mongoose.Types.ObjectId.isValid(String(run || '')) ? run : null,
         });

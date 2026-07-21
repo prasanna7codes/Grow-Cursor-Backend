@@ -40,9 +40,9 @@ router.get('/stats', requireAuth, validate(endListingStatsQuerySchema, 'query'),
   try {
     const { sellerId, startDate, endDate } = req.query;
 
-    // This page reports only the duplicate-SKU / expiry sources; ends logged
-    // from the stock-check verify flow are excluded so totals stay consistent.
-    const matchCriteria = { source: { $in: ['duplicate_sku', 'expiry_listing'] } };
+    // Reports all three end-listing sources: duplicate-SKU, expiry, and Amazon
+    // stock-check.
+    const matchCriteria = { source: { $in: ['duplicate_sku', 'expiry_listing', 'amazon_stock_check'] } };
 
     if (sellerId) {
       if (!mongoose.Types.ObjectId.isValid(sellerId)) {
@@ -119,6 +119,9 @@ router.get('/stats', requireAuth, validate(endListingStatsQuerySchema, 'query'),
       const expiryListingCount = row.sources
         .filter(s => s.source === 'expiry_listing')
         .reduce((sum, s) => sum + (s.count || 0), 0);
+      const amazonStockCheckCount = row.sources
+        .filter(s => s.source === 'amazon_stock_check')
+        .reduce((sum, s) => sum + (s.count || 0), 0);
       const countryMap = new Map();
 
       for (const sourceRow of row.sources) {
@@ -127,12 +130,15 @@ router.get('/stats', requireAuth, validate(endListingStatsQuerySchema, 'query'),
           country,
           duplicateSkuCount: 0,
           expiryListingCount: 0,
+          amazonStockCheckCount: 0,
           total: 0,
         };
         if (sourceRow.source === 'duplicate_sku') {
           existing.duplicateSkuCount += sourceRow.count || 0;
         } else if (sourceRow.source === 'expiry_listing') {
           existing.expiryListingCount += sourceRow.count || 0;
+        } else if (sourceRow.source === 'amazon_stock_check') {
+          existing.amazonStockCheckCount += sourceRow.count || 0;
         }
         existing.total += sourceRow.count || 0;
         countryMap.set(country, existing);
@@ -143,7 +149,8 @@ router.get('/stats', requireAuth, validate(endListingStatsQuerySchema, 'query'),
         sellerName: row.sellerName || 'Unknown',
         duplicateSkuCount,
         expiryListingCount,
-        total: duplicateSkuCount + expiryListingCount,
+        amazonStockCheckCount,
+        total: duplicateSkuCount + expiryListingCount + amazonStockCheckCount,
         countryBreakdown: Array.from(countryMap.values())
           .sort((a, b) => b.total - a.total || a.country.localeCompare(b.country)),
       };
