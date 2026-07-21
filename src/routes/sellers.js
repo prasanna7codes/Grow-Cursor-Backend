@@ -258,6 +258,7 @@ router.get('/sku-duplicates', requireAuth, requirePageAccess('DuplicateSkus'), a
           count: { $sum: 1 },
           itemIds: { $push: '$itemId' },
           titles: { $push: '$title' },
+          currencies: { $push: '$currency' },
         },
       },
       { $match: { _id: { $ne: '' }, count: { $gt: 1 } } },
@@ -268,7 +269,7 @@ router.get('/sku-duplicates', requireAuth, requirePageAccess('DuplicateSkus'), a
           data: [
             { $skip: skip },
             { $limit: limit },
-            { $project: { _id: 0, sku: '$_id', count: 1, itemIds: 1, titles: 1 } },
+            { $project: { _id: 0, sku: '$_id', count: 1, itemIds: 1, titles: 1, currencies: 1 } },
           ],
         },
       },
