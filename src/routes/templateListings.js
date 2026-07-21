@@ -2410,34 +2410,34 @@ router.get('/database-view', requireAuth, async (req, res) => {
 // Database statistics endpoint (MUST be before /:id route)
 router.get('/database-stats', requireAuth, async (req, res) => {
   try {
-    const stats = await TemplateListing.aggregate([
-      { $match: { deletedAt: null } },
-      {
-        $group: {
-          _id: null,
-          totalListings: { $sum: 1 },
-          uniqueSellers: { $addToSet: '$sellerId' },
-          uniqueTemplates: { $addToSet: '$templateId' },
-          draftCount: {
-            $sum: { $cond: [{ $eq: ['$status', 'draft'] }, 1, 0] }
-          },
-          activeCount: {
-            $sum: { $cond: [{ $eq: ['$status', 'active'] }, 1, 0] }
-          },
-          inactiveCount: {
-            $sum: { $cond: [{ $eq: ['$status', 'inactive'] }, 1, 0] }
-          }
-        }
-      }
+    // Indexed counts + distincts instead of a single $group over every
+    // non-deleted document (~700k full-doc reads, 30s+, and it evicted the
+    // working set from cache each run). The status counts are pure COUNT_SCANs
+    // on { deletedAt, status }. distinct() with a filter refuses the fast
+    // index path (as does $match+$group with a null predicate), so we take
+    // the unfiltered distinct (fast DISTINCT_SCAN) and verify each id still
+    // has at least one non-deleted listing via indexed point lookups.
+    const [total, draft, active, inactive, sellerIds, templateIds] = await Promise.all([
+      TemplateListing.countDocuments({ deletedAt: null }),
+      TemplateListing.countDocuments({ deletedAt: null, status: 'draft' }),
+      TemplateListing.countDocuments({ deletedAt: null, status: 'active' }),
+      TemplateListing.countDocuments({ deletedAt: null, status: 'inactive' }),
+      TemplateListing.distinct('sellerId'),
+      TemplateListing.distinct('templateId')
+    ]);
+
+    const [sellerFlags, templateFlags] = await Promise.all([
+      Promise.all(sellerIds.map((id) => TemplateListing.exists({ sellerId: id, deletedAt: null }))),
+      Promise.all(templateIds.map((id) => TemplateListing.exists({ templateId: id, deletedAt: null })))
     ]);
 
     res.json({
-      total: stats[0]?.totalListings || 0,
-      sellers: stats[0]?.uniqueSellers?.length || 0,
-      templates: stats[0]?.uniqueTemplates?.length || 0,
-      draft: stats[0]?.draftCount || 0,
-      active: stats[0]?.activeCount || 0,
-      inactive: stats[0]?.inactiveCount || 0
+      total,
+      sellers: sellerFlags.filter(Boolean).length,
+      templates: templateFlags.filter(Boolean).length,
+      draft,
+      active,
+      inactive
     });
   } catch (error) {
     console.error('Database stats error:', error);
