@@ -289,7 +289,8 @@ router.get('/', requireAuth, requirePageAccess('Assignments'), async (req, res) 
         { path: 'createdBy', select: 'username' },
         { path: 'rangeQuantities.range', select: 'name' },
       ])
-      .sort({ [sortBy]: sortOrder === 'asc' ? 1 : -1 });
+      .sort({ [sortBy]: sortOrder === 'asc' ? 1 : -1 })
+      .lean();
 
     // Apply additional filters that require populated data
     const {
@@ -429,7 +430,8 @@ router.get('/mine',
           { path: 'store', select: 'name' },
           { path: 'rangeQuantities.range', select: 'name' },
         ])
-        .sort({ createdAt: -1 });
+        .sort({ createdAt: -1 })
+        .lean();
 
       res.json(items);
     } catch (e) {
