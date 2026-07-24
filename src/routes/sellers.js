@@ -18,6 +18,21 @@ const currencyCountryLabels = {
   EUR: 'Europe',
 };
 
+// Maps the short country vocabulary used by the Duplicate SKUs page (and
+// EndListingLog) back to the currency codes stored on each SellerSkuIndex row,
+// so the page can filter duplicates down to a single country.
+const COUNTRY_TO_CURRENCIES = {
+  US: ['USD'],
+  UK: ['GBP', 'GB'],
+  AU: ['AUD'],
+  CANADA: ['CAD'],
+};
+
+function currenciesForCountry(country) {
+  if (!country) return null;
+  return COUNTRY_TO_CURRENCIES[String(country).trim().toUpperCase()] || null;
+}
+
 function formatCurrencyCountry(currency) {
   if (!currency) return 'Unknown';
   const normalized = String(currency).trim().toUpperCase();
@@ -239,19 +254,31 @@ router.delete('/disconnect-ebay', requireAuth, requireRole('seller'), async (req
   }
 });
 
-// GET /sellers/sku-duplicates?sellerId=xxx&page=1&limit=25
-// Returns SKUs that appear on more than one itemId for the given seller in the SellerSkuIndex collection
+// GET /sellers/sku-duplicates?sellerId=xxx&page=1&limit=25&country=US
+// Returns SKUs that appear on more than one itemId for the given seller in the SellerSkuIndex collection.
+// When `country` is supplied, only listings from that country's currencies are considered, so a SKU is
+// treated as a duplicate only when it repeats within the selected country.
 router.get('/sku-duplicates', requireAuth, requirePageAccess('DuplicateSkus'), async (req, res) => {
-  const { sellerId } = req.query;
+  const { sellerId, country } = req.query;
   if (!sellerId || !mongoose.Types.ObjectId.isValid(sellerId)) {
     return res.status(400).json({ error: 'Valid sellerId query param is required.' });
   }
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 25));
   const page  = Math.max(1, parseInt(req.query.page)  || 1);
   const skip  = (page - 1) * limit;
+
+  const countryCurrencies = currenciesForCountry(country);
+  if (country && !countryCurrencies) {
+    return res.status(400).json({ error: `Unknown country filter: ${country}` });
+  }
+
   try {
     const [facet] = await SellerSkuIndex.aggregate([
       { $match: { seller: new mongoose.Types.ObjectId(sellerId) } },
+      ...(countryCurrencies ? [
+        { $addFields: { _normCurrency: { $toUpper: { $ifNull: ['$currency', ''] } } } },
+        { $match: { _normCurrency: { $in: countryCurrencies } } },
+      ] : []),
       {
         $group: {
           _id: '$sku',
