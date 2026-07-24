@@ -17,6 +17,14 @@ import axios from 'axios';
 import { requireAuth } from '../middleware/auth.js';
 import Seller from '../models/Seller.js';
 import { ensureValidToken } from './ebay.js';
+import { validate } from '../utils/validate.js';
+import {
+  discountsListQuerySchema,
+  discountsAllQuerySchema,
+  discountsCachedQuerySchema,
+  discountsEndingSoonQuerySchema,
+  discountsDetailQuerySchema,
+} from '../schemas/index.js';
 
 const router = express.Router();
 
@@ -189,7 +197,7 @@ function parseTypes(typesQuery) {
  *       500:
  *         description: Internal server error
  */
-router.get('/discounts', requireAuth, async (req, res) => {
+router.get('/discounts', requireAuth, validate(discountsListQuerySchema, 'query'), async (req, res) => {
   try {
     const { sellerId, status, type, q, sort } = req.query;
     if (!sellerId) return res.status(400).json({ error: 'Missing sellerId' });
@@ -262,7 +270,7 @@ router.get('/discounts', requireAuth, async (req, res) => {
  *       500:
  *         description: Internal server error
  */
-router.get('/discounts/all', requireAuth, async (req, res) => {
+router.get('/discounts/all', requireAuth, validate(discountsAllQuerySchema, 'query'), async (req, res) => {
   try {
     const { status, type, q, sort } = req.query;
     // ?types=A,B (multiple) takes precedence over ?type=A (single)
@@ -372,7 +380,7 @@ export async function refreshDiscountAlertsCache() {
  *       500:
  *         description: Internal server error
  */
-router.get('/discounts/cached', requireAuth, async (req, res) => {
+router.get('/discounts/cached', requireAuth, validate(discountsCachedQuerySchema, 'query'), async (req, res) => {
   try {
     if (req.query.refresh === 'true' || !discountAlertsCache) {
       await refreshDiscountAlertsCache();
@@ -420,7 +428,7 @@ router.get('/discounts/cached', requireAuth, async (req, res) => {
  *       500:
  *         description: Internal server error
  */
-router.get('/discounts/ending-soon', requireAuth, async (req, res) => {
+router.get('/discounts/ending-soon', requireAuth, validate(discountsEndingSoonQuerySchema, 'query'), async (req, res) => {
   try {
     const days = Math.min(Math.max(parseInt(req.query.days) || 3, 1), 30);
 
@@ -498,7 +506,7 @@ router.get('/discounts/ending-soon', requireAuth, async (req, res) => {
  *       500:
  *         description: Internal server error
  */
-router.get('/discounts/detail', requireAuth, async (req, res) => {
+router.get('/discounts/detail', requireAuth, validate(discountsDetailQuerySchema, 'query'), async (req, res) => {
   try {
     const { sellerId, href } = req.query;
     if (!sellerId || !href) {

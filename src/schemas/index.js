@@ -592,3 +592,54 @@ export const createUserCategoryTargetSchema = z.object({
     invalid_type_error: 'Daily desired quantity must be a number greater than or equal to 0',
   }).min(0, 'Daily desired quantity must be a number greater than or equal to 0'),
 });
+
+// ── Discounts (eBay Sell Marketing) ──────────────────────────────────────────
+// These schemas are intentionally permissive on *values* and strict on *types*.
+//
+// Rationale: the discounts handlers already filter unrecognised values rather
+// than rejecting them (e.g. `if (status && VALID_STATUSES.includes(status))`),
+// and `/detail` keeps its own required-field + eBay-URL checks. Turning those
+// silent ignores into 400s would be a behaviour change, so the schemas only
+// guarantee "this is a string, not an array/object" — which is what actually
+// guards the handlers against crafted query params like `?status[$ne]=x`.
+//
+// NOTE: `validate()` strips keys that aren't declared here, so every query
+// param a handler reads must be listed or it will arrive as `undefined`.
+
+export const discountsListQuerySchema = z.object({
+  // Required-ness stays in the handler so its 'Missing sellerId' message is kept;
+  // this only rejects a malformed id (which today reaches Mongoose as a CastError).
+  sellerId: optionalObjectIdSchema,
+  status: z.string().trim().optional(),
+  type: z.string().trim().optional(),
+  q: z.string().trim().optional(),
+  sort: z.string().trim().optional(),
+});
+
+export const discountsAllQuerySchema = z.object({
+  status: z.string().trim().optional(),
+  type: z.string().trim().optional(),
+  // Comma-separated list (e.g. 'CODED_COUPON,MARKDOWN_SALE'); parsed by parseTypes()
+  types: z.string().trim().optional(),
+  q: z.string().trim().optional(),
+  sort: z.string().trim().optional(),
+});
+
+export const discountsCachedQuerySchema = z.object({
+  // Compared with === 'true'; any other value means "use cache"
+  refresh: z.string().trim().optional(),
+});
+
+export const discountsEndingSoonQuerySchema = z.object({
+  // parseInt'd and clamped to 1..30 by the handler, so non-numeric input is
+  // already handled there (falls back to 3) — kept as a string for parity.
+  days: z.string().trim().optional(),
+  refresh: z.string().trim().optional(),
+});
+
+export const discountsDetailQuerySchema = z.object({
+  // Both stay optional here: the handler returns a specific 400 for missing
+  // fields and enforces the eBay Marketing API prefix on href (SSRF guard).
+  sellerId: optionalObjectIdSchema,
+  href: z.string().trim().optional(),
+});
