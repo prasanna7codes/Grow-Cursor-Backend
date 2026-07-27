@@ -29,6 +29,10 @@ export function mergeTemplate(baseTemplate, override) {
     merged.pricingConfig = override.pricingConfig;
   }
   
+  if (override.overrides.overlayOptions && override.overlayOptions) {
+    merged.overlayOptions = override.overlayOptions;
+  }
+
   if (override.overrides.coreFieldDefaults && override.coreFieldDefaults) {
     merged.coreFieldDefaults = override.coreFieldDefaults;
   }

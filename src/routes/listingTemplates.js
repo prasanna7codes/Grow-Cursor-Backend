@@ -3,8 +3,54 @@ import { requireAuth } from '../middleware/auth.js';
 import ListingTemplate from '../models/ListingTemplate.js';
 import TemplateOverride from '../models/TemplateOverride.js';
 import SellerPricingConfig from '../models/SellerPricingConfig.js';
+import { listBadges, resolveBadge } from '../config/overlayBadges.js';
+import { ANCHORS } from '../utils/overlayCompositor.js';
 
 const router = express.Router();
+
+/**
+ * Reject overlay options that reference unregistered artwork or out-of-range
+ * placement. Without this a template could be saved with a badge key that
+ * silently does nothing at preview time.
+ * @returns {string|null} error message, or null when valid
+ */
+function validateOverlayOptions(overlayOptions) {
+  if (overlayOptions === undefined || overlayOptions === null) return null;
+  if (!Array.isArray(overlayOptions)) return 'overlayOptions must be an array';
+
+  for (const option of overlayOptions) {
+    if (!option || !resolveBadge(option.badgeKey)) {
+      return `Unknown overlay badge: ${option?.badgeKey}`;
+    }
+    if (option.anchor !== undefined && !ANCHORS.includes(option.anchor)) {
+      return `Invalid overlay anchor: ${option.anchor}`;
+    }
+    if (option.scale !== undefined && !(option.scale >= 0.05 && option.scale <= 1)) {
+      return `Overlay scale must be between 0.05 and 1 (got ${option.scale})`;
+    }
+    if (option.margin !== undefined && !(option.margin >= 0 && option.margin <= 0.2)) {
+      return `Overlay margin must be between 0 and 0.2 (got ${option.margin})`;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * @swagger
+ * /listing-templates/overlay-badges:
+ *   get:
+ *     tags: [Listing Templates]
+ *     summary: List overlay badges available for template image overlays
+ *     security:
+ *       - bearerAuth: []
+ *     responses:
+ *       200:
+ *         description: Registered badges
+ */
+router.get('/overlay-badges', requireAuth, (req, res) => {
+  res.json({ badges: listBadges() });
+});
 
 // Get custom Action field for template
 /**
@@ -401,12 +447,17 @@ router.get('/:id', requireAuth, async (req, res) => {
 // Create new template
 router.post('/', requireAuth, async (req, res) => {
   try {
-    const { name, description, category, ebayCategory, customColumns, asinAutomation, pricingConfig, coreFieldDefaults, rangeId, listProductId } = req.body;
-    
+    const { name, description, category, ebayCategory, customColumns, asinAutomation, pricingConfig, coreFieldDefaults, overlayOptions, rangeId, listProductId } = req.body;
+
     if (!name) {
       return res.status(400).json({ error: 'Template name is required' });
     }
-    
+
+    const overlayError = validateOverlayOptions(overlayOptions);
+    if (overlayError) {
+      return res.status(400).json({ error: overlayError });
+    }
+
     const templateData = {
       name,
       description,
@@ -415,6 +466,7 @@ router.post('/', requireAuth, async (req, res) => {
       customColumns: customColumns || [],
       asinAutomation: asinAutomation || { enabled: false, fieldConfigs: [] },
       pricingConfig: pricingConfig || { enabled: false },
+      overlayOptions: overlayOptions || [],
       createdBy: req.user.userId
     };
     
@@ -493,6 +545,7 @@ router.post('/:id/duplicate', requireAuth, async (req, res) => {
       category: sourceTemplate.category,
       ebayCategory: sourceTemplate.ebayCategory,
       customColumns: sourceTemplate.customColumns ? JSON.parse(JSON.stringify(sourceTemplate.customColumns)) : [],
+      overlayOptions: sourceTemplate.overlayOptions ? JSON.parse(JSON.stringify(sourceTemplate.overlayOptions)) : [],
       asinAutomation: sourceTemplate.asinAutomation ? {
         enabled: sourceTemplate.asinAutomation.enabled,
         fieldConfigs: sourceTemplate.asinAutomation.fieldConfigs ? 
@@ -536,10 +589,15 @@ router.post('/:id/duplicate', requireAuth, async (req, res) => {
 // Update template
 router.put('/:id', requireAuth, async (req, res) => {
   try {
-    const { name, description, category, ebayCategory, customColumns, asinAutomation, pricingConfig, coreFieldDefaults, customActionField, rangeId, listProductId } = req.body;
-    
-    const updateData = { 
-      name, 
+    const { name, description, category, ebayCategory, customColumns, asinAutomation, pricingConfig, coreFieldDefaults, customActionField, overlayOptions, rangeId, listProductId } = req.body;
+
+    const overlayError = validateOverlayOptions(overlayOptions);
+    if (overlayError) {
+      return res.status(400).json({ error: overlayError });
+    }
+
+    const updateData = {
+      name,
       description,
       category,
       ebayCategory,
@@ -548,6 +606,12 @@ router.put('/:id', requireAuth, async (req, res) => {
       pricingConfig: pricingConfig || { enabled: false },
       updatedAt: Date.now()
     };
+
+    // Only touch overlayOptions when the client sends them, so older clients
+    // that don't know about the field can't silently clear a template's badges.
+    if (overlayOptions !== undefined) {
+      updateData.overlayOptions = overlayOptions || [];
+    }
     
     // Add coreFieldDefaults if provided
     if (coreFieldDefaults !== undefined) {

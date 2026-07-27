@@ -160,6 +160,40 @@ const pricingConfigSchema = new mongoose.Schema({
   }
 }, { _id: false });
 
+// An overlay badge this template offers when ASINs are added. The user picks
+// one per batch, so a template lists what's available rather than forcing one.
+// badgeKey must exist in config/overlayBadges.js.
+const overlayOptionSchema = new mongoose.Schema({
+  badgeKey: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  label: {
+    type: String,
+    default: ''
+  },
+  // Fraction of the image's longest edge. 0.26 keeps the badge legible at
+  // eBay's search-thumbnail size without covering the product.
+  scale: {
+    type: Number,
+    default: 0.26,
+    min: 0.05,
+    max: 1
+  },
+  anchor: {
+    type: String,
+    enum: ['bottom-right', 'bottom-left', 'top-right', 'top-left'],
+    default: 'bottom-right'
+  },
+  margin: {
+    type: Number,
+    default: 0.015,
+    min: 0,
+    max: 0.2
+  }
+}, { _id: false });
+
 const listingTemplateSchema = new mongoose.Schema({
   name: {
     type: String,
@@ -190,6 +224,10 @@ const listingTemplateSchema = new mongoose.Schema({
   pricingConfig: {
     type: pricingConfigSchema,
     default: () => ({ enabled: false })
+  },
+  overlayOptions: {
+    type: [overlayOptionSchema],
+    default: []
   },
   coreFieldDefaults: {
     type: mongoose.Schema.Types.Mixed,
