@@ -73,14 +73,17 @@ export function computeBadgeBox(baseWidth, baseHeight, placement) {
 }
 
 /**
- * Composite a badge onto a product image.
+ * Decode, orient and resize a source image into the buffer everything else
+ * builds on.
  *
- * @param {Buffer} productBuffer - Source product image
- * @param {string|Buffer} badge - Path to (or buffer of) the badge artwork
- * @param {object} [placement] - { scale, anchor, margin }
- * @returns {Promise<{skipped: boolean, reason?: string, buffer?: Buffer, width?: number, height?: number, box?: object}>}
+ * Shared by compositeBadge() and normalizeForUpload() so a badged image and an
+ * unbadged one are prepared identically — same orientation handling, same size
+ * ceiling, same rejection rules. Divergence here would show up as image 1
+ * looking subtly different from images 2-6 in the same listing.
+ *
+ * @returns {Promise<{skipped: true, reason: string}|{skipped: false, baseBuffer: Buffer, meta: object}>}
  */
-export async function compositeBadge(productBuffer, badge, placement = DEFAULT_PLACEMENT) {
+async function prepareBase(productBuffer) {
   // .rotate() with no argument applies the EXIF orientation, matching the eBay
   // picture uploader in routes/ebay.js.
   const source = sharp(productBuffer).rotate();
@@ -90,7 +93,7 @@ export async function compositeBadge(productBuffer, badge, placement = DEFAULT_P
     return { skipped: true, reason: 'unreadable_source' };
   }
 
-  // Badging a picture eBay would reject anyway just wastes an upload.
+  // Uploading a picture eBay would reject anyway just wastes a round trip.
   if (Math.max(metadata.width, metadata.height) < MIN_SOURCE_EDGE) {
     return { skipped: true, reason: 'source_too_small' };
   }
@@ -99,7 +102,51 @@ export async function compositeBadge(productBuffer, badge, placement = DEFAULT_P
     .resize(WORK_EDGE, WORK_EDGE, { fit: 'inside', withoutEnlargement: true })
     .toBuffer();
 
-  const baseMeta = await sharp(baseBuffer).metadata();
+  return { skipped: false, baseBuffer, meta: await sharp(baseBuffer).metadata() };
+}
+
+/**
+ * Re-encode a product image for upload without touching its content.
+ *
+ * eBay forbids mixing its own hosted pictures with external URLs in one
+ * listing, so when the primary image gets badged and hosted on EPS every other
+ * image has to be hosted too. Those images need no badge — they just need to
+ * make the same trip.
+ *
+ * @param {Buffer} productBuffer - Source product image
+ * @returns {Promise<{skipped: boolean, reason?: string, buffer?: Buffer, width?: number, height?: number}>}
+ */
+export async function normalizeForUpload(productBuffer) {
+  const base = await prepareBase(productBuffer);
+  if (base.skipped) return base;
+
+  let pipeline = sharp(base.baseBuffer);
+  if (base.meta.hasAlpha) {
+    pipeline = pipeline.flatten({ background: { r: 255, g: 255, b: 255 } });
+  }
+
+  return {
+    skipped: false,
+    buffer: await pipeline.jpeg({ quality: 90, chromaSubsampling: '4:4:4' }).toBuffer(),
+    width: base.meta.width,
+    height: base.meta.height,
+  };
+}
+
+/**
+ * Composite a badge onto a product image.
+ *
+ * @param {Buffer} productBuffer - Source product image
+ * @param {string|Buffer} badge - Path to (or buffer of) the badge artwork
+ * @param {object} [placement] - { scale, anchor, margin }
+ * @returns {Promise<{skipped: boolean, reason?: string, buffer?: Buffer, width?: number, height?: number, box?: object}>}
+ */
+export async function compositeBadge(productBuffer, badge, placement = DEFAULT_PLACEMENT) {
+  const base = await prepareBase(productBuffer);
+  if (base.skipped) return base;
+
+  const baseBuffer = base.baseBuffer;
+  const baseMeta = base.meta;
   const box = computeBadgeBox(baseMeta.width, baseMeta.height, placement);
 
   const badgeBuffer = await sharp(badge)
