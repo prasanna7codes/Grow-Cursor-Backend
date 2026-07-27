@@ -270,6 +270,37 @@ export async function uploadBufferToEbayPictureService(token, buffer, fileName) 
  * @param {string} badgeKey - requested badge key ('' / null means no overlay)
  * @returns {{badge: object, placement: object}|null}
  */
+/**
+ * Decide which badge a batch should use.
+ *
+ * An explicitly requested badge always wins. Otherwise the template's default
+ * fills the gap, which is what lets entry points with no picker of their own
+ * still badge their listings — whether a template badges at all is configured
+ * once in Manage Templates rather than chosen per batch.
+ *
+ * Returns the key only; it is still checked against the template's allowlist by
+ * resolveTemplateOverlay(). A default is stored as a flag on an existing
+ * overlayOption, so it is always in that allowlist by construction.
+ *
+ * @param {object} template - effective template (may carry overlayOptions)
+ * @param {string} badgeKey - explicitly requested badge, if any
+ * @returns {{badgeKey: string, usingDefault: boolean}}
+ */
+export function resolveEffectiveBadgeKey(template, badgeKey) {
+  if (badgeKey) return { badgeKey, usingDefault: false };
+
+  const options = Array.isArray(template?.overlayOptions) ? template.overlayOptions : [];
+  // First wins if somehow several are flagged. The save-time validation rejects
+  // that, but a document written before the rule existed must still behave
+  // predictably rather than picking by chance.
+  const defaultOption = options.find((option) => option?.isDefault && option?.badgeKey);
+
+  return {
+    badgeKey: defaultOption?.badgeKey || '',
+    usingDefault: Boolean(defaultOption?.badgeKey),
+  };
+}
+
 export function resolveTemplateOverlay(template, badgeKey) {
   if (!badgeKey) return null;
 

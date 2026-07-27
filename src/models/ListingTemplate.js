@@ -191,6 +191,18 @@ const overlayOptionSchema = new mongoose.Schema({
     default: 0.015,
     min: 0,
     max: 0.2
+  },
+  // Applied automatically when a batch doesn't name a badge, so every ASIN-add
+  // path gets the overlay without its own picker. At most one option per
+  // template may set this; enforced in routes/listingTemplates.js.
+  //
+  // Deliberately a flag on the option rather than a `defaultBadgeKey` field on
+  // the template: overlayOptions is the allowlist resolveTemplateOverlay()
+  // checks against, so a separate field could name a badge the template does
+  // not offer. A flag cannot drift out of sync with it.
+  isDefault: {
+    type: Boolean,
+    default: false
   }
 }, { _id: false });
 

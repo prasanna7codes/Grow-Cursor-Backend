@@ -11,7 +11,7 @@ import { calculateStartPrice } from '../utils/pricingCalculator.js';
 import { generateWithGemini } from '../utils/gemini.js';
 import { generateSKUFromASIN, generateSKUWithCount } from '../utils/skuGenerator.js';
 import { getEffectiveTemplate } from '../utils/templateMerger.js';
-import { applyOverlayMapping, resolveSavedImageList, resolveTemplateOverlay, withOverlaidImages } from '../utils/overlayImage.js';
+import { applyOverlayMapping, resolveEffectiveBadgeKey, resolveSavedImageList, resolveTemplateOverlay, withOverlaidImages } from '../utils/overlayImage.js';
 import { ensureValidToken } from './ebay.js';
 import { getUsageStats, getFieldExtractionStats, getRecentErrors, checkQuotaStatus } from '../utils/apiUsageTracker.js';
 import { getAsinCacheStats, clearAsinCache, invalidateAsinCache } from '../utils/asinCache.js';
@@ -206,34 +206,43 @@ function buildAmazonSourceData(amazonData) {
 }
 
 /**
- * Resolve the overlay badge a batch asked for, plus the eBay token needed to
- * host the composites, once per request instead of once per ASIN.
+ * Resolve the overlay badge for a batch, plus the eBay token needed to host the
+ * composites, once per request instead of once per ASIN.
  *
- * Returns null whenever the overlay can't be applied — unknown badge, badge not
- * enabled on the template, or no usable seller token — so the preview runs
- * exactly as it did before rather than failing.
+ * When the caller doesn't name a badge, the template's default is used. That is
+ * what lets paths with no picker of their own — the ASIN List page's directory
+ * stream, and any future entry point — apply the overlay without each one
+ * having to plumb a parameter through. Whether a template badges its listings
+ * is decided once, in Manage Templates, rather than per batch.
+ *
+ * Returns null whenever the overlay can't be applied — no badge requested and
+ * no default, unknown badge, badge not enabled on the template, or no usable
+ * seller token — so the preview runs exactly as it did before rather than
+ * failing.
  */
 async function prepareOverlayContext(template, seller, badgeKey, source = 'listing') {
+  const { badgeKey: effectiveKey, usingDefault } = resolveEffectiveBadgeKey(template, badgeKey);
+
   // Log every outcome, including "nothing requested". An overlay that quietly
   // doesn't apply looks identical to one that was never asked for, and the CSV
   // only reveals it after export.
-  if (!badgeKey) {
-    console.log(`🏷️ [${source}] No overlay requested`);
+  if (!effectiveKey) {
+    console.log(`🏷️ [${source}] No overlay requested and no template default`);
     return null;
   }
 
-  const overlay = resolveTemplateOverlay(template, badgeKey);
+  const overlay = resolveTemplateOverlay(template, effectiveKey);
   if (!overlay) {
-    console.warn(`🏷️ [${source}] Overlay "${badgeKey}" unavailable (not enabled on this template, or not registered) — continuing without it`);
+    console.warn(`🏷️ [${source}] Overlay "${effectiveKey}" unavailable (not enabled on this template, or not registered) — continuing without it`);
     return null;
   }
 
   try {
     const token = await ensureValidToken(seller);
-    console.log(`🏷️ [${source}] Overlay "${badgeKey}" active (${Math.round(overlay.placement.scale * 100)}% ${overlay.placement.anchor})`);
+    console.log(`🏷️ [${source}] Overlay "${effectiveKey}"${usingDefault ? ' (template default)' : ''} active (${Math.round(overlay.placement.scale * 100)}% ${overlay.placement.anchor})`);
     return { overlay, ctx: { sellerId: seller._id, token } };
   } catch (error) {
-    console.error(`🏷️ [${source}] Overlay "${badgeKey}" skipped — no eBay token for seller ${seller._id}: ${error.message}`);
+    console.error(`🏷️ [${source}] Overlay "${effectiveKey}" skipped — no eBay token for seller ${seller._id}: ${error.message}`);
     return null;
   }
 }

@@ -7,6 +7,7 @@ import {
   hostsAreUniform,
   isAlreadyOverlaid,
   replaceImages,
+  resolveEffectiveBadgeKey,
   resolveSavedImageList,
   resolveTemplateOverlay,
   splitImageList,
@@ -121,6 +122,64 @@ test('a badge is only honoured when the template offers it', () => {
   assert.equal(resolveTemplateOverlay(template, null), null);
   // Template with no overlay configuration at all.
   assert.equal(resolveTemplateOverlay({}, 'case-only'), null);
+});
+
+// ── Template default badge ───────────────────────────────────────────────────
+// Whether a template badges its listings is configured once in Manage
+// Templates. Entry points with no picker of their own — the ASIN List page's
+// directory stream — rely on this to apply the overlay at all.
+
+test('the template default is used when a batch names no badge', () => {
+  const template = {
+    overlayOptions: [
+      { badgeKey: 'other-badge' },
+      { badgeKey: 'case-only', isDefault: true },
+    ],
+  };
+
+  assert.deepEqual(resolveEffectiveBadgeKey(template, ''), { badgeKey: 'case-only', usingDefault: true });
+  assert.deepEqual(resolveEffectiveBadgeKey(template, null), { badgeKey: 'case-only', usingDefault: true });
+  assert.deepEqual(resolveEffectiveBadgeKey(template, undefined), { badgeKey: 'case-only', usingDefault: true });
+});
+
+test('an explicitly requested badge beats the default', () => {
+  const template = { overlayOptions: [{ badgeKey: 'case-only', isDefault: true }] };
+
+  assert.deepEqual(resolveEffectiveBadgeKey(template, 'other-badge'), {
+    badgeKey: 'other-badge',
+    usingDefault: false,
+  });
+});
+
+test('no default means no overlay, which is how it is switched off', () => {
+  // Unchecking the box in Manage Templates has to actually stop the badge,
+  // even though the badge is still offered by the template.
+  const offeredButNotDefault = { overlayOptions: [{ badgeKey: 'case-only', isDefault: false }] };
+
+  assert.deepEqual(resolveEffectiveBadgeKey(offeredButNotDefault, ''), { badgeKey: '', usingDefault: false });
+  assert.deepEqual(resolveEffectiveBadgeKey({ overlayOptions: [] }, ''), { badgeKey: '', usingDefault: false });
+  assert.deepEqual(resolveEffectiveBadgeKey({}, ''), { badgeKey: '', usingDefault: false });
+  assert.deepEqual(resolveEffectiveBadgeKey(null, ''), { badgeKey: '', usingDefault: false });
+});
+
+test('a default flagged on an option with no badgeKey is ignored', () => {
+  const template = { overlayOptions: [{ isDefault: true }, { badgeKey: 'case-only', isDefault: true }] };
+
+  // Falls through to the first usable one rather than returning an empty key
+  // that would read as "overlays off".
+  assert.equal(resolveEffectiveBadgeKey(template, '').badgeKey, 'case-only');
+});
+
+test('the default is still checked against the template allowlist', () => {
+  // resolveEffectiveBadgeKey only picks a name; resolveTemplateOverlay decides
+  // whether it is allowed. A default is a flag on an existing option, so it is
+  // in the allowlist by construction — but an unregistered badge must still be
+  // refused rather than reaching the filesystem.
+  const template = { _id: 't1', overlayOptions: [{ badgeKey: 'ghost', isDefault: true }] };
+  const { badgeKey } = resolveEffectiveBadgeKey(template, '');
+
+  assert.equal(badgeKey, 'ghost');
+  assert.equal(resolveTemplateOverlay(template, badgeKey), null);
 });
 
 test('template placement is normalised, so bad stored config cannot break rendering', () => {
