@@ -11,7 +11,7 @@ import { calculateStartPrice } from '../utils/pricingCalculator.js';
 import { generateWithGemini } from '../utils/gemini.js';
 import { generateSKUFromASIN, generateSKUWithCount } from '../utils/skuGenerator.js';
 import { getEffectiveTemplate } from '../utils/templateMerger.js';
-import { applyOverlayMapping, resolveTemplateOverlay, withOverlaidPrimary } from '../utils/overlayImage.js';
+import { applyOverlayMapping, resolveEffectiveBadgeKey, resolveSavedImageList, resolveTemplateOverlay, withOverlaidImages } from '../utils/overlayImage.js';
 import { ensureValidToken } from './ebay.js';
 import { getUsageStats, getFieldExtractionStats, getRecentErrors, checkQuotaStatus } from '../utils/apiUsageTracker.js';
 import { getAsinCacheStats, clearAsinCache, invalidateAsinCache } from '../utils/asinCache.js';
@@ -206,46 +206,72 @@ function buildAmazonSourceData(amazonData) {
 }
 
 /**
- * Resolve the overlay badge a batch asked for, plus the eBay token needed to
- * host the composites, once per request instead of once per ASIN.
+ * Resolve the overlay badge for a batch, plus the eBay token needed to host the
+ * composites, once per request instead of once per ASIN.
  *
- * Returns null whenever the overlay can't be applied — unknown badge, badge not
- * enabled on the template, or no usable seller token — so the preview runs
- * exactly as it did before rather than failing.
+ * When the caller doesn't name a badge, the template's default is used. That is
+ * what lets paths with no picker of their own — the ASIN List page's directory
+ * stream, and any future entry point — apply the overlay without each one
+ * having to plumb a parameter through. Whether a template badges its listings
+ * is decided once, in Manage Templates, rather than per batch.
+ *
+ * A batch that wants no overlay despite the default says so with NO_OVERLAY.
+ * The batch picker needs that: a template whose default badge suits most of its
+ * ASINs but not this batch's has no other way to say so.
+ *
+ * Returns null whenever the overlay can't be applied — opted out, no badge
+ * requested and no default, unknown badge, badge not enabled on the template,
+ * or no usable seller token — so the preview runs exactly as it did before
+ * rather than failing.
  */
 async function prepareOverlayContext(template, seller, badgeKey, source = 'listing') {
+  const { badgeKey: effectiveKey, usingDefault, optedOut } = resolveEffectiveBadgeKey(template, badgeKey);
+
   // Log every outcome, including "nothing requested". An overlay that quietly
   // doesn't apply looks identical to one that was never asked for, and the CSV
   // only reveals it after export.
-  if (!badgeKey) {
-    console.log(`🏷️ [${source}] No overlay requested`);
+  //
+  // Opting out is logged apart from the rest precisely because it isn't a
+  // problem — routing it through the "unavailable" warning below would put a
+  // misconfiguration-shaped line in the log every time someone deliberately
+  // turned the badge off, and this log is how overlay problems get diagnosed.
+  if (optedOut) {
+    console.log(`🏷️ [${source}] Overlay turned off for this batch`);
     return null;
   }
 
-  const overlay = resolveTemplateOverlay(template, badgeKey);
+  if (!effectiveKey) {
+    console.log(`🏷️ [${source}] No overlay requested and no template default`);
+    return null;
+  }
+
+  const overlay = resolveTemplateOverlay(template, effectiveKey);
   if (!overlay) {
-    console.warn(`🏷️ [${source}] Overlay "${badgeKey}" unavailable (not enabled on this template, or not registered) — continuing without it`);
+    console.warn(`🏷️ [${source}] Overlay "${effectiveKey}" unavailable (not enabled on this template, or not registered) — continuing without it`);
     return null;
   }
 
   try {
     const token = await ensureValidToken(seller);
-    console.log(`🏷️ [${source}] Overlay "${badgeKey}" active (${Math.round(overlay.placement.scale * 100)}% ${overlay.placement.anchor})`);
+    console.log(`🏷️ [${source}] Overlay "${effectiveKey}"${usingDefault ? ' (template default)' : ''} active (${Math.round(overlay.placement.scale * 100)}% ${overlay.placement.anchor})`);
     return { overlay, ctx: { sellerId: seller._id, token } };
   } catch (error) {
-    console.error(`🏷️ [${source}] Overlay "${badgeKey}" skipped — no eBay token for seller ${seller._id}: ${error.message}`);
+    console.error(`🏷️ [${source}] Overlay "${effectiveKey}" skipped — no eBay token for seller ${seller._id}: ${error.message}`);
     return null;
   }
 }
 
 /**
- * Apply the batch's overlay to amazonData's primary image, if one is active.
+ * Apply the batch's overlay to amazonData's images, if one is active. Badges
+ * the primary and moves every image onto eBay Picture Services, since eBay
+ * rejects listings that mix its own hosted pictures with external URLs.
+ *
  * Always returns a usable object — never throws — so a badge failure can't
  * take down a preview.
  */
 async function applyBatchOverlay(amazonData, overlayContext) {
   if (!overlayContext) return { data: amazonData, applied: false };
-  return withOverlaidPrimary(amazonData, overlayContext.overlay, overlayContext.ctx);
+  return withOverlaidImages(amazonData, overlayContext.overlay, overlayContext.ctx);
 }
 
 function calculatePricingOnly(asin, amazonPrice, pricingConfig) {
@@ -2850,6 +2876,8 @@ router.get('/analytics', requireAuth, async (req, res) => {
  *           Overlay badge composited onto each ASIN's primary image for this batch.
  *           Must be one of the template's configured `overlayOptions`; an unknown or
  *           disabled key is ignored and the preview runs without an overlay.
+ *           Omit to use the template's default badge, if it has one. Send `none`
+ *           to suppress the overlay for this batch even when a default is set.
  *         example: case-only
  *       - in: query
  *         name: token
@@ -3023,7 +3051,8 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
           let sourceData = null;
           let pricingCalculation = null;
           let freshAmazonSourcePrice = null;
-          let overlayMapping = null;
+          let overlayMappings = null;
+          let overlayHostedImages = null;
           let duplicateImages = Array.isArray(asinDoc?.images) ? asinDoc.images : [];
           const needsLiveAmazonData = true;
 
@@ -3035,8 +3064,9 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
               if (amazonData) {
                 // Same badge as the new-listing path, so a re-listed ASIN's
                 // preview matches what a first-time listing would produce.
-                const { data: stagedData, mapping } = await applyBatchOverlay(amazonData, overlayContext);
-                overlayMapping = mapping || null;
+                const { data: stagedData, mappings } = await applyBatchOverlay(amazonData, overlayContext);
+                overlayMappings = mappings || null;
+                overlayHostedImages = Array.isArray(stagedData.images) ? stagedData.images : null;
                 duplicateImages = Array.isArray(stagedData.images) ? stagedData.images : duplicateImages;
                 sourceData = buildAmazonSourceData(stagedData);
                 sendSse({
@@ -3058,6 +3088,7 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
           // Return existing listing data for editing (generatedListing = user's current saved data)
           // _amazonSourcePrice is included so the save endpoint stores it automatically
           const freshStartPrice = pricingCalculation?.calculatedStartPrice ?? existingListing.startPrice;
+          const photoList = resolveSavedImageList(existingListing.itemPhotoUrl, overlayMappings, overlayHostedImages);
           const item = {
             id: `preview-${asin}`,
             asin,
@@ -3067,13 +3098,13 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
             pricingCalculation,
             generatedListing: {
               title: existingListing.title,
-              // The saved fields are reused verbatim for editing, so the badge
-              // has to be swapped into them directly — otherwise the modal
-              // previews a badged image while saving the original URLs.
-              description: applyOverlayMapping(existingListing.description, overlayMapping),
+              // The saved fields are reused verbatim for editing, so the hosted
+              // images have to be swapped into them directly — otherwise the
+              // modal previews badged images while saving the original URLs.
+              description: applyOverlayMapping(existingListing.description, overlayMappings),
               startPrice: freshStartPrice,
               quantity: existingListing.quantity,
-              itemPhotoUrl: applyOverlayMapping(existingListing.itemPhotoUrl || '', overlayMapping),
+              itemPhotoUrl: photoList.value,
               conditionId: existingListing.conditionId || '',
               format: existingListing.format || '',
               duration: existingListing.duration || '',
@@ -3092,8 +3123,11 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
               existingListing.duplicateCount > 0
                 ? `Previously updated ${existingListing.duplicateCount} time(s).`
                 : `First time editing this ASIN.`,
-              // Rewriting a saved listing's image should never be silent.
-              ...(overlayMapping ? ['Main image replaced with the selected overlay.'] : [])
+              // Rewriting a saved listing's images should never be silent.
+              ...(overlayMappings?.length ? ['Main image badged; all images moved to eBay hosting.'] : []),
+              ...(photoList.replaced
+                ? ['Saved image list was out of date — replaced with the current Amazon images.']
+                : [])
             ],
             errors: []
           };
@@ -3386,12 +3420,14 @@ router.get('/bulk-preview-from-directory-stream', requireAuthSSE, async (req, re
 
           let sourceData = null;
           let pricingCalculation = null;
-          let overlayMapping = null;
+          let overlayMappings = null;
+          let overlayHostedImages = null;
 
           try {
             const amazonData = await fetchAmazonData(asin, region, { forceRefresh: true });
-            const { data: stagedData, mapping } = await applyBatchOverlay(amazonData, overlayContext);
-            overlayMapping = mapping || null;
+            const { data: stagedData, mappings } = await applyBatchOverlay(amazonData, overlayContext);
+            overlayMappings = mappings || null;
+            overlayHostedImages = Array.isArray(stagedData.images) ? stagedData.images : null;
             sourceData = buildAmazonSourceData(stagedData);
             pricingCalculation = calculatePricingOnly(asin, amazonData.price, pricingConfig);
           } catch (fetchErr) {
@@ -3399,6 +3435,7 @@ router.get('/bulk-preview-from-directory-stream', requireAuthSSE, async (req, re
           }
 
           const freshStartPrice = pricingCalculation?.calculatedStartPrice ?? existingListing.startPrice;
+          const photoList = resolveSavedImageList(existingListing.itemPhotoUrl, overlayMappings, overlayHostedImages);
 
           const item = {
             id: `preview-${asin}`, asin,
@@ -3409,11 +3446,12 @@ router.get('/bulk-preview-from-directory-stream', requireAuthSSE, async (req, re
             generatedListing: {
               title: existingListing.title,
               // See the bulk-preview-stream duplicate branch: saved fields are
-              // reused as-is, so the badge is swapped in rather than regenerated.
-              description: applyOverlayMapping(existingListing.description, overlayMapping),
+              // reused as-is, so the hosted images are swapped in rather than
+              // regenerated.
+              description: applyOverlayMapping(existingListing.description, overlayMappings),
               startPrice: freshStartPrice,
               quantity: existingListing.quantity,
-              itemPhotoUrl: applyOverlayMapping(existingListing.itemPhotoUrl || '', overlayMapping),
+              itemPhotoUrl: photoList.value,
               conditionId: existingListing.conditionId || '',
               format: existingListing.format || '',
               duration: existingListing.duration || '',
@@ -3429,7 +3467,10 @@ router.get('/bulk-preview-from-directory-stream', requireAuthSSE, async (req, re
               existingListing.duplicateCount > 0
                 ? `Previously updated ${existingListing.duplicateCount} time(s).`
                 : 'First time editing this ASIN.',
-              ...(overlayMapping ? ['Main image replaced with the selected overlay.'] : [])
+              ...(overlayMappings?.length ? ['Main image badged; all images moved to eBay hosting.'] : []),
+              ...(photoList.replaced
+                ? ['Saved image list was out of date — replaced with the current Amazon images.']
+                : [])
             ],
             errors: []
           };
@@ -4667,8 +4708,13 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
           const generatedSKU = generateSKUFromASIN(asin);
 
           const amazonData = await fetchAmazonData(asin, region, { forceRefresh: true });
-          const { mapping: overlayMapping } = await applyBatchOverlay(amazonData, overlayContext);
+          const { data: stagedData, mappings: overlayMappings } = await applyBatchOverlay(amazonData, overlayContext);
           const pricingCalculation = calculatePricingOnly(asin, amazonData.price, pricingConfig);
+          const photoList = resolveSavedImageList(
+            existingListing.itemPhotoUrl,
+            overlayMappings,
+            Array.isArray(stagedData?.images) ? stagedData.images : null
+          );
 
           return {
             asin,
@@ -4676,11 +4722,11 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
             autoFilledData: {
               coreFields: {
                 title: existingListing.title,
-                // Saved fields reused as-is; swap the badge in directly.
-                description: applyOverlayMapping(existingListing.description, overlayMapping),
+                // Saved fields reused as-is; swap the hosted images in directly.
+                description: applyOverlayMapping(existingListing.description, overlayMappings),
                 startPrice: pricingCalculation?.calculatedStartPrice ?? existingListing.startPrice,
                 quantity: existingListing.quantity,
-                itemPhotoUrl: applyOverlayMapping(existingListing.itemPhotoUrl || '', overlayMapping),
+                itemPhotoUrl: photoList.value,
                 conditionId: existingListing.conditionId || '',
                 format: existingListing.format || '',
                 duration: existingListing.duration || '',
@@ -4702,7 +4748,10 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
               existingListing.duplicateCount > 0
                 ? `Previously updated ${existingListing.duplicateCount} time(s).`
                 : `First time editing this ASIN.`,
-              ...(overlayMapping ? ['Main image replaced with the selected overlay.'] : [])
+              ...(overlayMappings?.length ? ['Main image badged; all images moved to eBay hosting.'] : []),
+              ...(photoList.replaced
+                ? ['Saved image list was out of date — replaced with the current Amazon images.']
+                : [])
             ]
           };
         }

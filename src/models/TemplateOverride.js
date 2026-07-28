@@ -182,6 +182,10 @@ const overlayOptionSchema = new mongoose.Schema({
     default: 0.015,
     min: 0,
     max: 0.2
+  },
+  isDefault: {
+    type: Boolean,
+    default: false
   }
 }, { _id: false });
 

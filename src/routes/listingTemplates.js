@@ -33,6 +33,14 @@ function validateOverlayOptions(overlayOptions) {
     }
   }
 
+  // The default is what every ASIN-add path falls back to, so two of them would
+  // make the applied badge depend on array order — silently, and differently
+  // after any edit that reorders the list.
+  const defaults = overlayOptions.filter(option => option?.isDefault);
+  if (defaults.length > 1) {
+    return `Only one overlay badge can be the default (got ${defaults.map(o => o.badgeKey).join(', ')})`;
+  }
+
   return null;
 }
 
