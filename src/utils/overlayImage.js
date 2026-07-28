@@ -31,6 +31,12 @@ import { compositeBadge, normalizeForUpload, normalizePlacement } from './overla
 const PLAIN_BADGE = { key: '__plain__', version: 0 };
 const PLAIN_PLACEMENT = { scale: 0, anchor: 'none', margin: 0 };
 
+// What a batch sends to say "no overlay on this one", as opposed to saying
+// nothing and inheriting the template default. Any string works as long as the
+// badge registry can never contain it; 'none' reads clearly in a URL and in a
+// log line. Asserted against the registry in the tests.
+export const NO_OVERLAY = 'none';
+
 // Anything already on eBay's CDN has been through here before. Guards against
 // double-badging on re-preview and duplicate-update flows.
 const HOSTED_PATTERN = /(^|\.)ebayimg\.com/i;
@@ -261,33 +267,33 @@ export async function uploadBufferToEbayPictureService(token, buffer, fileName) 
 }
 
 /**
- * Resolve a caller-supplied badge key against a template's configured options.
- *
- * The key arrives as a query parameter, so it is only honoured when the
- * template actually offers it — otherwise any client could pick any badge.
- *
- * @param {object} template - effective template (may carry overlayOptions)
- * @param {string} badgeKey - requested badge key ('' / null means no overlay)
- * @returns {{badge: object, placement: object}|null}
- */
-/**
  * Decide which badge a batch should use.
  *
- * An explicitly requested badge always wins. Otherwise the template's default
- * fills the gap, which is what lets entry points with no picker of their own
- * still badge their listings — whether a template badges at all is configured
- * once in Manage Templates rather than chosen per batch.
+ * Three inputs, three different meanings, and they must not collapse into each
+ * other:
+ *
+ *   'case-only'  an explicit choice, which always wins
+ *   NO_OVERLAY   an explicit refusal, which beats the template default
+ *   '' / null    no opinion, so the template default fills the gap
+ *
+ * The default is what lets entry points with no picker of their own — the ASIN
+ * List page's directory stream — badge their listings at all, so "no opinion"
+ * has to mean "use the default". That is exactly why the refusal needs its own
+ * value: without one, a lister choosing "None" in the picker is indistinguish-
+ * able from a lister who never opened it, and the default badges the batch
+ * anyway.
  *
  * Returns the key only; it is still checked against the template's allowlist by
  * resolveTemplateOverlay(). A default is stored as a flag on an existing
  * overlayOption, so it is always in that allowlist by construction.
  *
  * @param {object} template - effective template (may carry overlayOptions)
- * @param {string} badgeKey - explicitly requested badge, if any
- * @returns {{badgeKey: string, usingDefault: boolean}}
+ * @param {string} badgeKey - explicitly requested badge, NO_OVERLAY, or nothing
+ * @returns {{badgeKey: string, usingDefault: boolean, optedOut: boolean}}
  */
 export function resolveEffectiveBadgeKey(template, badgeKey) {
-  if (badgeKey) return { badgeKey, usingDefault: false };
+  if (badgeKey === NO_OVERLAY) return { badgeKey: '', usingDefault: false, optedOut: true };
+  if (badgeKey) return { badgeKey, usingDefault: false, optedOut: false };
 
   const options = Array.isArray(template?.overlayOptions) ? template.overlayOptions : [];
   // First wins if somehow several are flagged. The save-time validation rejects
@@ -298,9 +304,20 @@ export function resolveEffectiveBadgeKey(template, badgeKey) {
   return {
     badgeKey: defaultOption?.badgeKey || '',
     usingDefault: Boolean(defaultOption?.badgeKey),
+    optedOut: false,
   };
 }
 
+/**
+ * Resolve a caller-supplied badge key against a template's configured options.
+ *
+ * The key arrives as a query parameter, so it is only honoured when the
+ * template actually offers it — otherwise any client could pick any badge.
+ *
+ * @param {object} template - effective template (may carry overlayOptions)
+ * @param {string} badgeKey - requested badge key ('' / null means no overlay)
+ * @returns {{badge: object, placement: object}|null}
+ */
 export function resolveTemplateOverlay(template, badgeKey) {
   if (!badgeKey) return null;
 

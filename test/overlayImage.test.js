@@ -6,6 +6,7 @@ import {
   buildOverlayResult,
   hostsAreUniform,
   isAlreadyOverlaid,
+  NO_OVERLAY,
   replaceImages,
   resolveEffectiveBadgeKey,
   resolveSavedImageList,
@@ -137,9 +138,11 @@ test('the template default is used when a batch names no badge', () => {
     ],
   };
 
-  assert.deepEqual(resolveEffectiveBadgeKey(template, ''), { badgeKey: 'case-only', usingDefault: true });
-  assert.deepEqual(resolveEffectiveBadgeKey(template, null), { badgeKey: 'case-only', usingDefault: true });
-  assert.deepEqual(resolveEffectiveBadgeKey(template, undefined), { badgeKey: 'case-only', usingDefault: true });
+  const expected = { badgeKey: 'case-only', usingDefault: true, optedOut: false };
+
+  assert.deepEqual(resolveEffectiveBadgeKey(template, ''), expected);
+  assert.deepEqual(resolveEffectiveBadgeKey(template, null), expected);
+  assert.deepEqual(resolveEffectiveBadgeKey(template, undefined), expected);
 });
 
 test('an explicitly requested badge beats the default', () => {
@@ -148,6 +151,7 @@ test('an explicitly requested badge beats the default', () => {
   assert.deepEqual(resolveEffectiveBadgeKey(template, 'other-badge'), {
     badgeKey: 'other-badge',
     usingDefault: false,
+    optedOut: false,
   });
 });
 
@@ -155,11 +159,57 @@ test('no default means no overlay, which is how it is switched off', () => {
   // Unchecking the box in Manage Templates has to actually stop the badge,
   // even though the badge is still offered by the template.
   const offeredButNotDefault = { overlayOptions: [{ badgeKey: 'case-only', isDefault: false }] };
+  const off = { badgeKey: '', usingDefault: false, optedOut: false };
 
-  assert.deepEqual(resolveEffectiveBadgeKey(offeredButNotDefault, ''), { badgeKey: '', usingDefault: false });
-  assert.deepEqual(resolveEffectiveBadgeKey({ overlayOptions: [] }, ''), { badgeKey: '', usingDefault: false });
-  assert.deepEqual(resolveEffectiveBadgeKey({}, ''), { badgeKey: '', usingDefault: false });
-  assert.deepEqual(resolveEffectiveBadgeKey(null, ''), { badgeKey: '', usingDefault: false });
+  assert.deepEqual(resolveEffectiveBadgeKey(offeredButNotDefault, ''), off);
+  assert.deepEqual(resolveEffectiveBadgeKey({ overlayOptions: [] }, ''), off);
+  assert.deepEqual(resolveEffectiveBadgeKey({}, ''), off);
+  assert.deepEqual(resolveEffectiveBadgeKey(null, ''), off);
+});
+
+// ── Opting a single batch out ────────────────────────────────────────────────
+// The default has to be overridable per batch: a template whose badge suits
+// most of its ASINs but not this batch's needs a way to say so. "Said nothing"
+// and "said no" cannot be the same value, or the picker's None option silently
+// badges the batch anyway — which is what it did before NO_OVERLAY existed.
+
+test('an explicit opt-out beats the template default', () => {
+  const template = { overlayOptions: [{ badgeKey: 'case-only', isDefault: true }] };
+
+  assert.deepEqual(resolveEffectiveBadgeKey(template, NO_OVERLAY), {
+    badgeKey: '',
+    usingDefault: false,
+    optedOut: true,
+  });
+});
+
+test('opting out is distinguishable from saying nothing', () => {
+  // The whole point of the sentinel. If these two ever return the same thing,
+  // the batch picker has no way to express "not on this batch".
+  const template = { overlayOptions: [{ badgeKey: 'case-only', isDefault: true }] };
+
+  const silent = resolveEffectiveBadgeKey(template, '');
+  const refused = resolveEffectiveBadgeKey(template, NO_OVERLAY);
+
+  assert.equal(silent.badgeKey, 'case-only');
+  assert.equal(refused.badgeKey, '');
+  assert.equal(refused.optedOut, true);
+  assert.equal(silent.optedOut, false);
+});
+
+test('opting out is harmless on a template with no default', () => {
+  assert.deepEqual(resolveEffectiveBadgeKey({ overlayOptions: [] }, NO_OVERLAY), {
+    badgeKey: '',
+    usingDefault: false,
+    optedOut: true,
+  });
+});
+
+test('the opt-out sentinel can never collide with a real badge', () => {
+  // NO_OVERLAY is only safe because no badge is named it. If one ever were,
+  // selecting that badge would silently mean "no overlay" instead.
+  assert.equal(resolveBadge(NO_OVERLAY), null);
+  assert.equal(listBadges().some(badge => badge.key === NO_OVERLAY), false);
 });
 
 test('a default flagged on an option with no badgeKey is ignored', () => {

@@ -215,17 +215,31 @@ function buildAmazonSourceData(amazonData) {
  * having to plumb a parameter through. Whether a template badges its listings
  * is decided once, in Manage Templates, rather than per batch.
  *
- * Returns null whenever the overlay can't be applied — no badge requested and
- * no default, unknown badge, badge not enabled on the template, or no usable
- * seller token — so the preview runs exactly as it did before rather than
- * failing.
+ * A batch that wants no overlay despite the default says so with NO_OVERLAY.
+ * The batch picker needs that: a template whose default badge suits most of its
+ * ASINs but not this batch's has no other way to say so.
+ *
+ * Returns null whenever the overlay can't be applied — opted out, no badge
+ * requested and no default, unknown badge, badge not enabled on the template,
+ * or no usable seller token — so the preview runs exactly as it did before
+ * rather than failing.
  */
 async function prepareOverlayContext(template, seller, badgeKey, source = 'listing') {
-  const { badgeKey: effectiveKey, usingDefault } = resolveEffectiveBadgeKey(template, badgeKey);
+  const { badgeKey: effectiveKey, usingDefault, optedOut } = resolveEffectiveBadgeKey(template, badgeKey);
 
   // Log every outcome, including "nothing requested". An overlay that quietly
   // doesn't apply looks identical to one that was never asked for, and the CSV
   // only reveals it after export.
+  //
+  // Opting out is logged apart from the rest precisely because it isn't a
+  // problem — routing it through the "unavailable" warning below would put a
+  // misconfiguration-shaped line in the log every time someone deliberately
+  // turned the badge off, and this log is how overlay problems get diagnosed.
+  if (optedOut) {
+    console.log(`🏷️ [${source}] Overlay turned off for this batch`);
+    return null;
+  }
+
   if (!effectiveKey) {
     console.log(`🏷️ [${source}] No overlay requested and no template default`);
     return null;
@@ -2862,6 +2876,8 @@ router.get('/analytics', requireAuth, async (req, res) => {
  *           Overlay badge composited onto each ASIN's primary image for this batch.
  *           Must be one of the template's configured `overlayOptions`; an unknown or
  *           disabled key is ignored and the preview runs without an overlay.
+ *           Omit to use the template's default badge, if it has one. Send `none`
+ *           to suppress the overlay for this batch even when a default is set.
  *         example: case-only
  *       - in: query
  *         name: token
