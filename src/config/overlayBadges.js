@@ -14,8 +14,29 @@ import path from 'path';
 const BADGES = {
   'case-only': {
     key: 'case-only',
-    label: 'Case Only — Phone Not Included',
+    label: 'Case Only — Phone Not Included (Red)',
     file: 'case-only-overlay.png',
+    version: 1,
+  },
+  
+  'watch-strap-text': {
+    key: 'watch-strap-text',
+    label: 'watch-strap-text',
+    file: 'watch-strap-text.png',
+    version: 1,
+  },
+
+  'watch-case-text': {
+    key: 'watch-case-text',
+    label: 'watch-case-text',
+    file: 'watch-case-text.png',
+    version: 1,
+  },
+
+   'phone-case-text': {
+    key: 'phone-case-text',
+    label: 'phone-case-text',
+    file: 'phone-case-text.png',
     version: 1,
   },
 };
