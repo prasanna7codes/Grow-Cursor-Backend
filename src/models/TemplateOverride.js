@@ -154,6 +154,41 @@ const pricingConfigSchema = new mongoose.Schema({
   }
 }, { _id: false });
 
+// Mirrors overlayOptionSchema in ListingTemplate.js — kept in sync by hand, as
+// with the other schemas duplicated in this file.
+const overlayOptionSchema = new mongoose.Schema({
+  badgeKey: {
+    type: String,
+    required: true,
+    trim: true
+  },
+  label: {
+    type: String,
+    default: ''
+  },
+  scale: {
+    type: Number,
+    default: 0.26,
+    min: 0.05,
+    max: 1
+  },
+  anchor: {
+    type: String,
+    enum: ['bottom-right', 'bottom-left', 'top-right', 'top-left'],
+    default: 'bottom-right'
+  },
+  margin: {
+    type: Number,
+    default: 0.015,
+    min: 0,
+    max: 0.2
+  },
+  isDefault: {
+    type: Boolean,
+    default: false
+  }
+}, { _id: false });
+
 /**
  * Template Override Model
  * Stores seller-specific customizations on top of base templates
@@ -182,7 +217,8 @@ const templateOverrideSchema = new mongoose.Schema({
     asinAutomation: { type: Boolean, default: false },
     pricingConfig: { type: Boolean, default: false },
     coreFieldDefaults: { type: Boolean, default: false },
-    customActionField: { type: Boolean, default: false }
+    customActionField: { type: Boolean, default: false },
+    overlayOptions: { type: Boolean, default: false }
   },
   
   // Seller-specific customizations (only populated if overridden)
@@ -201,6 +237,11 @@ const templateOverrideSchema = new mongoose.Schema({
     default: undefined
   },
   
+  overlayOptions: {
+    type: [overlayOptionSchema],
+    default: undefined
+  },
+
   coreFieldDefaults: {
     type: mongoose.Schema.Types.Mixed,
     default: undefined

@@ -11,6 +11,8 @@ import { calculateStartPrice } from '../utils/pricingCalculator.js';
 import { generateWithGemini } from '../utils/gemini.js';
 import { generateSKUFromASIN, generateSKUWithCount } from '../utils/skuGenerator.js';
 import { getEffectiveTemplate } from '../utils/templateMerger.js';
+import { applyOverlayMapping, resolveEffectiveBadgeKey, resolveSavedImageList, resolveTemplateOverlay, withOverlaidImages } from '../utils/overlayImage.js';
+import { ensureValidToken } from './ebay.js';
 import { getUsageStats, getFieldExtractionStats, getRecentErrors, checkQuotaStatus } from '../utils/apiUsageTracker.js';
 import { getAsinCacheStats, clearAsinCache, invalidateAsinCache } from '../utils/asinCache.js';
 import AsinDirectory from '../models/AsinDirectory.js';
@@ -201,6 +203,75 @@ function buildAmazonSourceData(amazonData) {
     compatibility: amazonData.compatibility,
     productInfo: amazonData.productInfo || null
   };
+}
+
+/**
+ * Resolve the overlay badge for a batch, plus the eBay token needed to host the
+ * composites, once per request instead of once per ASIN.
+ *
+ * When the caller doesn't name a badge, the template's default is used. That is
+ * what lets paths with no picker of their own — the ASIN List page's directory
+ * stream, and any future entry point — apply the overlay without each one
+ * having to plumb a parameter through. Whether a template badges its listings
+ * is decided once, in Manage Templates, rather than per batch.
+ *
+ * A batch that wants no overlay despite the default says so with NO_OVERLAY.
+ * The batch picker needs that: a template whose default badge suits most of its
+ * ASINs but not this batch's has no other way to say so.
+ *
+ * Returns null whenever the overlay can't be applied — opted out, no badge
+ * requested and no default, unknown badge, badge not enabled on the template,
+ * or no usable seller token — so the preview runs exactly as it did before
+ * rather than failing.
+ */
+async function prepareOverlayContext(template, seller, badgeKey, source = 'listing') {
+  const { badgeKey: effectiveKey, usingDefault, optedOut } = resolveEffectiveBadgeKey(template, badgeKey);
+
+  // Log every outcome, including "nothing requested". An overlay that quietly
+  // doesn't apply looks identical to one that was never asked for, and the CSV
+  // only reveals it after export.
+  //
+  // Opting out is logged apart from the rest precisely because it isn't a
+  // problem — routing it through the "unavailable" warning below would put a
+  // misconfiguration-shaped line in the log every time someone deliberately
+  // turned the badge off, and this log is how overlay problems get diagnosed.
+  if (optedOut) {
+    console.log(`🏷️ [${source}] Overlay turned off for this batch`);
+    return null;
+  }
+
+  if (!effectiveKey) {
+    console.log(`🏷️ [${source}] No overlay requested and no template default`);
+    return null;
+  }
+
+  const overlay = resolveTemplateOverlay(template, effectiveKey);
+  if (!overlay) {
+    console.warn(`🏷️ [${source}] Overlay "${effectiveKey}" unavailable (not enabled on this template, or not registered) — continuing without it`);
+    return null;
+  }
+
+  try {
+    const token = await ensureValidToken(seller);
+    console.log(`🏷️ [${source}] Overlay "${effectiveKey}"${usingDefault ? ' (template default)' : ''} active (${Math.round(overlay.placement.scale * 100)}% ${overlay.placement.anchor})`);
+    return { overlay, ctx: { sellerId: seller._id, token } };
+  } catch (error) {
+    console.error(`🏷️ [${source}] Overlay "${effectiveKey}" skipped — no eBay token for seller ${seller._id}: ${error.message}`);
+    return null;
+  }
+}
+
+/**
+ * Apply the batch's overlay to amazonData's images, if one is active. Badges
+ * the primary and moves every image onto eBay Picture Services, since eBay
+ * rejects listings that mix its own hosted pictures with external URLs.
+ *
+ * Always returns a usable object — never throws — so a badge failure can't
+ * take down a preview.
+ */
+async function applyBatchOverlay(amazonData, overlayContext) {
+  if (!overlayContext) return { data: amazonData, applied: false };
+  return withOverlaidImages(amazonData, overlayContext.overlay, overlayContext.ctx);
 }
 
 function calculatePricingOnly(asin, amazonPrice, pricingConfig) {
@@ -2799,6 +2870,16 @@ router.get('/analytics', requireAuth, async (req, res) => {
  *         schema: { type: string, default: US }
  *         description: Amazon marketplace region
  *       - in: query
+ *         name: overlayBadgeId
+ *         schema: { type: string }
+ *         description: >
+ *           Overlay badge composited onto each ASIN's primary image for this batch.
+ *           Must be one of the template's configured `overlayOptions`; an unknown or
+ *           disabled key is ignored and the preview runs without an overlay.
+ *           Omit to use the template's default badge, if it has one. Send `none`
+ *           to suppress the overlay for this batch even when a default is set.
+ *         example: case-only
+ *       - in: query
  *         name: token
  *         schema: { type: string }
  *         description: JWT token (used instead of Authorization header for EventSource)
@@ -2819,6 +2900,9 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
   try {
     const { templateId, sellerId, asins: asinsParam, region = 'US' } = req.query;
     const preferCachedAmazonData = req.query.preferCachedAmazonData === 'true';
+    // Overlay badge chosen by the user for this batch. Validated against the
+    // template's overlayOptions before it can reach the filesystem.
+    const overlayBadgeId = typeof req.query.overlayBadgeId === 'string' ? req.query.overlayBadgeId : '';
 
     if (!templateId || !sellerId || !asinsParam) {
       return res.status(400).json({ error: 'Template ID, Seller ID, and ASINs are required' });
@@ -2887,6 +2971,8 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
       pricingConfig = sellerConfig.pricingConfig;
     }
     const aiRunContext = createAiRunContext('bulk-preview-stream');
+
+    const overlayContext = await prepareOverlayContext(template, seller, overlayBadgeId, 'bulk-preview-stream');
 
     // Check for existing ASINs and SKUs (same as bulk-preview)
     const existingAsinListings = await TemplateListing.find({
@@ -2965,6 +3051,8 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
           let sourceData = null;
           let pricingCalculation = null;
           let freshAmazonSourcePrice = null;
+          let overlayMappings = null;
+          let overlayHostedImages = null;
           let duplicateImages = Array.isArray(asinDoc?.images) ? asinDoc.images : [];
           const needsLiveAmazonData = true;
 
@@ -2974,8 +3062,13 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
               console.log(`[duplicate_updateable] Fetching fresh Amazon data for ${asin}`);
               const amazonData = await fetchAmazonData(asin, region, { forceRefresh: !preferCachedAmazonData });
               if (amazonData) {
-                duplicateImages = Array.isArray(amazonData.images) ? amazonData.images : duplicateImages;
-                sourceData = buildAmazonSourceData(amazonData);
+                // Same badge as the new-listing path, so a re-listed ASIN's
+                // preview matches what a first-time listing would produce.
+                const { data: stagedData, mappings } = await applyBatchOverlay(amazonData, overlayContext);
+                overlayMappings = mappings || null;
+                overlayHostedImages = Array.isArray(stagedData.images) ? stagedData.images : null;
+                duplicateImages = Array.isArray(stagedData.images) ? stagedData.images : duplicateImages;
+                sourceData = buildAmazonSourceData(stagedData);
                 sendSse({
                   type: 'amazon_loaded',
                   asin,
@@ -2995,6 +3088,7 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
           // Return existing listing data for editing (generatedListing = user's current saved data)
           // _amazonSourcePrice is included so the save endpoint stores it automatically
           const freshStartPrice = pricingCalculation?.calculatedStartPrice ?? existingListing.startPrice;
+          const photoList = resolveSavedImageList(existingListing.itemPhotoUrl, overlayMappings, overlayHostedImages);
           const item = {
             id: `preview-${asin}`,
             asin,
@@ -3004,10 +3098,13 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
             pricingCalculation,
             generatedListing: {
               title: existingListing.title,
-              description: existingListing.description,
+              // The saved fields are reused verbatim for editing, so the hosted
+              // images have to be swapped into them directly — otherwise the
+              // modal previews badged images while saving the original URLs.
+              description: applyOverlayMapping(existingListing.description, overlayMappings),
               startPrice: freshStartPrice,
               quantity: existingListing.quantity,
-              itemPhotoUrl: existingListing.itemPhotoUrl || '',
+              itemPhotoUrl: photoList.value,
               conditionId: existingListing.conditionId || '',
               format: existingListing.format || '',
               duration: existingListing.duration || '',
@@ -3025,7 +3122,12 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
               `This ASIN already exists in this template.`,
               existingListing.duplicateCount > 0
                 ? `Previously updated ${existingListing.duplicateCount} time(s).`
-                : `First time editing this ASIN.`
+                : `First time editing this ASIN.`,
+              // Rewriting a saved listing's images should never be silent.
+              ...(overlayMappings?.length ? ['Main image badged; all images moved to eBay hosting.'] : []),
+              ...(photoList.replaced
+                ? ['Saved image list was out of date — replaced with the current Amazon images.']
+                : [])
             ],
             errors: []
           };
@@ -3056,16 +3158,22 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
 
         // Fetch and process ASIN (new listing case)
         const amazonData = await fetchAmazonData(asin, region);
-        const sourceData = buildAmazonSourceData(amazonData);
+        // Badge the primary image before anything reads images[0]: one swap
+        // covers itemPhotoUrl, {image_main} in the description, and the modal.
+        const overlayResult = await applyBatchOverlay(amazonData, overlayContext);
+        const stagedData = overlayResult.data;
+        const sourceData = buildAmazonSourceData(stagedData);
         sendSse({
           type: 'amazon_loaded',
           asin,
           id: `preview-${asin}`,
           sourceData,
+          overlayApplied: overlayResult.applied,
+          overlayWarning: overlayResult.warning || null,
           progressStage: 'generating'
         });
         const { coreFields, customFields, pricingCalculation } =
-          await applyFieldConfigs(amazonData, template.asinAutomation.fieldConfigs, pricingConfig, buildAiUsageContext(req, templateId, sellerId, aiRunContext));
+          await applyFieldConfigs(stagedData, template.asinAutomation.fieldConfigs, pricingConfig, buildAiUsageContext(req, templateId, sellerId, aiRunContext));
 
         const mergedCoreFields = {
           ...(template.coreFieldDefaults || {}),
@@ -3180,6 +3288,13 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
  *         description: Comma-separated ASIN list (max 100)
  *         example: "B01N5IB20Q,B07K1RZWMC"
  *       - in: query
+ *         name: overlayBadgeId
+ *         schema: { type: string }
+ *         description: >
+ *           Overlay badge composited onto each ASIN's primary image for this batch.
+ *           Must be one of the template's configured `overlayOptions`.
+ *         example: case-only
+ *       - in: query
  *         name: token
  *         schema: { type: string }
  *         description: JWT token (used instead of Authorization header for EventSource)
@@ -3199,6 +3314,7 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
 router.get('/bulk-preview-from-directory-stream', requireAuthSSE, async (req, res) => {
   try {
     const { templateId, sellerId, asins: asinsParam } = req.query;
+    const overlayBadgeId = typeof req.query.overlayBadgeId === 'string' ? req.query.overlayBadgeId : '';
 
     if (!templateId || !sellerId || !asinsParam) {
       return res.status(400).json({ error: 'Template ID, Seller ID, and ASINs are required' });
@@ -3243,6 +3359,8 @@ router.get('/bulk-preview-from-directory-stream', requireAuthSSE, async (req, re
     if (sellerConfig) {
       pricingConfig = sellerConfig.pricingConfig;
     }
+
+    const overlayContext = await prepareOverlayContext(template, seller, overlayBadgeId, 'directory-stream');
 
     // Check for existing ASINs and SKU conflicts
     const existingAsinListings = await TemplateListing.find({
@@ -3302,16 +3420,22 @@ router.get('/bulk-preview-from-directory-stream', requireAuthSSE, async (req, re
 
           let sourceData = null;
           let pricingCalculation = null;
+          let overlayMappings = null;
+          let overlayHostedImages = null;
 
           try {
             const amazonData = await fetchAmazonData(asin, region, { forceRefresh: true });
-            sourceData = buildAmazonSourceData(amazonData);
+            const { data: stagedData, mappings } = await applyBatchOverlay(amazonData, overlayContext);
+            overlayMappings = mappings || null;
+            overlayHostedImages = Array.isArray(stagedData.images) ? stagedData.images : null;
+            sourceData = buildAmazonSourceData(stagedData);
             pricingCalculation = calculatePricingOnly(asin, amazonData.price, pricingConfig);
           } catch (fetchErr) {
             console.warn(`[directory duplicate_updateable] Fresh ScraperAPI fetch failed for ${asin}:`, fetchErr.message);
           }
 
           const freshStartPrice = pricingCalculation?.calculatedStartPrice ?? existingListing.startPrice;
+          const photoList = resolveSavedImageList(existingListing.itemPhotoUrl, overlayMappings, overlayHostedImages);
 
           const item = {
             id: `preview-${asin}`, asin,
@@ -3321,10 +3445,13 @@ router.get('/bulk-preview-from-directory-stream', requireAuthSSE, async (req, re
             pricingCalculation,
             generatedListing: {
               title: existingListing.title,
-              description: existingListing.description,
+              // See the bulk-preview-stream duplicate branch: saved fields are
+              // reused as-is, so the hosted images are swapped in rather than
+              // regenerated.
+              description: applyOverlayMapping(existingListing.description, overlayMappings),
               startPrice: freshStartPrice,
               quantity: existingListing.quantity,
-              itemPhotoUrl: existingListing.itemPhotoUrl || '',
+              itemPhotoUrl: photoList.value,
               conditionId: existingListing.conditionId || '',
               format: existingListing.format || '',
               duration: existingListing.duration || '',
@@ -3339,7 +3466,11 @@ router.get('/bulk-preview-from-directory-stream', requireAuthSSE, async (req, re
               'This ASIN already exists in this template.',
               existingListing.duplicateCount > 0
                 ? `Previously updated ${existingListing.duplicateCount} time(s).`
-                : 'First time editing this ASIN.'
+                : 'First time editing this ASIN.',
+              ...(overlayMappings?.length ? ['Main image badged; all images moved to eBay hosting.'] : []),
+              ...(photoList.replaced
+                ? ['Saved image list was out of date — replaced with the current Amazon images.']
+                : [])
             ],
             errors: []
           };
@@ -3387,8 +3518,9 @@ router.get('/bulk-preview-from-directory-stream', requireAuthSSE, async (req, re
         };
 
         res.write(`data: ${JSON.stringify({ type: 'progress', id: `preview-${asin}`, stage: 'generating' })}\n\n`);
+        const { data: stagedData } = await applyBatchOverlay(amazonData, overlayContext);
         const { coreFields, customFields, pricingCalculation } =
-          await applyFieldConfigs(amazonData, template.asinAutomation.fieldConfigs, pricingConfig, buildAiUsageContext(req, templateId, sellerId, aiRunContext));
+          await applyFieldConfigs(stagedData, template.asinAutomation.fieldConfigs, pricingConfig, buildAiUsageContext(req, templateId, sellerId, aiRunContext));
 
         const mergedCoreFields = {
           ...(template.coreFieldDefaults || {}),
@@ -4300,7 +4432,7 @@ router.delete('/:id', requireAuth, async (req, res) => {
 // ASIN Autofill endpoint
 router.post('/autofill-from-asin', requireAuth, async (req, res) => {
   try {
-    const { asin, templateId, sellerId, region = 'US' } = req.body;
+    const { asin, templateId, sellerId, region = 'US', overlayBadgeId = '' } = req.body;
 
     if (!asin || !templateId) {
       return res.status(400).json({
@@ -4337,11 +4469,17 @@ router.post('/autofill-from-asin', requireAuth, async (req, res) => {
     console.log(`Fetching Amazon data for ASIN: ${asin} (${region})`);
     const amazonData = await fetchAmazonData(asin, region);
 
+    // 2.5. Badge the primary image. Needs a seller for the eBay picture upload,
+    // so an autofill without sellerId simply keeps the original image.
+    const seller = sellerId ? await Seller.findById(sellerId) : null;
+    const overlayContext = seller ? await prepareOverlayContext(template, seller, overlayBadgeId, 'autofill-single') : null;
+    const { data: stagedData, applied: overlayApplied } = await applyBatchOverlay(amazonData, overlayContext);
+
     // 3. Apply field configurations (AI + direct mappings)
     console.log(`Processing ${template.asinAutomation.fieldConfigs.length} field configs`);
     const aiRunContext = createAiRunContext('autofill-single');
     const { coreFields, customFields, pricingCalculation } = await applyFieldConfigs(
-      amazonData,
+      stagedData,
       template.asinAutomation.fieldConfigs,
       pricingConfig,  // Use seller-specific or template default pricing config
       buildAiUsageContext(req, templateId, sellerId, aiRunContext)
@@ -4355,6 +4493,7 @@ router.post('/autofill-from-asin', requireAuth, async (req, res) => {
         coreFields,
         customFields
       },
+      overlayApplied,
       amazonSource: {
         title: amazonData.title,
         brand: amazonData.brand,
@@ -4429,7 +4568,7 @@ router.post('/autofill-from-asin', requireAuth, async (req, res) => {
 // Bulk auto-fill from multiple ASINs
 router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
   try {
-    const { asins, templateId, sellerId, region = 'US' } = req.body;
+    const { asins, templateId, sellerId, region = 'US', overlayBadgeId = '' } = req.body;
 
     if (!asins || !Array.isArray(asins) || asins.length === 0) {
       return res.status(400).json({
@@ -4507,6 +4646,9 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
     console.log(`Found ${existingInCurrentTemplate.size} ASINs in current template (will update)`);
     console.log(`Found ${existingInOtherTemplates.size} ASINs in other templates (will block)\n`);
 
+    const overlaySeller = await Seller.findById(sellerId);
+    const overlayContext = overlaySeller ? await prepareOverlayContext(template, overlaySeller, overlayBadgeId, 'bulk-autofill') : null;
+
     // Pre-generate all SKUs and check for collisions with existing SKUs
     const generatedSKUs = cleanedAsins.map(asin => ({
       asin,
@@ -4566,7 +4708,13 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
           const generatedSKU = generateSKUFromASIN(asin);
 
           const amazonData = await fetchAmazonData(asin, region, { forceRefresh: true });
+          const { data: stagedData, mappings: overlayMappings } = await applyBatchOverlay(amazonData, overlayContext);
           const pricingCalculation = calculatePricingOnly(asin, amazonData.price, pricingConfig);
+          const photoList = resolveSavedImageList(
+            existingListing.itemPhotoUrl,
+            overlayMappings,
+            Array.isArray(stagedData?.images) ? stagedData.images : null
+          );
 
           return {
             asin,
@@ -4574,10 +4722,11 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
             autoFilledData: {
               coreFields: {
                 title: existingListing.title,
-                description: existingListing.description,
+                // Saved fields reused as-is; swap the hosted images in directly.
+                description: applyOverlayMapping(existingListing.description, overlayMappings),
                 startPrice: pricingCalculation?.calculatedStartPrice ?? existingListing.startPrice,
                 quantity: existingListing.quantity,
-                itemPhotoUrl: existingListing.itemPhotoUrl || '',
+                itemPhotoUrl: photoList.value,
                 conditionId: existingListing.conditionId || '',
                 format: existingListing.format || '',
                 duration: existingListing.duration || '',
@@ -4598,7 +4747,11 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
               `This ASIN already exists in this template.`,
               existingListing.duplicateCount > 0
                 ? `Previously updated ${existingListing.duplicateCount} time(s).`
-                : `First time editing this ASIN.`
+                : `First time editing this ASIN.`,
+              ...(overlayMappings?.length ? ['Main image badged; all images moved to eBay hosting.'] : []),
+              ...(photoList.replaced
+                ? ['Saved image list was out of date — replaced with the current Amazon images.']
+                : [])
             ]
           };
         }
@@ -4622,10 +4775,11 @@ router.post('/bulk-autofill-from-asins', requireAuth, async (req, res) => {
         try {
           // Fetch Amazon data
           const amazonData = await fetchAmazonData(asin, region);
+          const { data: stagedData } = await applyBatchOverlay(amazonData, overlayContext);
 
           // Apply field configurations
           const { coreFields, customFields, pricingCalculation } = await applyFieldConfigs(
-            amazonData,
+            stagedData,
             template.asinAutomation.fieldConfigs,
             pricingConfig,  // Use seller-specific or template default pricing config
             buildAiUsageContext(req, templateId, sellerId, aiRunContext)
@@ -5190,7 +5344,7 @@ router.post('/bulk-create', requireAuth, async (req, res) => {
 // Bulk preview: Process ASINs and return preview data (no save to database)
 router.post('/bulk-preview', requireAuth, async (req, res) => {
   try {
-    const { templateId, sellerId, asins, region = 'US' } = req.body;
+    const { templateId, sellerId, asins, region = 'US', overlayBadgeId = '' } = req.body;
 
     if (!templateId) {
       return res.status(400).json({ error: 'Template ID is required' });
@@ -5330,6 +5484,7 @@ router.post('/bulk-preview', requireAuth, async (req, res) => {
     console.log(`🚀 Processing ${asins.length} ASINs in parallel...`);
 
     const aiRunContext = createAiRunContext('bulk-preview');
+    const overlayContext = await prepareOverlayContext(template, seller, overlayBadgeId, 'bulk-preview');
 
     // Process ALL ASINs in parallel using Promise.allSettled
     const asinPromises = asins.map(async (asin) => {
@@ -5373,10 +5528,11 @@ router.post('/bulk-preview', requireAuth, async (req, res) => {
 
         // Fetch Amazon data
         const amazonData = await fetchAmazonData(asin, region);
+        const { data: stagedData } = await applyBatchOverlay(amazonData, overlayContext);
 
         // Apply field configurations
         const { coreFields, customFields, pricingCalculation } =
-          await applyFieldConfigs(amazonData, template.asinAutomation.fieldConfigs, pricingConfig, buildAiUsageContext(req, templateId, sellerId, aiRunContext));
+          await applyFieldConfigs(stagedData, template.asinAutomation.fieldConfigs, pricingConfig, buildAiUsageContext(req, templateId, sellerId, aiRunContext));
 
         // Apply template core field defaults as base layer (autofilled fields override these)
         const mergedCoreFields = {
