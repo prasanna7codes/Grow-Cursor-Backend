@@ -3822,7 +3822,11 @@ router.get('/precheck-stats', requireAuth, async (req, res) => {
 });
 
 // Get single listing by ID
-router.get('/:id', requireAuth, async (req, res) => {
+router.get('/:id', requireAuth, async (req, res, next) => {
+  // Literal single-segment GET routes registered after this one (e.g. /cache-stats)
+  // would otherwise be swallowed here and blow up on the ObjectId cast.
+  if (!mongoose.isValidObjectId(req.params.id)) return next();
+
   try {
     const listing = await TemplateListing.findById(req.params.id)
       .populate('createdBy', 'name email')

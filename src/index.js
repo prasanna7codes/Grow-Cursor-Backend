@@ -26,6 +26,7 @@ import assignmentsRouter from './routes/assignments.js';
 import compatibilityRoutes from './routes/compatibility.js';
 
 import ebayRoutes, { resumeRunningAutoCompatibilityBatches } from './routes/ebay.js';
+import unsoldListingsRoutes from './routes/unsoldListings.js';
 import bestOffersRoutes from './routes/bestOffers.js';
 import discountsRoutes from './routes/discounts.js';
 import sellersRoutes from './routes/sellers.js';
@@ -179,6 +180,7 @@ app.use('/api/assignments', assignmentsRouter);
 app.use('/api/compatibility', compatibilityRoutes);
 
 app.use('/api/ebay', ebayRoutes);
+app.use('/api/unsold-listings', unsoldListingsRoutes);
 app.use('/api/ebay', bestOffersRoutes);
 app.use('/api/ebay', discountsRoutes);
 app.use('/api/sellers', sellersRoutes);
