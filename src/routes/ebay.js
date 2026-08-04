@@ -42,6 +42,7 @@ import AsinListRange from '../models/AsinListRange.js';
 import AsinListProduct from '../models/AsinListProduct.js';
 import PriceChangeLog from '../models/PriceChangeLog.js';
 import PtRefreshLog from '../models/PtRefreshLog.js';
+import TemplateListing from '../models/TemplateListing.js';
 import OpenAI from 'openai';
 import {
   calculateOrderAmazonFinancials,
@@ -3406,6 +3407,112 @@ router.get('/order/:orderId', requireAuth, requirePageAccess('Fulfillment'), asy
 });
 
 
+// ── Amazon product link resolution (order SKU → ASIN → amazon.com/dp link) ───
+// Same source the Listings Database page reads: the TemplateListing row for the
+// SKU carries amazonLink, auto-generated from its ASIN reference. Order SKUs can
+// carry a variant suffix (GRW25ABCDE-1), so match on baseCustomLabel with the
+// case-insensitive collation, exactly like the Amazon Stock Check SKU lookup.
+const AMAZON_LINK_LOOKUP_CHUNK = 1000;
+
+function getBaseSkuLabel(value) {
+  return String(value || '').trim().split('-')[0].trim();
+}
+
+function isAmazonAsinValue(value) {
+  const cleaned = String(value || '').trim().toUpperCase();
+  return /^[A-Z0-9]{10}$/.test(cleaned) && cleaned.startsWith('B0');
+}
+
+function amazonLinkFromAsin(asin) {
+  return asin ? `https://www.amazon.com/dp/${asin}` : '';
+}
+
+// An order can hold its SKU on the order itself or per line item, under any of
+// the three casings the eBay payloads have used over time.
+function getOrderSkus(order) {
+  const skus = [];
+  if (Array.isArray(order?.lineItems)) {
+    for (const item of order.lineItems) {
+      const sku = String(item?.sku || item?.SKU || item?.sellerSku || '').trim();
+      if (sku) skus.push(sku);
+    }
+  }
+  const orderSku = String(order?.sku || '').trim();
+  if (orderSku) skus.push(orderSku);
+  return [...new Set(skus)];
+}
+
+async function buildAmazonLinkMapForOrders(orders) {
+  // base label -> every full order SKU that reduces to it
+  const skusByLabel = new Map();
+  for (const order of orders) {
+    for (const sku of getOrderSkus(order)) {
+      const label = getBaseSkuLabel(sku).toUpperCase();
+      if (!label) continue;
+      if (!skusByLabel.has(label)) skusByLabel.set(label, new Set());
+      skusByLabel.get(label).add(sku.trim().toUpperCase());
+    }
+  }
+
+  const linkByLabel = new Map();
+  const rememberRow = (row) => {
+    const label = getBaseSkuLabel(row.baseCustomLabel || row.customLabel).toUpperCase();
+    if (!label || linkByLabel.has(label)) return;
+    const asin = String(row._asinReference || '').trim().toUpperCase();
+    const url = row.amazonLink || amazonLinkFromAsin(asin);
+    if (url) linkByLabel.set(label, { asin, url });
+  };
+
+  const runLookup = async (field, values) => {
+    for (let i = 0; i < values.length; i += AMAZON_LINK_LOOKUP_CHUNK) {
+      const rows = await TemplateListing.find({
+        [field]: { $in: values.slice(i, i + AMAZON_LINK_LOOKUP_CHUNK) },
+        _asinReference: { $exists: true, $ne: '' }
+      })
+        .select('customLabel baseCustomLabel amazonLink +_asinReference')
+        .collation({ locale: 'en', strength: 2 })
+        .lean();
+      rows.forEach(rememberRow);
+    }
+  };
+
+  await runLookup('baseCustomLabel', [...skusByLabel.keys()]);
+
+  // Listings created through the bulk-insert paths can be missing
+  // baseCustomLabel, so retry whatever is still unresolved against customLabel.
+  const unresolved = new Set();
+  for (const [label, skus] of skusByLabel) {
+    if (linkByLabel.has(label)) continue;
+    unresolved.add(label);
+    for (const sku of skus) unresolved.add(sku);
+  }
+  if (unresolved.size > 0) await runLookup('customLabel', [...unresolved]);
+
+  return linkByLabel;
+}
+
+// Attaches `amazonLinks` (one entry per resolvable SKU) and `amazonLink`
+// (flattened string, used by the CSV export) to each plain order object.
+function attachAmazonLinks(orderObjects, linkByLabel) {
+  for (const order of orderObjects) {
+    const seenUrls = new Set();
+    const links = [];
+
+    for (const sku of getOrderSkus(order)) {
+      const label = getBaseSkuLabel(sku).toUpperCase();
+      // A SKU that is itself an ASIN needs no lookup.
+      const match = linkByLabel.get(label)
+        || (isAmazonAsinValue(label) ? { asin: label, url: amazonLinkFromAsin(label) } : null);
+      if (!match || seenUrls.has(match.url)) continue;
+      seenUrls.add(match.url);
+      links.push({ sku, asin: match.asin, url: match.url });
+    }
+
+    order.amazonLinks = links;
+    order.amazonLink = links.map(link => link.url).join(' | ');
+  }
+}
+
 // Get stored orders from database with pagination support
 /**
  * @swagger
@@ -3456,6 +3563,11 @@ router.get('/order/:orderId', requireAuth, requirePageAccess('Fulfillment'), asy
  *         name: productName
  *         schema:
  *           type: string
+ *       - in: query
+ *         name: includeAmazonLink
+ *         description: Resolve each order's SKU to its Amazon product link
+ *         schema:
+ *           type: boolean
  *     responses:
  *       200:
  *         description: Paginated order list
@@ -3463,7 +3575,7 @@ router.get('/order/:orderId', requireAuth, requirePageAccess('Fulfillment'), asy
  *         description: Internal server error
  */
 router.get('/stored-orders', requireAuth, async (req, res) => {
-  const { sellerId, page = 1, limit = 50, searchOrderId, searchAzOrderId, searchBuyerName, searchItemId, searchSku, searchMarketplace, paymentStatus, startDate, endDate, awaitingShipment, hasFulfillmentNotes, amazonArriving, arrivalSort, amazonAccount, arrivalStartDate, arrivalEndDate, arrivalDateFrom, arrivalDateTo, productName, excludeClient } = req.query;
+  const { sellerId, page = 1, limit = 50, searchOrderId, searchAzOrderId, searchBuyerName, searchItemId, searchSku, searchMarketplace, paymentStatus, startDate, endDate, awaitingShipment, hasFulfillmentNotes, amazonArriving, arrivalSort, amazonAccount, arrivalStartDate, arrivalEndDate, arrivalDateFrom, arrivalDateTo, productName, excludeClient, includeAmazonLink } = req.query;
 
   try {
     let query = {};
@@ -3860,6 +3972,12 @@ router.get('/stored-orders', requireAuth, async (req, res) => {
       orderObj.lastSellerMessageAt = slaData?.lastSellerMessageAt || null;
       return orderObj;
     });
+
+    // Opt-in so the pages that don't show the Amazon Link column skip the lookup.
+    if (includeAmazonLink === 'true' && ordersWithConvoData.length > 0) {
+      const amazonLinkMap = await buildAmazonLinkMapForOrders(ordersWithConvoData);
+      attachAmazonLinks(ordersWithConvoData, amazonLinkMap);
+    }
 
     console.log(`[Stored Orders] Query: ${JSON.stringify(query)}, Page: ${pageNum}/${totalPages}, Found ${orders.length}/${totalOrders} orders`);
 
