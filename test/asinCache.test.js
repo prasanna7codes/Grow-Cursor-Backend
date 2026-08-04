@@ -70,6 +70,40 @@ test('sustained writes settle at the watermark instead of reaching the cap', () 
   assert.notEqual(getCachedAsinData(`ASIN${String(MAX_KEYS * 3 - 1).padStart(4, '0')}`, REGION), null);
 });
 
+test('a negative cap override cannot disable the cap it configures', async () => {
+  // Without the Math.max, -5 both drives HIGH_WATER negative (evicting on every
+  // write) and slips past node-cache's own `maxKeys > -1` guard. The query
+  // string forces a second module instance so the constants are re-read.
+  process.env.ASIN_CACHE_MAX_KEYS = '-5';
+  try {
+    const mod = await import('../src/utils/asinCache.js?negative-cap');
+    assert.ok(mod.MAX_KEYS >= 1);
+    assert.ok(mod.HIGH_WATER >= 0);
+    assert.ok(mod.EVICT_BATCH >= 1);
+  } finally {
+    process.env.ASIN_CACHE_MAX_KEYS = String(MAX_KEYS);
+  }
+});
+
+test('expired-but-unreaped entries are reclaimed before any live entry', async () => {
+  // keys() does not filter on expiry and checkperiod only sweeps every 2
+  // minutes, so dead keys hold space against the cap in between. The getTtl()
+  // pass inside evictOldest reaps them, which is why it can return fewer than
+  // EVICT_BATCH while still freeing more than that.
+  const doomed = 2;
+  for (let i = 0; i < doomed; i += 1) asinCache.set(`asin:DEAD${i}_${REGION}`, { i }, 0.001);
+  fill(HIGH_WATER - doomed);
+  await new Promise(resolve => setTimeout(resolve, 20));
+
+  assert.equal(asinCache.keys().length, HIGH_WATER, 'expired keys still count until something touches them');
+
+  const evicted = evictOldest();
+
+  assert.equal(evicted, 0, 'the batch was spent on keys already dead, so nothing live was given up');
+  assert.equal(asinCache.keys().length, HIGH_WATER - doomed, 'yet the dead keys are gone');
+  assert.equal(cachedAsins().some(asin => asin.startsWith('DEAD')), false);
+});
+
 // ── A write that fails anyway ────────────────────────────────────────────────
 
 test('node-cache throws at the cap rather than evicting', () => {
@@ -84,7 +118,6 @@ test('node-cache throws at the cap rather than evicting', () => {
 test('a failed write degrades to a cache miss instead of throwing', () => {
   // Reached only if eviction itself fails, so force the failure directly rather
   // than trying to out-run the eviction.
-  const realSet = asinCache.set;
   asinCache.set = () => { throw Object.assign(new Error('Cache max keys amount exceeded'), { errorcode: 'ECACHEFULL' }); };
 
   try {
@@ -93,7 +126,9 @@ test('a failed write degrades to a cache miss instead of throwing', () => {
     // into a failed ASIN row in the preview.
     assert.doesNotThrow(() => setCachedAsinData('B01N5IB20Q', { asin: 'B01N5IB20Q' }, REGION));
   } finally {
-    asinCache.set = realSet;
+    // delete, not reassign: the stub is an own property shadowing the prototype
+    // method, and restoring by assignment would leave that shadow in place.
+    delete asinCache.set;
   }
 
   assert.equal(getCachedAsinData('B01N5IB20Q', REGION), null, 'the entry is simply absent — the next request re-scrapes');

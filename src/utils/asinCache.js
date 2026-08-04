@@ -21,7 +21,10 @@ const CACHE_ENABLED = process.env.ENABLE_ASIN_CACHE !== 'false'; // Enabled by d
 // The watermarks are percentages of the cap rather than separate literals —
 // lowering the cap must not leave the watermark stranded above it. Overridable
 // so the tests can reach the thresholds without inserting 10k entries.
-export const MAX_KEYS = parseInt(process.env.ASIN_CACHE_MAX_KEYS) || 10000;
+// Math.max guards a negative override: it would both push HIGH_WATER below zero
+// (evicting on every write) and slip past node-cache's own `maxKeys > -1` check,
+// disabling the cap it is meant to set.
+export const MAX_KEYS = Math.max(1, parseInt(process.env.ASIN_CACHE_MAX_KEYS) || 10000);
 export const HIGH_WATER = Math.floor(MAX_KEYS * 0.7);
 export const EVICT_BATCH = Math.max(1, Math.floor(MAX_KEYS * 0.1));
 
@@ -67,21 +70,34 @@ export function getCachedAsinData(asin, region = 'US') {
  * exactly when a batch still in flight is about to re-request the warm entries a
  * flush would have thrown away. Amortized to one pass per EVICT_BATCH writes.
  *
+ * Expired-but-unreaped keys are reclaimed first, and for free: keys() does not
+ * filter on expiry and checkperiod only sweeps every 2 minutes, so dead keys sit
+ * in the count and against the cap until then — but getTtl() runs the expiry
+ * check itself and deletes them, then reports undefined, which sorts them to the
+ * front of the batch. So a pass here clears the dead weight before it touches
+ * anything live, which is why the count deleted can be lower than EVICT_BATCH.
+ *
+ * The count check reads getStats().keys rather than keys().length so the common
+ * path — the writes that evict nothing — allocates no array.
+ *
  * @returns {number} - How many entries were evicted
  */
 export function evictOldest() {
-  const keys = asinCache.keys();
-  if (keys.length < HIGH_WATER) return 0;
+  if (asinCache.getStats().keys < HIGH_WATER) return 0;
 
+  const keys = asinCache.keys();
   const oldest = keys
     .map(key => [key, asinCache.getTtl(key) || 0])
     .sort((a, b) => a[1] - b[1])
     .slice(0, EVICT_BATCH)
     .map(([key]) => key);
 
-  asinCache.del(oldest);
-  console.log(`[ASIN Cache] ♻️ EVICTED: ${oldest.length} oldest of ${keys.length} (high water: ${HIGH_WATER})`);
-  return oldest.length;
+  // del()'s return, not the batch size: entries already reaped as expired by the
+  // getTtl() pass above are no-ops here, and a log that counted them would
+  // overstate how much live cache was actually given up.
+  const evicted = asinCache.del(oldest);
+  console.log(`[ASIN Cache] ♻️ EVICTED: ${evicted} of ${keys.length} keys (high water: ${HIGH_WATER}, now ${asinCache.getStats().keys})`);
+  return evicted;
 }
 
 /**
@@ -155,24 +171,6 @@ export function getAsinCacheStats() {
     ksize: stats.ksize,
     vsize: stats.vsize
   };
-}
-
-/**
- * Warm cache with commonly used ASINs (optional)
- * @param {Array<{asin: string, data: Object}>} asinDataList
- */
-export function warmAsinCache(asinDataList) {
-  if (!CACHE_ENABLED) return;
-  
-  let warmed = 0;
-  asinDataList.forEach(({ asin, data }) => {
-    if (asinCache.set(`asin:${asin}`, data)) {
-      warmed++;
-    }
-  });
-  
-  console.log(`[ASIN Cache] 🔥 WARMED: ${warmed} ASINs preloaded`);
-  return warmed;
 }
 
 // Export cache instance for advanced usage
