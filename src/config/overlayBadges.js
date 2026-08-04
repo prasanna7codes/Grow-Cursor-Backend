@@ -39,6 +39,16 @@ const BADGES = {
     file: 'phone-case-text.png',
     version: 1,
   },
+
+  'case-only-text': {
+    key: 'case-only-text',
+    label: 'case-only-text',
+    // Must match the filename on disk exactly, including case — Render's
+    // filesystem is case-sensitive, so a mismatched spelling resolves locally
+    // on Windows and then fails to load in production.
+    file: 'case-only-text.png',
+    version: 1,
+  },
 };
 
 const BADGE_DIR = path.join(process.cwd(), 'public/uploads/overlay-badges');
