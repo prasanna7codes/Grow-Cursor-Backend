@@ -117,7 +117,7 @@ Example output: [{"make":"Lexus","model":"IS F","startYear":"2008","endYear":"20
             model: 'gpt-4o-mini',
             messages: [{ role: 'user', content: prompt }],
             temperature: 0,
-            max_tokens: 1000
+            max_tokens: 3000
         });
 
         const raw = completion.choices[0]?.message?.content?.trim() || '[]';
