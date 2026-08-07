@@ -1,6 +1,7 @@
 import express from 'express';
 import mongoose from 'mongoose';
 import { requireAuth, requireAuthSSE, requirePageAccess } from '../middleware/auth.js';
+import { requireObjectId } from '../middleware/objectId.js';
 import TemplateListing from '../models/TemplateListing.js';
 import ListingTemplate from '../models/ListingTemplate.js';
 import Seller from '../models/Seller.js';
@@ -3821,8 +3822,14 @@ router.get('/precheck-stats', requireAuth, async (req, res) => {
   }
 });
 
-// Get single listing by ID
-router.get('/:id', requireAuth, async (req, res) => {
+// Get single listing by ID.
+//
+// requireObjectId sits after requireAuth so an unauthenticated request still
+// answers 401 rather than falling through and revealing which paths exist.
+// Anything that is not an id — /cache-stats and every literal GET added below
+// this line in future — passes on to its own route instead of being cast to an
+// ObjectId here and reported as a 500.
+router.get('/:id', requireAuth, requireObjectId(), async (req, res) => {
   try {
     const listing = await TemplateListing.findById(req.params.id)
       .populate('createdBy', 'name email')
@@ -4333,7 +4340,7 @@ router.put('/bulk-update', requireAuth, async (req, res) => {
  *       500: { description: Server error }
  */
 // Update listing
-router.put('/:id', requireAuth, async (req, res) => {
+router.put('/:id', requireAuth, requireObjectId(), async (req, res) => {
   try {
     const listingData = req.body;
 
@@ -4367,7 +4374,7 @@ router.put('/:id', requireAuth, async (req, res) => {
 });
 
 // Delete listing
-router.delete('/:id', requireAuth, async (req, res) => {
+router.delete('/:id', requireAuth, requireObjectId(), async (req, res) => {
   try {
     const listing = await TemplateListing.findByIdAndDelete(req.params.id);
 
@@ -9450,6 +9457,16 @@ router.post('/cache-invalidate/:asin', requireAuth, async (req, res) => {
       message: error.message
     });
   }
+});
+
+// Last in the file, so it only sees requests that matched no route above it.
+//
+// Before requireObjectId, a malformed id was caught by the /:id handler and
+// answered with a 500. Now it falls through to here, and the app has no 404
+// handler of its own — without this the reply would be Express's default HTML
+// page, which an API client parsing JSON handles worse than the 500 it replaces.
+router.use((req, res) => {
+  res.status(404).json({ error: `No such template-listings route: ${req.method} ${req.path}` });
 });
 
 export default router;
