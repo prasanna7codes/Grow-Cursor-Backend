@@ -29,6 +29,17 @@ import { compositeBadge, normalizeForUpload, normalizePlacement } from './overla
 // artwork composited. The key namespaces their cache rows away from badged
 // composites of the same source URL, which would otherwise collide.
 const PLAIN_BADGE = { key: '__plain__', version: 0 };
+
+// Cache-key discriminators, not geometry. PLAIN_BADGE has no filePath, so
+// getOrCreateHostedImage routes these images to normalizeForUpload(), which
+// takes no placement at all — nothing here ever reaches computeBadgeBox. The
+// values only have to be constant, so that every unbadged image of a given
+// source URL lands on one cache row.
+//
+// So read `scale: 0` as "unused", not as "a badge scaled to nothing": these
+// never go through normalizePlacement, which would clamp 0 up to 0.05 and
+// replace the unrecognised anchor with the default. If a future change does
+// start passing this to the compositor, it needs real values first.
 const PLAIN_PLACEMENT = { scale: 0, anchor: 'none', margin: 0 };
 
 // What a batch sends to say "no overlay on this one", as opposed to saying
