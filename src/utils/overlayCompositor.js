@@ -1,10 +1,17 @@
+import fs from 'node:fs/promises';
 import sharp from 'sharp';
 
 /**
- * Pure image compositing for listing overlay badges.
+ * Image compositing for listing overlay badges.
  *
- * No network, no database, no configuration lookups — buffers in, buffer out —
- * so the placement maths can be unit tested without touching eBay or Mongo.
+ * No network, no database, no configuration lookups — so the placement maths
+ * can be unit tested without touching eBay or Mongo.
+ *
+ * The one piece of state is badgeCache, which memoizes resized badge artwork
+ * (see getResizedBadge). It changes how often the artwork is decoded and
+ * nothing else: for a given badge and size the composite is byte-identical
+ * whether it was a hit or a miss, which is asserted directly in the tests. Call
+ * clearBadgeCache() to reset it.
  */
 
 // eBay recommends 1600px on the longest edge; below 500px it rejects the picture.
@@ -134,6 +141,74 @@ export async function normalizeForUpload(productBuffer) {
 }
 
 /**
+ * Resized badge artwork, keyed by path + mtime + the size asked for.
+ *
+ * The artwork on disk is far larger than it is ever drawn: the files run to
+ * 2508px and 3464px square, while the badge is rendered at 26% of a base capped
+ * to WORK_EDGE — 416px for any product photo of 1600px or more, which is nearly
+ * all of them. Decoding a 3464px RGBA PNG costs ~48MB of raw pixels and ~145ms,
+ * and without this every badged image in a bulk run paid that again to produce
+ * a byte-identical result.
+ *
+ * Keyed on mtime as well as path so replacing artwork on disk takes effect
+ * without a restart; the stat that costs is a rounding error against the decode
+ * it avoids. Only string paths are cached — a caller passing a Buffer has given
+ * us no stable identity to key on, so that path renders every time.
+ */
+const badgeCache = new Map();
+
+// Six badges at the handful of sizes non-1600px sources produce. The limit only
+// exists so an unforeseen spread of base dimensions can't grow this without end.
+const BADGE_CACHE_LIMIT = 32;
+
+function renderBadge(badge, badgeEdge) {
+  return sharp(badge)
+    .resize(badgeEdge, badgeEdge, {
+      // 'contain' keeps the artwork's aspect ratio. 'cover' would crop the badge
+      // on any non-square target, which is what the earlier prototype did.
+      fit: 'contain',
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    })
+    .toBuffer();
+}
+
+async function getResizedBadge(badge, badgeEdge) {
+  if (typeof badge !== 'string') return renderBadge(badge, badgeEdge);
+
+  let mtimeMs;
+  try {
+    ({ mtimeMs } = await fs.stat(badge));
+  } catch {
+    // Missing or unreadable: fall through and let sharp report it as it did
+    // before, rather than turning a file error into a cache miss error.
+    return renderBadge(badge, badgeEdge);
+  }
+
+  const key = `${badge}\0${mtimeMs}\0${badgeEdge}`;
+  const cached = badgeCache.get(key);
+  if (cached) return cached;
+
+  // The promise is cached, not the buffer, so concurrent images of the same
+  // badge — the normal case in a bulk run — share one decode instead of racing
+  // to do the same work. A rejection is evicted so a transient read failure
+  // isn't remembered for the life of the process.
+  const pending = renderBadge(badge, badgeEdge);
+  pending.catch(() => badgeCache.delete(key));
+
+  badgeCache.set(key, pending);
+  if (badgeCache.size > BADGE_CACHE_LIMIT) {
+    badgeCache.delete(badgeCache.keys().next().value);
+  }
+
+  return pending;
+}
+
+/** Drop every memoized badge. Exported for tests. */
+export function clearBadgeCache() {
+  badgeCache.clear();
+}
+
+/**
  * Composite a badge onto a product image.
  *
  * @param {Buffer} productBuffer - Source product image
@@ -149,14 +224,9 @@ export async function compositeBadge(productBuffer, badge, placement = DEFAULT_P
   const baseMeta = base.meta;
   const box = computeBadgeBox(baseMeta.width, baseMeta.height, placement);
 
-  const badgeBuffer = await sharp(badge)
-    .resize(box.badgeEdge, box.badgeEdge, {
-      // 'contain' keeps the artwork's aspect ratio. 'cover' would crop the badge
-      // on any non-square target, which is what the earlier prototype did.
-      fit: 'contain',
-      background: { r: 0, g: 0, b: 0, alpha: 0 },
-    })
-    .toBuffer();
+  // Shared between callers, so it must stay read-only from here on. sharp's
+  // composite() only reads its input, which is the one thing done with it below.
+  const badgeBuffer = await getResizedBadge(badge, box.badgeEdge);
 
   let pipeline = sharp(baseBuffer);
 

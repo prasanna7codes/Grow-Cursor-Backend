@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import sharp from 'sharp';
 import {
@@ -6,6 +9,7 @@ import {
   DEFAULT_PLACEMENT,
   MIN_SOURCE_EDGE,
   WORK_EDGE,
+  clearBadgeCache,
   compositeBadge,
   computeBadgeBox,
   normalizePlacement,
@@ -202,4 +206,169 @@ test('output is JPEG with no alpha channel, which is what eBay accepts', async (
 
   assert.equal(meta.format, 'jpeg');
   assert.equal(meta.hasAlpha, false);
+});
+
+// ── Badge memoization ────────────────────────────────────────────────────────
+//
+// The artwork is decoded once per (file, mtime, size) instead of once per image.
+// The property that matters is that this is invisible: the composite has to be
+// byte-identical to what an uncached decode produced.
+
+/** A badge file of a given solid colour, in a directory cleaned up afterwards. */
+async function badgeFile(t, colour) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'badge-'));
+  t.after(() => fs.rm(dir, { recursive: true, force: true }));
+
+  const file = path.join(dir, 'badge.png');
+  await write(file, colour, STAMP);
+  return file;
+}
+
+/**
+ * Write the badge and stamp it with an explicit mtime.
+ *
+ * The timestamp is pinned rather than left to the clock because these tests
+ * drive the cache key by hand. A natural mtime is no good for that: stat reports
+ * it with a sub-millisecond fraction (…537.7754) that utimes, which takes
+ * millisecond Dates, cannot write back — so "restore the mtime I just read"
+ * silently changes the key. A value set explicitly round-trips exactly.
+ */
+async function write(file, colour, mtime) {
+  await fs.writeFile(
+    file,
+    await sharp({ create: { width: 600, height: 600, channels: 4, background: { ...colour, alpha: 1 } } })
+      .png()
+      .toBuffer()
+  );
+  await fs.utimes(file, mtime, mtime);
+}
+
+const STAMP = new Date(1700000000000);
+const LATER_STAMP = new Date(1800000000000);
+
+const RED = { r: 255, g: 0, b: 0 };
+const BLUE = { r: 0, g: 0, b: 255 };
+const isBlue = ({ r, g, b }) => b > 180 && r < 80 && g < 80;
+
+/** The pixel at the centre of wherever the badge landed. */
+async function badgePixel(result) {
+  const { top, left, badgeEdge } = result.box;
+  return pixelAt(result.buffer, left + Math.floor(badgeEdge / 2), top + Math.floor(badgeEdge / 2));
+}
+
+/**
+ * How many pixels wide the badge actually rendered, along the row through its
+ * middle. Sampling a single centre pixel cannot tell a correctly-sized badge
+ * from an oversized one clipped by the frame — both are red in the middle.
+ */
+async function badgeWidth(result) {
+  const { data, info } = await sharp(result.buffer).raw().toBuffer({ resolveWithObject: true });
+  const y = result.box.top + Math.floor(result.box.badgeEdge / 2);
+
+  let width = 0;
+  for (let x = 0; x < info.width; x++) {
+    const i = (y * info.width + x) * info.channels;
+    if (isRed({ r: data[i], g: data[i + 1], b: data[i + 2] })) width++;
+  }
+  return width;
+}
+
+test('a memoized badge composites byte-identically to a cold one', async t => {
+  const file = await badgeFile(t, RED);
+
+  clearBadgeCache();
+  const cold = await compositeBadge(await productImage(1600, 1600), file, DEFAULT_PLACEMENT);
+  const warm = await compositeBadge(await productImage(1600, 1600), file, DEFAULT_PLACEMENT);
+
+  assert.deepEqual(warm.box, cold.box);
+  assert.ok(cold.buffer.equals(warm.buffer), 'the cached decode changed the output');
+});
+
+test('the artwork is decoded once, not once per image', async t => {
+  // Proving a cache hit without instrumenting sharp: swap the file's contents
+  // for a different colour but keep its mtime, so the key is unchanged. A cache
+  // hit still draws the old red badge; a re-read would draw the new blue.
+  const file = await badgeFile(t, RED);
+
+  clearBadgeCache();
+  const first = await compositeBadge(await productImage(1600, 1600), file, DEFAULT_PLACEMENT);
+  assert.ok(isRed(await badgePixel(first)));
+
+  await write(file, BLUE, STAMP);
+
+  const second = await compositeBadge(await productImage(1600, 1600), file, DEFAULT_PLACEMENT);
+  assert.ok(isRed(await badgePixel(second)), 'the badge was re-decoded instead of being reused');
+});
+
+test('replacing the artwork on disk takes effect without a restart', async t => {
+  const file = await badgeFile(t, RED);
+
+  clearBadgeCache();
+  const before = await compositeBadge(await productImage(1600, 1600), file, DEFAULT_PLACEMENT);
+  assert.ok(isRed(await badgePixel(before)));
+
+  // A real deployment writes a new file, which moves mtime and so the cache key.
+  await write(file, BLUE, LATER_STAMP);
+
+  const after = await compositeBadge(await productImage(1600, 1600), file, DEFAULT_PLACEMENT);
+  assert.ok(isBlue(await badgePixel(after)), 'stale artwork survived a file replacement');
+});
+
+test('one badge at two sizes does not collide in the cache', async t => {
+  // badgeEdge is part of the key. Were it not, the second call would composite
+  // the first call's buffer at the wrong size.
+  const file = await badgeFile(t, RED);
+
+  clearBadgeCache();
+  const big = await compositeBadge(await productImage(1600, 1600), file, DEFAULT_PLACEMENT);
+  const small = await compositeBadge(await productImage(600, 600), file, DEFAULT_PLACEMENT);
+
+  assert.notEqual(small.box.badgeEdge, big.box.badgeEdge);
+
+  // Measured, not sampled: reusing the 1600px render on the 600px image would
+  // still be red in the middle — it would simply overflow its box and be
+  // clipped by the frame. Only the rendered width shows that.
+  for (const result of [big, small]) {
+    const width = await badgeWidth(result);
+    assert.ok(
+      Math.abs(width - result.box.badgeEdge) <= 2,
+      `badge rendered ${width}px wide into a ${result.box.badgeEdge}px box`
+    );
+  }
+});
+
+test('concurrent composites of one badge agree', async t => {
+  // A bulk run hits this in parallel; the shared in-flight promise must hand
+  // every caller the same artwork, and no caller a half-written one.
+  const file = await badgeFile(t, RED);
+
+  clearBadgeCache();
+  const results = await Promise.all(
+    Array.from({ length: 8 }, async () =>
+      compositeBadge(await productImage(1600, 1600), file, DEFAULT_PLACEMENT)
+    )
+  );
+
+  for (const result of results) {
+    assert.equal(result.skipped, false);
+    assert.ok(result.buffer.equals(results[0].buffer));
+  }
+});
+
+test('an unreadable badge path still reports the failure', async () => {
+  clearBadgeCache();
+  await assert.rejects(
+    compositeBadge(await productImage(1600, 1600), 'public/uploads/overlay-badges/no-such-badge.png', DEFAULT_PLACEMENT)
+  );
+});
+
+test('a Buffer badge is not cached against another of the same size', async () => {
+  // Buffers carry no identity to key on, so they bypass the cache entirely.
+  // If they were ever keyed by size alone, the blue badge would come back red.
+  const red = await sharp({ create: { width: 600, height: 600, channels: 4, background: { ...RED, alpha: 1 } } }).png().toBuffer();
+  const blue = await sharp({ create: { width: 600, height: 600, channels: 4, background: { ...BLUE, alpha: 1 } } }).png().toBuffer();
+
+  clearBadgeCache();
+  assert.ok(isRed(await badgePixel(await compositeBadge(await productImage(1600, 1600), red, DEFAULT_PLACEMENT))));
+  assert.ok(isBlue(await badgePixel(await compositeBadge(await productImage(1600, 1600), blue, DEFAULT_PLACEMENT))));
 });
