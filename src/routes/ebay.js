@@ -16522,6 +16522,95 @@ router.get('/feed/upload-stats', requireAuth, requirePageAccess('FeedUploadStats
 });
 
 // ============================================
+// GET FEED ENDED-LISTING STATS (per seller)
+// ============================================
+// GET /api/ebay/feed/ended-stats?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&sellerId=...&country=US
+// "Ended" = auto-ended items (EndListingLog, 1 row each) + manual end adjustments
+// (ManualEndListingAdjustment.quantity). Country is normalized so a missing
+// country counts as US — mirroring /feed/upload-stats — keeping Net (success − ended)
+// coherent within a marketplace. Omit country (or pass ALL) to sum all marketplaces.
+/**
+ * @swagger
+ * /ebay/feed/ended-stats:
+ *   get:
+ *     summary: Get ended-listing counts per seller (auto + manual) for a date range
+ *     tags: [eBay Feed]
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: startDate
+ *         schema: { type: string, format: date }
+ *       - in: query
+ *         name: endDate
+ *         schema: { type: string, format: date }
+ *       - in: query
+ *         name: sellerId
+ *         schema: { type: string }
+ *       - in: query
+ *         name: country
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Ended-listing totals per seller
+ */
+router.get('/feed/ended-stats', requireAuth, requirePageAccess('FeedUploadStats'), async (req, res) => {
+  try {
+    const { startDate, endDate, sellerId, country } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ error: 'startDate and endDate are required' });
+    }
+    const { start } = getPTDayBoundsUTC(startDate);
+    const { end } = getPTDayBoundsUTC(endDate);
+
+    // Auto-ended: EndListingLog is filtered by endedAt (a Date).
+    const autoMatch = { endedAt: { $gte: start, $lte: end } };
+    if (sellerId) autoMatch.seller = new mongoose.Types.ObjectId(sellerId);
+    // Manual ends: ManualEndListingAdjustment is keyed by pdtDate ('YYYY-MM-DD' string).
+    const manualMatch = { pdtDate: { $gte: startDate, $lte: endDate } };
+    if (sellerId) manualMatch.seller = new mongoose.Types.ObjectId(sellerId);
+
+    const sellerUserLookup = [
+      { $lookup: { from: 'sellers', localField: '_id.seller', foreignField: '_id', as: 'sellerDoc' } },
+      { $unwind: { path: '$sellerDoc', preserveNullAndEmptyArrays: true } },
+      { $lookup: { from: 'users', localField: 'sellerDoc.user', foreignField: '_id', as: 'userDoc' } },
+      { $unwind: { path: '$userDoc', preserveNullAndEmptyArrays: true } },
+      { $project: { _id: 0, sellerId: '$_id.seller', sellerName: { $ifNull: ['$userDoc.username', 'Unknown'] }, country: '$_id.country', ended: 1 } },
+    ];
+
+    const [autoRows, manualRows] = await Promise.all([
+      EndListingLog.aggregate([
+        { $match: autoMatch },
+        { $addFields: { normalizedCountry: { $ifNull: ['$country', 'US'] } } },
+        { $group: { _id: { seller: '$seller', country: '$normalizedCountry' }, ended: { $sum: 1 } } },
+        ...sellerUserLookup,
+      ]),
+      ManualEndListingAdjustment.aggregate([
+        { $match: manualMatch },
+        { $group: { _id: { seller: '$seller', country: '$country' }, ended: { $sum: '$quantity' } } },
+        ...sellerUserLookup,
+      ]),
+    ]);
+
+    // Requested country filter (US already includes normalized null); ALL/absent = every marketplace.
+    const wantCountry = country && country !== 'ALL' ? country : null;
+    const bySeller = new Map();
+    for (const row of [...autoRows, ...manualRows]) {
+      if (wantCountry && (row.country || 'US') !== wantCountry) continue;
+      const key = String(row.sellerId || row.sellerName);
+      const existing = bySeller.get(key) || { sellerId: row.sellerId, sellerName: row.sellerName, endedListings: 0 };
+      existing.endedListings += row.ended || 0;
+      bySeller.set(key, existing);
+    }
+
+    res.json(Array.from(bySeller.values()));
+  } catch (err) {
+    console.error('[Feed Ended Stats] Error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch ended listing stats' });
+  }
+});
+
+// ============================================
 // GET FEED CATEGORY/RANGE STATS
 // ============================================
 // GET /api/ebay/feed/category-stats?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD&country=X
