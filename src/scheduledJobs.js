@@ -116,18 +116,18 @@ export function initializeScheduledJobs() {
     }
 
     if (IS_SKU_INDEX_RUNNER) {
-        // SKU Index Sync at 12:30 PM IST daily.
+        // SKU Index Sync at 11:00 AM IST daily.
         // Runs only on the Render runner and processes at most 3 sellers concurrently.
-        cron.schedule('30 12 * * *', async () => {
+        cron.schedule('0 11 * * *', async () => {
             try {
-                console.log('[CRON] Scheduled SKU Index Sync starting at 12:30 PM IST...');
+                console.log('[CRON] Scheduled SKU Index Sync starting at 11:00 AM IST...');
                 await scheduledSkuIndexSyncAllSellers();
             } catch (err) {
                 console.error('[CRON] Scheduled SKU Index Sync error:', err.message);
             }
         }, { timezone: 'Asia/Kolkata' });
 
-        console.log(`[CRON] Scheduled job initialized: SKU Index Sync at 12:30 PM IST (runner: ${RUNNER_ID})`);
+        console.log(`[CRON] Scheduled job initialized: SKU Index Sync at 11:00 AM IST (runner: ${RUNNER_ID})`);
     } else {
         console.log(`[CRON] Skipping SKU Index Sync cron initialization for runner: ${RUNNER_ID}. Set RUNNER_ID=render to enable automatic runs.`);
     }
