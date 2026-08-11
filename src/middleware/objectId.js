@@ -36,7 +36,9 @@ const OBJECT_ID_PATTERN = /^[0-9a-fA-F]{24}$/;
  * @returns {import('express').RequestHandler}
  */
 export function requireObjectId(param = 'id') {
-  return (req, res, next) => {
+  // Named rather than anonymous so it appears as itself in stack traces and in
+  // a router's layer list, both of which otherwise show '<anonymous>'.
+  return function requireObjectIdGuard(req, res, next) {
     if (OBJECT_ID_PATTERN.test(req.params[param] || '')) return next();
     next('route');
   };

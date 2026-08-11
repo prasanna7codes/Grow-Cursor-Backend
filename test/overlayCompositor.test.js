@@ -6,6 +6,7 @@ import test from 'node:test';
 import sharp from 'sharp';
 import {
   ANCHORS,
+  BADGE_CACHE_LIMIT,
   DEFAULT_PLACEMENT,
   MIN_SOURCE_EDGE,
   WORK_EDGE,
@@ -353,6 +354,41 @@ test('concurrent composites of one badge agree', async t => {
     assert.equal(result.skipped, false);
     assert.ok(result.buffer.equals(results[0].buffer));
   }
+});
+
+test('eviction drops the least recently used entry, not the oldest', async t => {
+  // Distinct base sizes give distinct badgeEdges, and so distinct cache keys.
+  // 4px apart is enough to separate them once scaled by 0.26, and all are above
+  // MIN_SOURCE_EDGE so none is skipped.
+  const sizes = Array.from({ length: BADGE_CACHE_LIMIT + 1 }, (_, i) => 500 + i * 4);
+  const edges = sizes.map(size => computeBadgeBox(size, size, DEFAULT_PLACEMENT).badgeEdge);
+  assert.equal(new Set(edges).size, sizes.length, 'test needs one distinct cache key per size');
+
+  const file = await badgeFile(t, RED);
+  const composite = async size => compositeBadge(await productImage(size, size), file, DEFAULT_PLACEMENT);
+
+  clearBadgeCache();
+  for (const size of sizes.slice(0, BADGE_CACHE_LIMIT)) await composite(size);
+
+  // Touch the oldest entry. Under LRU this makes it the newest; under FIFO it
+  // stays first in line and the next insert evicts it.
+  await composite(sizes[0]);
+
+  // Same mtime, so the keys are untouched — but anything decoded from here on
+  // comes back blue, which is how a survivor is told from an evicted entry.
+  await write(file, BLUE, STAMP);
+
+  // Overflow by one. Exactly one entry is evicted.
+  await composite(sizes[BADGE_CACHE_LIMIT]);
+
+  assert.ok(
+    isRed(await badgePixel(await composite(sizes[0]))),
+    'the most recently used entry was evicted, so eviction is FIFO not LRU'
+  );
+  assert.ok(
+    isBlue(await badgePixel(await composite(sizes[1]))),
+    'expected the genuinely least recently used entry to have been evicted'
+  );
 });
 
 test('an unreadable badge path still reports the failure', async () => {

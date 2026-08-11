@@ -62,7 +62,11 @@ test('a literal path registered after /:id is reachable through a real router', 
   const router = express.Router();
   router.get('/:id', requireObjectId(), (req, res) => res.json({ route: 'id', id: req.params.id }));
   router.get('/cache-stats', (req, res) => res.json({ route: 'cache-stats' }));
-  router.use((req, res) => res.status(404).json({ route: '404' }));
+  // Mirrors the catch-all in routes/templateListings.js, message included, so
+  // the assertions below pin what a client actually receives.
+  router.use((req, res) => {
+    res.status(404).json({ route: '404', error: `No such route: ${req.method} ${req.baseUrl}${req.path}` });
+  });
 
   const app = express();
   app.use('/api/template-listings', router);
@@ -81,7 +85,53 @@ test('a literal path registered after /:id is reachable through a real router', 
     assert.deepEqual(await get(`/${id}`), { status: 200, body: { route: 'id', id } });
 
     // Previously a 500 carrying Mongoose's "Cast to ObjectId failed" message.
-    assert.deepEqual(await get('/garbage'), { status: 404, body: { route: '404' } });
+    const missing = await get('/garbage');
+    assert.equal(missing.status, 404);
+    assert.equal(missing.body.route, '404');
+
+    // The message names the path the client actually asked for. req.path alone
+    // is mount-relative and would say only '/garbage'.
+    assert.equal(missing.body.error, 'No such route: GET /api/template-listings/garbage');
+
+    // ...and stops at the path. This app puts tokens in query strings, so
+    // req.originalUrl would echo one back into an error body and the logs.
+    const withQuery = await get('/garbage?token=secret-value&page=2');
+    assert.equal(withQuery.status, 404);
+    assert.ok(
+      !withQuery.body.error.includes('secret-value'),
+      `query string leaked into the 404: ${withQuery.body.error}`
+    );
+    assert.equal(withQuery.body.error, 'No such route: GET /api/template-listings/garbage');
+  } finally {
+    server.close();
+  }
+});
+
+test('the same ordering on PATCH lets /reorder through', async () => {
+  // routes/chatTemplates.js registers PATCH /:id at :382 and PATCH /reorder at
+  // :568. The literal reached findByIdAndUpdate as an id and the cast threw, so
+  // a documented endpoint answered 500 and could never run. Same shape here.
+  const router = express.Router();
+  router.patch('/:id', requireObjectId(), (req, res) => res.json({ route: 'id', id: req.params.id }));
+  router.patch('/reorder', (req, res) => res.json({ route: 'reorder' }));
+  router.use((req, res) => res.status(404).json({ route: '404' }));
+
+  const app = express();
+  app.use('/api/chat-templates', router);
+  const server = app.listen(0);
+  try {
+    await new Promise(resolve => server.once('listening', resolve));
+    const base = `http://127.0.0.1:${server.address().port}/api/chat-templates`;
+    const patch = async path => {
+      const res = await fetch(base + path, { method: 'PATCH' });
+      return { status: res.status, body: await res.json() };
+    };
+
+    assert.deepEqual(await patch('/reorder'), { status: 200, body: { route: 'reorder' } });
+
+    const id = '507f1f77bcf86cd799439011';
+    assert.deepEqual(await patch(`/${id}`), { status: 200, body: { route: 'id', id } });
+    assert.deepEqual(await patch('/garbage'), { status: 404, body: { route: '404' } });
   } finally {
     server.close();
   }

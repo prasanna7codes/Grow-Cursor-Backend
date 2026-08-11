@@ -159,7 +159,8 @@ const badgeCache = new Map();
 
 // Six badges at the handful of sizes non-1600px sources produce. The limit only
 // exists so an unforeseen spread of base dimensions can't grow this without end.
-const BADGE_CACHE_LIMIT = 32;
+// Exported so the eviction test doesn't have to hardcode it.
+export const BADGE_CACHE_LIMIT = 32;
 
 function renderBadge(badge, badgeEdge) {
   return sharp(badge)
@@ -186,7 +187,16 @@ async function getResizedBadge(badge, badgeEdge) {
 
   const key = `${badge}\0${mtimeMs}\0${badgeEdge}`;
   const cached = badgeCache.get(key);
-  if (cached) return cached;
+  if (cached) {
+    // Re-insert to move this key to the end of the Map's iteration order, which
+    // is what makes the eviction below LRU rather than FIFO. It matters only in
+    // the case the limit exists for — an unexpected spread of base dimensions —
+    // and that is exactly where FIFO would evict the one hot entry while cold
+    // one-off sizes survive.
+    badgeCache.delete(key);
+    badgeCache.set(key, cached);
+    return cached;
+  }
 
   // The promise is cached, not the buffer, so concurrent images of the same
   // badge — the normal case in a bulk run — share one decode instead of racing
@@ -197,6 +207,8 @@ async function getResizedBadge(badge, badgeEdge) {
 
   badgeCache.set(key, pending);
   if (badgeCache.size > BADGE_CACHE_LIMIT) {
+    // Least recently used: the first key in iteration order, given every hit
+    // above moves its key to the end.
     badgeCache.delete(badgeCache.keys().next().value);
   }
 

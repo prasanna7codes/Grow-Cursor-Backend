@@ -1,5 +1,6 @@
  import { Router } from 'express';
 import { requireAuth, requirePageAccess } from '../middleware/auth.js';
+import { requireObjectId } from '../middleware/objectId.js';
 import { validate } from '../utils/validate.js';
 import { createChatTemplateSchema } from '../schemas/index.js';
 import ChatTemplate from '../models/ChatTemplate.js';
@@ -379,7 +380,12 @@ router.post('/', requireAuth, requirePageAccess('BuyerMessages'), validate(creat
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.patch('/:id', requireAuth, requirePageAccess('BuyerMessages'), async (req, res) => {
+// PATCH /reorder is registered ~180 lines below this. Express matches in
+// registration order, so without the guard this route swallowed it: the literal
+// 'reorder' reached findByIdAndUpdate as an id, the cast threw, and the catch
+// below answered 500 'Failed to update chat template' — leaving a documented
+// endpoint unreachable with an error that pointed at the database.
+router.patch('/:id', requireAuth, requirePageAccess('BuyerMessages'), requireObjectId(), async (req, res) => {
   try {
     const { id } = req.params;
     const { category, label, text, isActive, sortOrder } = req.body;
@@ -413,7 +419,10 @@ router.patch('/:id', requireAuth, requirePageAccess('BuyerMessages'), async (req
  * Soft delete a template (set isActive to false)
  */
 // Documented under PATCH /{id} above (combined path object)
-router.delete('/:id', requireAuth, requirePageAccess('BuyerMessages'), async (req, res) => {
+// No literal DELETE path is shadowed today. Guarded anyway so that adding one
+// later works, which is the whole point of fixing this with middleware rather
+// than by reordering.
+router.delete('/:id', requireAuth, requirePageAccess('BuyerMessages'), requireObjectId(), async (req, res) => {
   try {
     const { id } = req.params;
     const { hard } = req.query; // ?hard=true for permanent delete
@@ -580,6 +589,14 @@ router.patch('/reorder', requireAuth, requirePageAccess('BuyerMessages'), async 
     console.error('Error reordering chat templates:', error);
     res.status(500).json({ error: 'Failed to reorder templates' });
   }
+});
+
+// Last in the file, so it only sees requests that matched no route above it.
+// Without it a malformed id — which requireObjectId now passes on rather than
+// casting — would get Express's default HTML page, which an API client parsing
+// JSON handles worse than the 500 it replaces.
+router.use((req, res) => {
+  res.status(404).json({ error: `No such chat-templates route: ${req.method} ${req.baseUrl}${req.path}` });
 });
 
 export default router;

@@ -9465,8 +9465,13 @@ router.post('/cache-invalidate/:asin', requireAuth, async (req, res) => {
 // answered with a 500. Now it falls through to here, and the app has no 404
 // handler of its own — without this the reply would be Express's default HTML
 // page, which an API client parsing JSON handles worse than the 500 it replaces.
+//
+// baseUrl + path, not req.path, which is mount-relative and so reports a bare
+// '/garbage'. Not req.originalUrl either: that carries the query string, and
+// tokens travel in query strings on this app — the full path is the useful part
+// for whoever is debugging, the credentials are not.
 router.use((req, res) => {
-  res.status(404).json({ error: `No such template-listings route: ${req.method} ${req.path}` });
+  res.status(404).json({ error: `No such template-listings route: ${req.method} ${req.baseUrl}${req.path}` });
 });
 
 export default router;
