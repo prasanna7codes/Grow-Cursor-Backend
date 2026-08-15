@@ -240,55 +240,30 @@ async function reviseListingPictures(token, itemId, images) {
 
   if (body?.Ack === 'Failure') {
     const errors = asArray(body.Errors);
-    throw new Error(errors.map((e) => e.LongMessage).filter(Boolean).join('; ') || 'ReviseFixedPriceItem failed');
+    const message = errors.map((e) => e.LongMessage).filter(Boolean).join('; ') || 'ReviseFixedPriceItem failed';
+    const failure = new Error(message);
+    // eBay's numeric codes are stable where the prose is not, so the ended-listing
+    // check below keys off them first and only falls back to matching text.
+    failure.ebayErrorCodes = errors.map((e) => String(e.ErrorCode || '')).filter(Boolean);
+    throw failure;
   }
 
   return true;
 }
 
+// A listing that ended between the snapshot sync and the submit can never be
+// revised, so it is pruned rather than left to fail again on every future pass.
+const ENDED_LISTING_CODES = new Set(['21916635', '21917091', '291']);
+
+function isEndedListingError(error) {
+  const codes = error?.ebayErrorCodes || [];
+  if (codes.some((code) => ENDED_LISTING_CODES.has(code))) return true;
+  return /ended listing|listing has ended|auction has ended|already ended/i.test(error?.message || '');
+}
+
 async function loadSeller(sellerId) {
   if (!mongoose.Types.ObjectId.isValid(String(sellerId || ''))) return null;
   return Seller.findById(sellerId);
-}
-
-// ── Crawl cache ──────────────────────────────────────────────────────────────
-// A full GetSellerList crawl of a large seller is ~127 pages and takes minutes,
-// and the inventory does not change meaningfully inside a few minutes. So the
-// UNFILTERED scan is kept in process memory per seller, and each new search
-// filters the cached list instantly instead of re-paging eBay.
-//
-// Only crawls that ran to the last page are cached: a scan the operator
-// stopped early is a partial inventory, and serving it as if complete would
-// silently hide listings from the next search. `refresh=true` bypasses the
-// cache for an operator who has just changed listings on eBay.
-const CRAWL_CACHE_TTL_MS = (parseInt(process.env.LISTING_CRAWL_CACHE_TTL_SECONDS, 10) || 300) * 1000;
-// ~25k listings ≈ 8MB, so a handful of sellers is the sensible ceiling.
-const MAX_CACHED_SELLERS = 3;
-const crawlCache = new Map(); // sellerId -> { fetchedAt, listings: [] }
-
-function getCachedCrawl(sellerId) {
-  const entry = crawlCache.get(sellerId);
-  if (!entry) return null;
-  if (Date.now() - entry.fetchedAt > CRAWL_CACHE_TTL_MS) {
-    crawlCache.delete(sellerId);
-    return null;
-  }
-  return entry;
-}
-
-function setCachedCrawl(sellerId, listings) {
-  if (crawlCache.size >= MAX_CACHED_SELLERS && !crawlCache.has(sellerId)) {
-    let oldestKey = null;
-    let oldestAt = Infinity;
-    for (const [key, value] of crawlCache) {
-      if (value.fetchedAt < oldestAt) {
-        oldestAt = value.fetchedAt;
-        oldestKey = key;
-      }
-    }
-    if (oldestKey) crawlCache.delete(oldestKey);
-  }
-  crawlCache.set(sellerId, { fetchedAt: Date.now(), listings });
 }
 
 /**
@@ -436,17 +411,15 @@ router.delete('/snapshot', requireAuth, requirePageAccess(PAGE_ID), requireSuper
 
 /**
  * GET /listing-overlays/listings-stream
- * Searches the stored snapshot by default; `source=live` re-crawls eBay.
- * Either way the pictures that get badged are read live at preview time, so
- * stale rows can only surface an ended listing, never a wrong image.
+ *
+ * Searches the stored snapshot. Discovery reads from the database while the
+ * pictures that actually get badged are still fetched live at preview time, so
+ * a stale row can at worst surface a listing that has since ended — the revise
+ * then fails visibly — and can never cause the wrong image to be composited.
  */
 router.get('/listings-stream', requireAuthSSE, requirePageAccess(PAGE_ID), async (req, res) => {
-  const {
-    sellerId, category = '', search = '', refresh = '',
-    includeBadged: includeBadgedParam = '', source = 'stored',
-  } = req.query;
+  const { sellerId, category = '', search = '', includeBadged: includeBadgedParam = '' } = req.query;
   const includeBadged = String(includeBadgedParam).toLowerCase() === 'true';
-  const useLive = String(source).toLowerCase() === 'live';
 
   const seller = await loadSeller(sellerId);
   if (!seller) return res.status(404).json({ error: 'Seller not found' });
@@ -454,16 +427,6 @@ router.get('/listings-stream', requireAuthSSE, requirePageAccess(PAGE_ID), async
   const stream = openSseStream(req, res);
   const categoryFilter = String(category).trim().toLowerCase();
   const keywordGroups = parseKeywordQuery(search);
-  const wantRefresh = String(refresh).toLowerCase() === 'true';
-
-  const matchesFilters = (entry) => {
-    if (categoryFilter && !String(entry.categoryName).toLowerCase().includes(categoryFilter)) return false;
-    if (keywordGroups.length) {
-      const haystack = `${entry.title} ${entry.sku} ${entry.itemId}`.toLowerCase();
-      if (!matchesKeywords(haystack, keywordGroups)) return false;
-    }
-    return true;
-  };
 
   try {
     let matched = 0;
@@ -475,9 +438,8 @@ router.get('/listings-stream', requireAuthSSE, requirePageAccess(PAGE_ID), async
     // a REVERTED listing is back to its original picture and must be badgeable
     // again, and a previewed-but-never-submitted one never changed on eBay.
     //
-    // Loaded fresh on every request rather than cached with the inventory —
-    // otherwise listings submitted a minute ago would keep reappearing for as
-    // long as the crawl cache lived.
+    // Loaded fresh on every request, so a listing submitted a minute ago
+    // disappears from the very next search.
     const badgedItemIds = new Set();
     if (!includeBadged) {
       const runIds = await ListingOverlayRun.find({ seller: seller._id }).distinct('_id');
@@ -489,121 +451,62 @@ router.get('/listings-stream', requireAuthSSE, requirePageAccess(PAGE_ID), async
       }
     }
 
-    // Counted only against listings that otherwise matched, so the number reads
-    // as "of your results, this many are already done".
-    const keep = (entry) => {
-      if (!matchesFilters(entry)) return false;
-      if (badgedItemIds.has(String(entry.itemId))) {
+    // The category narrows the query in the database; the keyword grammar then
+    // runs in memory, keeping one implementation of the search semantics.
+    const query = { seller: seller._id };
+    if (categoryFilter) {
+      query.categoryName = { $regex: escapeRegex(categoryFilter), $options: 'i' };
+    }
+
+    stream.send({ type: 'started' });
+
+    const cursor = OverlayListingSnapshot.find(query)
+      .select('itemId sku title categoryId categoryName imageUrl syncedAt')
+      .lean()
+      .cursor();
+
+    let syncedAt = null;
+
+    for await (const doc of cursor) {
+      if (!stream.isOpen()) break;
+
+      scanned += 1;
+      if (!syncedAt) syncedAt = doc.syncedAt;
+
+      if (keywordGroups.length) {
+        const haystack = `${doc.title} ${doc.sku} ${doc.itemId}`.toLowerCase();
+        if (!matchesKeywords(haystack, keywordGroups)) continue;
+      }
+
+      // Counted only against listings that otherwise matched, so the number
+      // reads as "of your results, this many are already done".
+      if (badgedItemIds.has(String(doc.itemId))) {
         hiddenBadged += 1;
-        return false;
-      }
-      return true;
-    };
-
-    // Default path: search the stored snapshot. The category narrows the query
-    // in the database; the keyword grammar then runs in memory so stored and
-    // live searches behave identically rather than drifting apart.
-    if (!useLive) {
-      const query = { seller: seller._id };
-      if (categoryFilter) {
-        query.categoryName = { $regex: escapeRegex(categoryFilter), $options: 'i' };
+        continue;
       }
 
-      const cursor = OverlayListingSnapshot.find(query)
-        .select('itemId sku title categoryId categoryName imageUrl syncedAt')
-        .lean()
-        .cursor();
-
-      let syncedAt = null;
-
-      for await (const doc of cursor) {
-        if (!stream.isOpen()) break;
-
-        const entry = {
+      matched += 1;
+      stream.send({
+        type: 'item',
+        item: {
           itemId: doc.itemId,
           title: doc.title || '',
           sku: doc.sku || '',
           categoryId: doc.categoryId || '',
           categoryName: doc.categoryName || '',
           image: doc.imageUrl || '',
-        };
-
-        if (!syncedAt) syncedAt = doc.syncedAt;
-        scanned += 1;
-        if (!keep(entry)) continue;
-        matched += 1;
-        stream.send({ type: 'item', item: entry });
-      }
-
-      stream.send({
-        type: 'complete',
-        scanned,
-        matched,
-        hiddenBadged,
-        fromSnapshot: true,
-        snapshotEmpty: scanned === 0,
-        syncedAt,
+        },
       });
-      stream.finish();
-      return;
     }
 
-    // Served from the recent-crawl cache: filter in memory, no eBay calls.
-    const cached = wantRefresh ? null : getCachedCrawl(String(sellerId));
-    if (cached) {
-      stream.send({ type: 'started', fromCache: true });
-
-      for (const entry of cached.listings) {
-        if (!stream.isOpen()) break;
-        scanned += 1;
-        if (!keep(entry)) continue;
-        matched += 1;
-        stream.send({ type: 'item', item: entry });
-      }
-
-      stream.send({
-        type: 'complete',
-        scanned,
-        matched,
-        hiddenBadged,
-        fromCache: true,
-        cacheAgeSeconds: Math.round((Date.now() - cached.fetchedAt) / 1000),
-      });
-      stream.finish();
-      return;
-    }
-
-    stream.send({ type: 'started' });
-
-    // Everything scanned is collected, matches or not — the cache has to hold
-    // the whole inventory for a DIFFERENT filter to be answerable from it.
-    const inventory = [];
-
-    for await (const entry of crawlSellerListings(seller, stream)) {
-      if (!stream.isOpen()) break;
-
-      if (entry.__progress) {
-        stream.send({ type: 'progress', ...entry.__progress, scanned, matched });
-        continue;
-      }
-
-      scanned += 1;
-      inventory.push(entry);
-
-      if (!keep(entry)) continue;
-
-      matched += 1;
-      stream.send({ type: 'item', item: entry });
-    }
-
-    // Still open here means the crawl reached the last page rather than being
-    // stopped by the operator or a dropped connection — the only state in
-    // which the collected inventory is complete enough to cache.
-    if (stream.isOpen()) {
-      setCachedCrawl(String(sellerId), inventory);
-    }
-
-    stream.send({ type: 'complete', scanned, matched, hiddenBadged });
+    stream.send({
+      type: 'complete',
+      scanned,
+      matched,
+      hiddenBadged,
+      snapshotEmpty: scanned === 0,
+      syncedAt,
+    });
     stream.finish();
   } catch (error) {
     console.error('[ListingOverlays] listings-stream error:', error.message);
@@ -779,6 +682,8 @@ router.post('/runs/:runId/submit', requireAuth, requirePageAccess(PAGE_ID), asyn
     let successCount = 0;
     let failedCount = 0;
 
+    const endedItemIds = [];
+
     const results = await Promise.all(items.map((item) => limit(async () => {
       try {
         await reviseListingPictures(token, item.itemId, item.newImages);
@@ -787,23 +692,52 @@ router.post('/runs/:runId/submit', requireAuth, requirePageAccess(PAGE_ID), asyn
           { $set: { status: 'submitted', submittedAt: new Date(), error: '' } }
         );
         successCount += 1;
-        return { itemId: item.itemId, status: 'submitted' };
+        return { itemId: item.itemId, title: item.title, status: 'submitted' };
       } catch (error) {
+        const ended = isEndedListingError(error);
+        if (ended) endedItemIds.push(item.itemId);
+
         await ListingOverlayItem.updateOne(
           { _id: item._id },
-          { $set: { status: 'failed', error: error.message } }
+          { $set: { status: 'failed', error: error.message, listingEnded: ended } }
         );
         failedCount += 1;
-        return { itemId: item.itemId, status: 'failed', error: error.message };
+        return {
+          itemId: item.itemId,
+          title: item.title,
+          status: 'failed',
+          ended,
+          error: error.message,
+        };
       }
     })));
+
+    // An ended listing can never be revised, so it is dropped from the snapshot
+    // rather than resurfacing in every future search for this seller.
+    let prunedEnded = 0;
+    if (endedItemIds.length) {
+      const pruned = await OverlayListingSnapshot.deleteMany({
+        seller: seller._id,
+        itemId: { $in: endedItemIds },
+      });
+      prunedEnded = pruned.deletedCount || 0;
+      console.log(`[ListingOverlays] pruned ${prunedEnded} ended listing(s) from the snapshot`);
+    }
 
     await ListingOverlayRun.updateOne(
       { _id: run._id },
       { $set: { status: 'completed', successCount, failedCount, completedAt: new Date() } }
     );
 
-    res.json({ runId: run._id, successCount, failedCount, skippedAlreadyBadged, results });
+    res.json({
+      runId: run._id,
+      successCount,
+      failedCount,
+      skippedAlreadyBadged,
+      endedItemIds,
+      prunedEnded,
+      results,
+    });
   } catch (error) {
     console.error('[ListingOverlays] submit error:', error.message);
     res.status(500).json({ error: error.message });

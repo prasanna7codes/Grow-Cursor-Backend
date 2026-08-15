@@ -36,6 +36,11 @@ const listingOverlayItemSchema = new mongoose.Schema({
 
   error: { type: String, default: '' },
 
+  // Set when eBay refused the revise because the listing had ended. Distinct
+  // from an ordinary failure: there is nothing to retry, and the listing is
+  // pruned from the snapshot so it stops appearing in searches.
+  listingEnded: { type: Boolean, default: false },
+
   submittedAt: { type: Date, default: null },
   revertedAt: { type: Date, default: null }
 }, { timestamps: true });
