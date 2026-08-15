@@ -49,6 +49,13 @@ const BADGES = {
     file: 'case-only-text.png',
     version: 1,
   },
+
+  'strap-only-text': {
+    key: 'strap-only-text',
+    label: 'strap-only-text',
+    file: 'strap-only-text.png',
+    version: 1,
+  },
 };
 
 const BADGE_DIR = path.join(process.cwd(), 'public/uploads/overlay-badges');
