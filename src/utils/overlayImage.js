@@ -4,7 +4,7 @@ import FormData from 'form-data';
 import { parseStringPromise } from 'xml2js';
 import OverlayImage from '../models/OverlayImage.js';
 import { resolveBadge } from '../config/overlayBadges.js';
-import { compositeBadge, normalizeForUpload, normalizePlacement } from './overlayCompositor.js';
+import { compositeBadge, MIN_SOURCE_EDGE, normalizeForUpload, normalizePlacement } from './overlayCompositor.js';
 
 /**
  * Applies an overlay badge to a listing's primary image and hosts every image
@@ -63,6 +63,42 @@ export function isAlreadyOverlaid(url) {
   } catch {
     return false;
   }
+}
+
+// eBay serves each picture at many sizes from one base name. Which variant an
+// API response hands back is not guaranteed, and anything under
+// MIN_SOURCE_EDGE (500px) is dropped by the compositor as 'source_too_small',
+// so a listing would silently fail to badge purely because eBay quoted a
+// thumbnail. Ask for the largest variant instead.
+//
+// Two URL schemes are in the wild and both appear on live listings:
+//
+//   modern: .../images/g/<id>/s-l500.jpg        → s-l1600
+//   legacy: .../00/s/MTUwMFgxNDMy/z/<id>/$_1.JPG → $_57
+//
+// In the legacy scheme the base64 segment encodes the true dimensions
+// ("MTUwMFgxNDMy" is "1500X1432"), while the $_N suffix selects the rendition:
+// $_1 is a thumbnail, $_57 the full-size one. A legacy URL therefore looks
+// large and downloads small, which is exactly the trap this avoids.
+//
+// Only the size token is rewritten; the rest of the path (and any non-eBay
+// URL) is returned untouched.
+const EBAY_MODERN_VARIANT = /\/s-l\d+(\.[a-z]+)(?=$|\?)/i;
+const EBAY_LEGACY_VARIANT = /\$_\d+(\.[a-z]+)(?=$|\?)/i;
+
+/**
+ * @param {string} url
+ * @returns {string} the same picture at eBay's largest variant, or url unchanged
+ */
+export function toLargestEbayVariant(url) {
+  if (!url || typeof url !== 'string') return url;
+  if (!isAlreadyOverlaid(url)) return url;
+
+  if (EBAY_MODERN_VARIANT.test(url)) return url.replace(EBAY_MODERN_VARIANT, '/s-l1600$1');
+  // '$$' is an escaped literal dollar in a replacement string.
+  if (EBAY_LEGACY_VARIANT.test(url)) return url.replace(EBAY_LEGACY_VARIANT, '$$_57$1');
+
+  return url;
 }
 
 /**
@@ -364,7 +400,7 @@ export function resolveTemplateOverlay(template, badgeKey) {
  * @returns {Promise<string|null>} hosted URL, or null if this image could not be
  *   hosted (source too small or unreadable)
  */
-async function getOrCreateHostedImage({ sourceUrl, badge, placement, sellerId, token }) {
+async function getOrCreateHostedImage({ sourceUrl, badge, placement, sellerId, token, onSkip }) {
   const cacheKey = buildCacheKey({
     sourceUrl,
     badgeKey: badge.key,
@@ -385,6 +421,7 @@ async function getOrCreateHostedImage({ sourceUrl, badge, placement, sellerId, t
 
   if (result.skipped) {
     console.warn(`[Overlay] Skipped ${sourceUrl}: ${result.reason}`);
+    if (onSkip) onSkip(result.reason, sourceUrl);
     return null;
   }
 
@@ -426,12 +463,18 @@ async function getOrCreateHostedImage({ sourceUrl, badge, placement, sellerId, t
  * @returns {Promise<string[]|null>} the hosted list, or null if any image could
  *   not be hosted — in which case the caller must discard the partial results.
  */
-async function hostAllImages(images, overlay, ctx) {
+async function hostAllImages(images, overlay, ctx, { skipHosted = true, onSkip } = {}) {
   const hosted = [];
 
   for (const [index, sourceUrl] of images.entries()) {
     // Re-preview of an already-processed listing: leave it where it is.
-    if (isAlreadyOverlaid(sourceUrl)) {
+    //
+    // Callers whose SOURCE is eBay pass skipHosted:false. For them "already on
+    // ebayimg.com" is the starting state of every image rather than proof this
+    // ran before, so the hostname says nothing and skipping would badge
+    // nothing at all. Those callers establish idempotency from their own run
+    // records instead.
+    if (skipHosted && isAlreadyOverlaid(sourceUrl)) {
       hosted.push(sourceUrl);
       continue;
     }
@@ -443,6 +486,7 @@ async function hostAllImages(images, overlay, ctx) {
       placement: isPrimary ? overlay.placement : PLAIN_PLACEMENT,
       sellerId: ctx.sellerId,
       token: ctx.token,
+      onSkip,
     });
 
     // One failure poisons the whole listing: a list where this image stayed on
@@ -454,6 +498,87 @@ async function hostAllImages(images, overlay, ctx) {
   }
 
   return hosted;
+}
+
+// Turn compositor skip reasons into something an operator can act on. Without
+// this the UI only ever showed the mixed-host consequence.
+function describeSkip(skips) {
+  if (!skips.length) {
+    return 'Overlay skipped: not every image could be hosted on eBay, and a listing cannot mix eBay-hosted and external pictures.';
+  }
+
+  const tooSmall = skips.filter((s) => s.reason === 'source_too_small').length;
+  const unreadable = skips.filter((s) => s.reason === 'unreadable_source').length;
+  const parts = [];
+
+  if (tooSmall) {
+    parts.push(`${tooSmall} picture${tooSmall === 1 ? ' is' : 's are'} under ${MIN_SOURCE_EDGE}px, which eBay rejects as a listing image`);
+  }
+  if (unreadable) {
+    parts.push(`${unreadable} picture${unreadable === 1 ? ' could' : 's could'} not be read`);
+  }
+
+  return `Overlay skipped: ${parts.join('; ')}. The listing was left untouched.`;
+}
+
+/**
+ * Badge the primary picture of an EXISTING eBay listing and host the whole set
+ * on EPS, for the bulk-overlay page that revises live listings.
+ *
+ * Separate from withOverlaidImages() because that one is amazonData-shaped and
+ * carries the Amazon-source assumptions: it returns { data, mappings } for the
+ * CSV/description consumers, and it bails when every image is already on EPS.
+ * Here the source IS eBay, so that check would reject every listing.
+ *
+ * Idempotency is the caller's job (the run records say what has been badged);
+ * the OverlayImage cache still makes a repeat call cheap rather than wrong.
+ *
+ * @param {string[]} imageUrls - the listing's current pictures, primary first
+ * @param {{badge: object, placement: object}} overlay - resolveTemplateOverlay()
+ * @param {{sellerId: string, token: string}} ctx
+ * @returns {Promise<{images: string[], applied: boolean, warning?: string}>}
+ *   `images` is the original list untouched whenever applied is false.
+ */
+export async function overlayListingImages(imageUrls, overlay, ctx = {}) {
+  const images = Array.isArray(imageUrls) ? imageUrls.filter(Boolean) : [];
+
+  if (!overlay || !images.length || !ctx.token || !ctx.sellerId) {
+    return { images, applied: false };
+  }
+
+  // eBay may quote any size variant; the compositor drops anything under 500px.
+  const sources = images.map(toLargestEbayVariant);
+
+  try {
+    // The mixed-host bail-out is the CONSEQUENCE of a skip, not its cause.
+    // Reporting only that sends people hunting for an eBay hosting problem when
+    // the real answer is "this picture is 400px", so the reason is carried up.
+    const skips = [];
+    const hosted = await hostAllImages(sources, overlay, ctx, {
+      skipHosted: false,
+      onSkip: (reason, sourceUrl) => skips.push({ reason, sourceUrl }),
+    });
+
+    if (!hosted) {
+      return {
+        images,
+        applied: false,
+        warning: describeSkip(skips),
+      };
+    }
+
+    // Same invariant as the Amazon path: a mixed list is rejected by eBay with
+    // 20004, and here it would be rejected at revise time on a live listing.
+    if (!hostsAreUniform(hosted)) {
+      console.error('[Overlay] Refusing mixed-host image list for listing revise');
+      return { images, applied: false, warning: 'Overlay skipped: mixed image hosts.' };
+    }
+
+    return { images: hosted, applied: true };
+  } catch (error) {
+    console.error(`[Overlay] Listing overlay failed: ${error.message}`);
+    return { images, applied: false, warning: `Overlay could not be applied: ${error.message}` };
+  }
 }
 
 /**
