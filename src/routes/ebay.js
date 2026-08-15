@@ -52,6 +52,7 @@ import {
   getExchangeRateRecordForDate,
   getOrderTotalAmount
 } from '../utils/exchangeRateUtils.js';
+import { getExcludedItemIdsFrom, normalizeItemId } from '../utils/quantityUpdateExclusions.js';
 
 const upload = multer({ storage: multer.memoryStorage() });
 const router = express.Router();
@@ -7488,167 +7489,24 @@ const AUTO_COMPAT_EXCLUDED_USERNAMES = [
 ];
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Item IDs that should NOT have their quantity updated when ordered
-const QUANTITY_UPDATE_EXCLUDED_ITEMS = new Set([
-  '127311585410',
-  '127311587672',
-  '127311588411',
-  '127311588863',
-  '127311596014',
-  '389381058706',
-  '389381053145',
-  '389381049342',
-  '389381045467',
-  '389381039761',
-  '317649392161',
-  '317649397683',
-  '317649395742',
-  '317649399983',
-  '317649401541',
-  '127632524706',
-  '127632525908',
-  '127632527199',
-  '127632535240',
-  '127632517576',
-  '397653418688',
-  '397653430223',
-  '397653431626',
-  '397653432958',
-  '397653434997',
-  '389697500304',
-  '389697505524',
-  '389697519189',
-  '389697527530',
-  '389697527648',
-  '389707394803',
-  '389707398007',
-  '389707398167',
-  '406742433098',
-  '406742435500',
-  '406742435984',
-  '177927320888',
-  '177927336580',
-  '177927336724',
-  '389707470348',
-  '389707471563',
-  '389707471798',
-  '177933876674',
-  '177933879168',
-  '177933879217',
-  '389711830316',
-  '389711827996',
-  '389711828096',
-  '389707470348',
-  '389707471563',
-  '389707471798',
-  '389719944291',
-  '389719946273',
-  '389719946325',
-  '236712714683',
-  '236712734790',
-  '236712734883',
-  '236712734944',
-  '236712735005',
-  '389798717090',
-  '389798767664',
-  '389798767905',
-  '389798768087',
-  '389798768257',
-  '137166531019',
-  '137166559893',
-  '137166559917',
-  '137166559933',
-  '137166559948',
-  '389798718204',
-  '389798770343',
-  '389798770391',
-  '389798770430',
-  '389798770555',
-  '397760832934',
-  '397760867895',
-  '397760867926',
-  '397760867950',
-  '397760868001',
-  '397760910024',
-  '397760915006',
-  '397760913732',
-  '397760913792',
-  '397760912460',
-  '318135906852',
-  '318135906854',
-  '318135906872',
-  '318135906878',
-  '318135906890',
-  '389876300253',
-  '389876300254',
-  '389876300263',
-  '389876300264',
-  '389876300271',
-  '397828455740',
-  '397828455742',
-  '397828455743',
-  '397828455744',
-  '397828455749',
-  '397828455873',
-  '397828455874',
-  '397828455876',
-  '397828455877',
-  '397828455878',
-  '389905142747',
-  '389905161240',
-  '389905163638',
-  '389905163695',
-  '389905163516',
-  '398198911740',
-  '377358803057',
-  '398198967205',
-  '398198929161',
-  '377358882589',
-  '398198978709',
-  '398198963293',
-  '377358920661',
-  '398198994973',
-  '398198982189',
-  '377358943563',
-  '398199022568',
-  '398198994782',
-  '377358956973',
-  '398199027597',
-  '407093114769',
-  '127990187927',
-  '407093130233',
-  '127990191391',
-  '407093138945',
-  '127990211828',
-  '407093161439',
-  '127990221226',
-  '407093169210',
-  '127990234841',
-  '128001902402',
-  '128001936008',
-  '800446939641',
-  '800446959689',
-  '800446939639',
-  '800446939663',
-  '800446939643',
-  '128020622416',
-  '128020636554',
-  '128020645292',
-  '128020676938',
-  '128020683128',
-]);
-
 // ============================================
 // HELPER: Update Listing Quantity to 1 on New Order
 // ============================================
 // When a new order arrives, set quantity to 1 for each line item's listing.
 // Uses Trading API (ReviseInventoryStatus) which works for ALL listing types.
+// ItemIDs that must keep their quantity are excluded; that list lives in MongoDB
+// (QuantityUpdateExclusion), is edited from the "Quantity Update Exclusions"
+// admin page, and is read through utils/quantityUpdateExclusions.js.
 async function updateListingQuantityOnOrder(ebayOrder, accessToken, sellerName) {
   const lineItems = ebayOrder.lineItems || [];
   if (lineItems.length === 0) return;
 
   const orderId = ebayOrder.orderId;
   console.log(`[Quantity Update] Processing ${lineItems.length} line item(s) for order ${orderId}`);
+
+  // Checked against the database on every order, so an ItemID added from the
+  // admin page protects the very next order that comes in.
+  const excludedItemIds = await getExcludedItemIdsFrom(lineItems.map((li) => li.legacyItemId));
 
   for (const lineItem of lineItems) {
     const legacyItemId = lineItem.legacyItemId;
@@ -7659,7 +7517,7 @@ async function updateListingQuantityOnOrder(ebayOrder, accessToken, sellerName) 
       continue;
     }
 
-    if (QUANTITY_UPDATE_EXCLUDED_ITEMS.has(legacyItemId)) {
+    if (excludedItemIds.has(normalizeItemId(legacyItemId))) {
       console.log(`[Quantity Update] ⏭️ Excluded ItemID: ${legacyItemId} (${title}), skipping`);
       continue;
     }

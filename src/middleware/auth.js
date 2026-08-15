@@ -79,6 +79,7 @@ export const PAGE_DEFAULT_ROLES = {
   'AmazonStockCheck': ['superadmin', 'listingadmin'],
   'SellerSkuStockCheck': ['superadmin', 'listingadmin'],
   'EndListingByDate': ['superadmin', 'listingadmin'],
+  'QuantityUpdateExclusions': ['superadmin', 'listingadmin', 'fulfillmentadmin', 'hoc', 'compliancemanager'],
 
   // HR & Management
   'IdeasAndIssues': ['superadmin', 'hradmin', 'operationhead', 'listingadmin'],

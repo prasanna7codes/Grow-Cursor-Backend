@@ -273,6 +273,18 @@ export const resolutionOptionSchema = z.object({
   name: z.string().trim().min(1, 'Resolution option name is required'),
 });
 
+// ── Quantity update exclusions ────────────────────────────────────────────────
+
+// Accepts either a single ItemID, an array of them, or one pasted blob of IDs
+// separated by newlines / commas / spaces. Splitting happens in the route.
+export const quantityUpdateExclusionSchema = z.object({
+  itemIds: z.union([
+    z.string().trim().min(1, 'At least one ItemID is required'),
+    z.array(z.string()).min(1, 'At least one ItemID is required'),
+  ]),
+  note: z.string().trim().max(500, 'Note is too long').optional(),
+});
+
 // ── Seller upload limits ──────────────────────────────────────────────────────
 
 const UPLOAD_LIMIT_COUNTRIES = ['US', 'UK', 'AU', 'Canada'];
