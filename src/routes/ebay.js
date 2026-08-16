@@ -1463,6 +1463,212 @@ router.get('/check-sku-active', requireAuth, async (req, res) => {
 });
 
 // ============================================
+// SKU / ASIN LOOKUP ACROSS ALL SELLERS
+// ============================================
+
+// Distinct SKU labels resolved from a single ASIN, and index rows returned in
+// one response — a popular ASIN can be listed by every seller several times.
+const SKU_LOOKUP_MAX_LABELS = 200;
+const SKU_LOOKUP_MAX_ROWS = 500;
+
+/**
+ * @swagger
+ * /ebay/sku-index/lookup:
+ *   get:
+ *     tags: [eBay SKU Index]
+ *     summary: Find which sellers carry a SKU or ASIN, from the synced SKU index
+ *     description: >
+ *       Searches SellerSkuIndex (populated by the daily SKU Index Sync) across
+ *       every seller. A SKU matches its variants too (GRW25N4VFV finds
+ *       GRW25N4VFV-1). An ASIN is first resolved to the SKUs listed for it via
+ *       TemplateListing, then those SKUs are looked up in the index.
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: query
+ *         name: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *         description: A SKU (with or without variant suffix) or an Amazon ASIN
+ *     responses:
+ *       200:
+ *         description: Matching index rows grouped by seller
+ *       400:
+ *         description: query is required
+ *       500:
+ *         description: Internal server error
+ */
+router.get(
+  '/sku-index/lookup',
+  requireAuth,
+  requirePageAccess(['SkuIndexLookup', 'SkuIndexDashboard', 'SkuIndexSync', 'DuplicateSkus']),
+  async (req, res) => {
+    try {
+      const raw = String(req.query.query || '').trim();
+      if (!raw) {
+        return res.status(400).json({ error: 'query is required' });
+      }
+
+      const isAsinQuery = isAmazonAsinValue(raw);
+      const queriedAsin = isAsinQuery ? raw.toUpperCase() : '';
+
+      // The index stores SKUs exactly as eBay returned them, so match the raw
+      // value, its uppercase form, and the base label (variant suffix stripped)
+      // — all equality matches, so the seller+sku / seller+baseSku indexes hold.
+      const skuCandidates = new Set();
+      const addCandidate = (value) => {
+        const cleaned = String(value || '').trim();
+        if (!cleaned) return;
+        skuCandidates.add(cleaned);
+        skuCandidates.add(cleaned.toUpperCase());
+        const base = getBaseSkuLabel(cleaned);
+        if (base) {
+          skuCandidates.add(base);
+          skuCandidates.add(base.toUpperCase());
+        }
+      };
+      addCandidate(raw);
+
+      // An ASIN is not stored on the index itself (unless the SKU literally is
+      // the ASIN), so resolve it to the SKUs listed for it first.
+      let templateRows = [];
+      let asinSkuLabels = [];
+      if (isAsinQuery) {
+        // Matched with $in on case variants rather than a case-insensitive
+        // collation: the plain _asinReference index carries no collation, so a
+        // collated query here would collection-scan TemplateListing.
+        //
+        // Distinct labels are collected with $addToSet instead of capping
+        // documents — one ASIN can be listed hundreds of times across sellers
+        // and templates, and a document cap could drop a distinct SKU, and with
+        // it a seller that genuinely carries this ASIN.
+        const [grouped] = await TemplateListing.aggregate([
+          { $match: { _asinReference: { $in: [...new Set([queriedAsin, queriedAsin.toLowerCase(), raw])] } } },
+          {
+            $group: {
+              _id: null,
+              labels: { $addToSet: '$customLabel' },
+              baseLabels: { $addToSet: '$baseCustomLabel' }
+            }
+          }
+        ]);
+        asinSkuLabels = [...new Set([...(grouped?.labels || []), ...(grouped?.baseLabels || [])])]
+          .filter(Boolean)
+          .sort();
+        asinSkuLabels.slice(0, SKU_LOOKUP_MAX_LABELS).forEach(addCandidate);
+      }
+
+      const candidates = [...skuCandidates];
+      const rows = await SellerSkuIndex.find({
+        $or: [{ sku: { $in: candidates } }, { baseSku: { $in: candidates } }]
+      })
+        .select('seller sku baseSku itemId title price currency syncedAt')
+        .sort({ syncedAt: -1 })
+        .limit(SKU_LOOKUP_MAX_ROWS + 1)
+        .lean();
+
+      const truncated = rows.length > SKU_LOOKUP_MAX_ROWS;
+      if (truncated) rows.length = SKU_LOOKUP_MAX_ROWS;
+
+      // Reverse direction: a SKU search still wants the ASIN shown per row.
+      if (!isAsinQuery && rows.length > 0) {
+        const labels = [
+          ...new Set(rows.map((row) => getBaseSkuLabel(row.baseSku || row.sku)).filter(Boolean))
+        ].slice(0, SKU_LOOKUP_MAX_LABELS);
+        templateRows = labels.length > 0
+          ? await TemplateListing.find({
+              baseCustomLabel: { $in: labels },
+              _asinReference: { $exists: true, $ne: '' }
+            })
+              .select('customLabel baseCustomLabel +_asinReference')
+              .collation({ locale: 'en', strength: 2 })
+              .lean()
+          : [];
+      }
+
+      const asinByLabel = new Map();
+      for (const row of templateRows) {
+        const label = getBaseSkuLabel(row.baseCustomLabel || row.customLabel).toUpperCase();
+        const asin = String(row._asinReference || '').trim().toUpperCase();
+        if (label && asin && !asinByLabel.has(label)) asinByLabel.set(label, asin);
+      }
+
+      const sellerIds = [...new Set(rows.map((row) => String(row.seller)).filter(Boolean))];
+      const sellerDocs = sellerIds.length > 0
+        ? await Seller.find({ _id: { $in: sellerIds } })
+            .populate('user', 'username email')
+            .select('name user')
+            .lean()
+        : [];
+      const sellerNameById = new Map(sellerDocs.map((seller) => [
+        String(seller._id),
+        seller.user?.username || seller.user?.email || seller.name || 'Unknown Seller'
+      ]));
+
+      const asinForRow = (row) => {
+        if (isAmazonAsinValue(row.sku)) return String(row.sku).trim().toUpperCase();
+        const label = getBaseSkuLabel(row.baseSku || row.sku).toUpperCase();
+        return (label && asinByLabel.get(label)) || queriedAsin || '';
+      };
+
+      const bySeller = new Map();
+      for (const row of rows) {
+        const sellerId = String(row.seller);
+        if (!bySeller.has(sellerId)) {
+          bySeller.set(sellerId, {
+            sellerId,
+            sellerName: sellerNameById.get(sellerId) || 'Unknown Seller',
+            listingCount: 0,
+            lastSyncedAt: null,
+            listings: []
+          });
+        }
+        const group = bySeller.get(sellerId);
+        group.listingCount += 1;
+        if (!group.lastSyncedAt || row.syncedAt > group.lastSyncedAt) group.lastSyncedAt = row.syncedAt;
+        group.listings.push({
+          itemId: row.itemId || '',
+          sku: row.sku || '',
+          baseSku: row.baseSku || '',
+          title: row.title || '',
+          price: row.price,
+          currency: row.currency || '',
+          syncedAt: row.syncedAt,
+          asin: asinForRow(row)
+        });
+      }
+
+      const sellers = [...bySeller.values()].sort((a, b) =>
+        a.sellerName.localeCompare(b.sellerName, undefined, { sensitivity: 'base' })
+      );
+
+      const matchedSkus = [...new Set(rows.map((row) => row.sku).filter(Boolean))].sort();
+      const asins = [...new Set(rows.map(asinForRow).filter(Boolean))].sort();
+      // SKUs the ASIN is listed under in TemplateListing — lets the page say
+      // "known SKU, just not in any seller's synced index" instead of "nothing".
+      const knownSkusForAsin = asinSkuLabels.slice(0, 50);
+
+      return res.json({
+        query: raw,
+        queryType: isAsinQuery ? 'asin' : 'sku',
+        queriedAsin,
+        totalListings: rows.length,
+        sellerCount: sellers.length,
+        matchedSkus,
+        asins,
+        knownSkusForAsin,
+        truncated,
+        sellers
+      });
+    } catch (error) {
+      console.error('[sku-index/lookup] Error:', error.message);
+      return res.status(500).json({ error: 'Failed to look up SKU index', details: error.message });
+    }
+  }
+);
+
+// ============================================
 // UPLOAD FEED TO EBAY
 // ============================================
 /**

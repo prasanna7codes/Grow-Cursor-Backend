@@ -76,6 +76,7 @@ export const PAGE_DEFAULT_ROLES = {
   'SellerFunds': ['superadmin', 'listingadmin'],
   'SkuIndexSync': ['superadmin', 'listingadmin'],
   'SkuIndexDashboard': ['superadmin', 'listingadmin'],
+  'SkuIndexLookup': ['superadmin', 'listingadmin'],
   'AmazonStockCheck': ['superadmin', 'listingadmin'],
   'SellerSkuStockCheck': ['superadmin', 'listingadmin'],
   'EndListingByDate': ['superadmin', 'listingadmin'],
