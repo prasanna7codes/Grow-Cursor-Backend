@@ -23,8 +23,7 @@ const asinDirectorySchema = new mongoose.Schema({
   addedByUserId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
-    default: null,
-    index: true
+    default: null
   },
 
   // Enrichment fields from ScraperAPI
