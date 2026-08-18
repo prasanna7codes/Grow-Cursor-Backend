@@ -5,10 +5,9 @@ import pLimit from 'p-limit';
 import { parseStringPromise } from 'xml2js';
 
 import Seller from '../models/Seller.js';
-import User from '../models/User.js';
 import ListingOverlayRun from '../models/ListingOverlayRun.js';
 import ListingOverlayItem from '../models/ListingOverlayItem.js';
-import OverlayListingSnapshot from '../models/OverlayListingSnapshot.js';
+import SellerSkuIndex from '../models/SellerSkuIndex.js';
 import { requireAuth, requireAuthSSE, requirePageAccess } from '../middleware/auth.js';
 import { ensureValidToken } from './ebay.js';
 import { resolveBadge } from '../config/overlayBadges.js';
@@ -36,51 +35,6 @@ function tradingHeaders(callName) {
 // inside the regex query rather than simply matching nothing.
 function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-// Syncing crawls a seller's entire inventory and deleting throws the snapshot
-// away, so both are superadmin-only. The page can be granted to other roles,
-// and hiding a button is presentation, not permission — this is the actual gate.
-function requireSuperAdmin(req, res, next) {
-  if (req.user?.role !== 'superadmin') {
-    return res.status(403).json({ error: 'Only a superadmin can sync or delete stored listings.' });
-  }
-  next();
-}
-
-// ── Sync concurrency ─────────────────────────────────────────────────────────
-// Each sync crawls a seller's whole inventory, so a handful running at once
-// would compete for the same eBay call budget and take longer than running them
-// in sequence. Mirrors SKU_SYNC_CONCURRENCY in routes/ebay.js.
-//
-// Held in process memory rather than the database on purpose: every user hits
-// the same server, so this is enough to show one operator what another has
-// already started — and it self-heals on restart rather than leaving a stale
-// "running" row that blocks everyone.
-const MAX_CONCURRENT_SYNCS = parseInt(process.env.LISTING_OVERLAY_MAX_SYNCS, 10) || 3;
-// sellerId (string) → { sellerName, startedBy, startedAt, page, totalPages, stored }
-const activeSyncs = new Map();
-
-function activeSyncList() {
-  return [...activeSyncs.entries()].map(([sellerId, info]) => ({ sellerId, ...info }));
-}
-
-// Outcome of recently finished syncs. The job outlives the request that started
-// it, so without this a sync that completed while the operator was on another
-// page would silently vanish from the UI with no result to show.
-const SYNC_RESULT_TTL_MS = 10 * 60 * 1000;
-const recentSyncResults = new Map(); // sellerId -> { finishedAt, stored, removed, total, partial, error }
-
-function recordSyncResult(sellerId, result) {
-  recentSyncResults.set(String(sellerId), { ...result, finishedAt: Date.now() });
-}
-
-function recentSyncList() {
-  const cutoff = Date.now() - SYNC_RESULT_TTL_MS;
-  for (const [key, value] of recentSyncResults) {
-    if (value.finishedAt < cutoff) recentSyncResults.delete(key);
-  }
-  return [...recentSyncResults.entries()].map(([sellerId, r]) => ({ sellerId, ...r }));
 }
 
 function asArray(value) {
@@ -131,84 +85,6 @@ function openSseStream(req, res) {
     },
     isOpen: () => !state.closed,
   };
-}
-
-/**
- * Every currently-active listing for a seller, straight from eBay.
- *
- * Uses the END-time window rather than the start-time window that
- * /ebay/sync-all-listings uses: that endpoint is an incremental sync and
- * deliberately looks at listings created since the last poll, which here would
- * silently omit everything older. Every live listing has an end time in the
- * future, so EndTimeFrom=now covers the lot — the same trick runSkuIndexSync
- * already relies on.
- */
-async function* crawlSellerListings(seller, stream) {
-  const now = new Date();
-  const endTimeFrom = now.toISOString();
-  const endTimeTo = new Date(now.getTime() + 120 * 24 * 60 * 60 * 1000).toISOString();
-
-  let page = 1;
-  let totalPages = 1;
-
-  while (page <= totalPages && stream.isOpen()) {
-    // Re-checked every page: a multi-thousand-listing crawl can outlive a token.
-    const token = await ensureValidToken(seller);
-
-    const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
-<GetSellerListRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-  <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
-  <ErrorLanguage>en_US</ErrorLanguage>
-  <WarningLevel>High</WarningLevel>
-  <GranularityLevel>Coarse</GranularityLevel>
-  <EndTimeFrom>${endTimeFrom}</EndTimeFrom>
-  <EndTimeTo>${endTimeTo}</EndTimeTo>
-  <Pagination>
-    <EntriesPerPage>200</EntriesPerPage>
-    <PageNumber>${page}</PageNumber>
-  </Pagination>
-  <OutputSelector>ItemArray.Item.ItemID</OutputSelector>
-  <OutputSelector>ItemArray.Item.Title</OutputSelector>
-  <OutputSelector>ItemArray.Item.SKU</OutputSelector>
-  <OutputSelector>ItemArray.Item.PrimaryCategory</OutputSelector>
-  <OutputSelector>ItemArray.Item.PictureDetails</OutputSelector>
-  <OutputSelector>ItemArray.Item.SellingStatus.ListingStatus</OutputSelector>
-  <OutputSelector>PaginationResult</OutputSelector>
-</GetSellerListRequest>`;
-
-    const response = await axios.post(EBAY_API, xmlRequest, {
-      headers: tradingHeaders('GetSellerList'),
-      timeout: 60000,
-    });
-
-    const parsed = await parseStringPromise(response.data, { explicitArray: false });
-    const body = parsed?.GetSellerListResponse;
-
-    if (body?.Ack === 'Failure') {
-      const errors = asArray(body.Errors);
-      throw new Error(errors[0]?.LongMessage || 'GetSellerList failed');
-    }
-
-    totalPages = parseInt(body?.PaginationResult?.TotalNumberOfPages, 10) || 1;
-
-    for (const item of asArray(body?.ItemArray?.Item)) {
-      if (item?.SellingStatus?.ListingStatus !== 'Active') continue;
-
-      yield {
-        itemId: item.ItemID,
-        title: item.Title || '',
-        sku: item.SKU || '',
-        categoryId: item.PrimaryCategory?.CategoryID || '',
-        categoryName: item.PrimaryCategory?.CategoryName || '',
-        // Gallery image only — enough for the table. The authoritative full
-        // picture set is fetched per selected listing at preview time.
-        image: asArray(item.PictureDetails?.PictureURL)[0] || '',
-      };
-    }
-
-    yield { __progress: { page, totalPages } };
-    page += 1;
-  }
 }
 
 /**
@@ -303,219 +179,25 @@ async function loadSeller(sellerId) {
 }
 
 /**
- * Run a snapshot sync to completion, independent of any HTTP connection.
+ * GET /listing-overlays/index-status
  *
- * Detached on purpose. When this was an SSE stream the crawl was driven by the
- * client socket, so a page refresh — or simply switching sellers — closed the
- * connection and killed a 150-page sync partway. Progress now lives in
- * `activeSyncs` and the page reads it by polling, so refreshing, closing the
- * tab, or another user opening the page all show the same live count.
- *
- * Stopping is therefore explicit (`stopRequested`) rather than an accident of
- * disconnecting.
+ * Per-seller counts and last sync time, read straight from SellerSkuIndex.
+ * Read-only: this page no longer runs a crawl of its own — the daily SKU Index
+ * Sync is what keeps these rows current.
  */
-async function runSnapshotSync(seller, sellerKey) {
-  const syncStart = new Date();
-  let stored = 0;
-  let batch = [];
-
-  // Stands in for the SSE stream the crawler used to check: it now asks whether
-  // a stop has been requested rather than whether a socket is still open.
-  const control = { isOpen: () => !(activeSyncs.get(sellerKey)?.stopRequested) };
-
-  const flush = async () => {
-    if (!batch.length) return;
-    await OverlayListingSnapshot.bulkWrite(batch, { ordered: false });
-    stored += batch.length;
-    batch = [];
-  };
-
+router.get('/index-status', requireAuth, requirePageAccess(PAGE_ID), async (req, res) => {
   try {
-    for await (const entry of crawlSellerListings(seller, control)) {
-      if (!control.isOpen()) break;
-
-      if (entry.__progress) {
-        await flush();
-        const shared = activeSyncs.get(sellerKey);
-        if (shared) Object.assign(shared, { ...entry.__progress, stored });
-        continue;
-      }
-
-      batch.push({
-        updateOne: {
-          filter: { seller: seller._id, itemId: entry.itemId },
-          update: {
-            $set: {
-              sku: entry.sku,
-              title: entry.title,
-              categoryId: entry.categoryId,
-              categoryName: entry.categoryName,
-              imageUrl: entry.image,
-              syncedAt: syncStart,
-            },
-          },
-          upsert: true,
-        },
-      });
-
-      if (batch.length >= 500) await flush();
-    }
-
-    await flush();
-
-    // Only a crawl that reached the last page may prune. A pass stopped early
-    // has not seen the whole inventory, so every listing it did not reach still
-    // carries an older stamp and would be deleted as if it had ended.
-    const completed = control.isOpen();
-    let removed = 0;
-    if (completed) {
-      const cleanup = await OverlayListingSnapshot.deleteMany({
-        seller: seller._id,
-        syncedAt: { $lt: syncStart },
-      });
-      removed = cleanup.deletedCount || 0;
-    }
-
-    const total = await OverlayListingSnapshot.countDocuments({ seller: seller._id });
-    recordSyncResult(sellerKey, { stored, removed, total, partial: !completed });
-    console.log(`[ListingOverlays] sync done seller=${sellerKey} stored=${stored} removed=${removed} total=${total}${completed ? '' : ' (stopped early)'}`);
-  } catch (error) {
-    console.error('[ListingOverlays] snapshot sync error:', error.message);
-    recordSyncResult(sellerKey, { stored, error: error.message });
-  } finally {
-    // Released on every exit, so a crash cannot hold a slot until restart.
-    activeSyncs.delete(sellerKey);
-  }
-}
-
-/**
- * POST /listing-overlays/snapshot/sync   body: { sellerId }
- * Starts the crawl and returns immediately; progress is read from
- * /snapshot/status.
- */
-router.post('/snapshot/sync', requireAuth, requirePageAccess(PAGE_ID), requireSuperAdmin, async (req, res) => {
-  const { sellerId } = req.body || {};
-
-  const seller = await loadSeller(sellerId);
-  if (!seller) return res.status(404).json({ error: 'Seller not found' });
-
-  const sellerKey = String(seller._id);
-
-  if (activeSyncs.has(sellerKey)) {
-    const running = activeSyncs.get(sellerKey);
-    return res.status(409).json({
-      error: `This seller is already being synced${running.startedBy ? ` by ${running.startedBy}` : ''}. Wait for it to finish.`,
-      activeSyncs: activeSyncList(),
-    });
-  }
-
-  if (activeSyncs.size >= MAX_CONCURRENT_SYNCS) {
-    return res.status(429).json({
-      error: `${activeSyncs.size} syncs are already running (limit ${MAX_CONCURRENT_SYNCS}). Wait for one to finish before starting another.`,
-      activeSyncs: activeSyncList(),
-    });
-  }
-
-  // Claimed synchronously, before any await, so two requests arriving together
-  // cannot both pass the checks above.
-  activeSyncs.set(sellerKey, {
-    sellerName: '',
-    startedBy: '',
-    startedAt: new Date().toISOString(),
-    page: 0,
-    totalPages: 0,
-    stored: 0,
-    stopRequested: false,
-  });
-
-  // Labels only — the slot is already held, so these can resolve late.
-  Promise.all([
-    User.findById(req.user?.userId).select('username email').lean().catch(() => null),
-    Seller.findById(seller._id).populate('user', 'username email').lean().catch(() => null),
-  ]).then(([user, populated]) => {
-    const entry = activeSyncs.get(sellerKey);
-    if (!entry) return;
-    entry.startedBy = user?.username || user?.email || 'someone';
-    entry.sellerName = populated?.user?.username || populated?.user?.email || '';
-  });
-
-  // Deliberately not awaited: the response returns now and the crawl keeps
-  // running in the background.
-  runSnapshotSync(seller, sellerKey);
-
-  res.status(202).json({
-    started: true,
-    activeSyncs: activeSyncList(),
-    maxConcurrentSyncs: MAX_CONCURRENT_SYNCS,
-  });
-});
-
-/**
- * POST /listing-overlays/snapshot/sync/stop   body: { sellerId }
- * Asks a running sync to stop at the next page boundary.
- */
-router.post('/snapshot/sync/stop', requireAuth, requirePageAccess(PAGE_ID), requireSuperAdmin, (req, res) => {
-  const sellerKey = String(req.body?.sellerId || '');
-  const entry = activeSyncs.get(sellerKey);
-  if (!entry) return res.status(404).json({ error: 'No sync is running for this seller.' });
-
-  entry.stopRequested = true;
-  res.json({ stopping: true });
-});
-
-/**
- * GET /listing-overlays/snapshot/status
- *
- * Per-seller row counts and sync times, plus the syncs running right now —
- * across ALL users, so one operator can see what another has already started
- * instead of queueing a duplicate crawl of the same seller.
- */
-router.get('/snapshot/status', requireAuth, requirePageAccess(PAGE_ID), async (req, res) => {
-  try {
-    const rows = await OverlayListingSnapshot.aggregate([
-      {
-        $group: {
-          _id: '$seller',
-          count: { $sum: 1 },
-          syncedAt: { $max: '$syncedAt' },
-        },
-      },
+    const rows = await SellerSkuIndex.aggregate([
+      { $group: { _id: '$seller', count: { $sum: 1 }, syncedAt: { $max: '$syncedAt' } } },
     ]);
 
     res.json({
-      snapshots: rows.map((row) => ({
+      sellers: rows.map((row) => ({
         sellerId: String(row._id),
         count: row.count,
         syncedAt: row.syncedAt,
       })),
-      activeSyncs: activeSyncList(),
-      recentSyncs: recentSyncList(),
-      maxConcurrentSyncs: MAX_CONCURRENT_SYNCS,
     });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * DELETE /listing-overlays/snapshot?sellerId=  (omit sellerId to clear all)
- * The snapshot is scratch data for a one-off badging pass; this is how it gets
- * thrown away once the pass is done.
- */
-router.delete('/snapshot', requireAuth, requirePageAccess(PAGE_ID), requireSuperAdmin, async (req, res) => {
-  try {
-    const { sellerId } = req.query;
-    const filter = {};
-
-    if (sellerId) {
-      if (!mongoose.Types.ObjectId.isValid(String(sellerId))) {
-        return res.status(400).json({ error: 'Invalid sellerId' });
-      }
-      filter.seller = sellerId;
-    }
-
-    const result = await OverlayListingSnapshot.deleteMany(filter);
-    res.json({ deletedCount: result.deletedCount || 0, scope: sellerId ? 'seller' : 'all' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -524,10 +206,15 @@ router.delete('/snapshot', requireAuth, requirePageAccess(PAGE_ID), requireSuper
 /**
  * GET /listing-overlays/listings-stream
  *
- * Searches the stored snapshot. Discovery reads from the database while the
- * pictures that actually get badged are still fetched live at preview time, so
- * a stale row can at worst surface a listing that has since ended — the revise
- * then fails visibly — and can never cause the wrong image to be composited.
+ * Searches SellerSkuIndex, which the daily SKU Index Sync already maintains for
+ * every seller. There is deliberately no crawl of its own here: a second pass
+ * over the same ~425k listings would double the eBay cost to collect fields
+ * that one call already returns.
+ *
+ * Discovery reads from the database while the pictures that actually get badged
+ * are still fetched live at preview time, so a row up to a day stale can at
+ * worst surface a listing that has since ended — the revise then fails visibly
+ * — and can never cause the wrong image to be composited.
  */
 router.get('/listings-stream', requireAuthSSE, requirePageAccess(PAGE_ID), async (req, res) => {
   const { sellerId, category = '', search = '', includeBadged: includeBadgedParam = '' } = req.query;
@@ -544,6 +231,7 @@ router.get('/listings-stream', requireAuthSSE, requirePageAccess(PAGE_ID), async
     let matched = 0;
     let scanned = 0;
     let hiddenBadged = 0;
+    let hiddenEnded = 0;
 
     // Listings whose badge is live right now, so they are kept out of the table
     // and cannot be badged a second time. Status matters, not just the item id:
@@ -553,14 +241,23 @@ router.get('/listings-stream', requireAuthSSE, requirePageAccess(PAGE_ID), async
     // Loaded fresh on every request, so a listing submitted a minute ago
     // disappears from the very next search.
     const badgedItemIds = new Set();
-    if (!includeBadged) {
-      const runIds = await ListingOverlayRun.find({ seller: seller._id }).distinct('_id');
-      if (runIds.length) {
-        const ids = await ListingOverlayItem
-          .find({ run: { $in: runIds }, status: 'submitted' })
-          .distinct('itemId');
-        ids.forEach((id) => badgedItemIds.add(String(id)));
-      }
+    // Listings eBay refused as ended. They can never be revised, so offering
+    // them again just wastes a preview. Remembered here rather than by deleting
+    // the index row, because SellerSkuIndex is shared with the stock checks and
+    // SKU profit report — this page must not remove listings from their view.
+    // The daily sync clears genuinely ended rows on its next complete pass.
+    const endedItemIds = new Set();
+
+    const runIds = await ListingOverlayRun.find({ seller: seller._id }).distinct('_id');
+    if (runIds.length) {
+      const [badged, ended] = await Promise.all([
+        includeBadged
+          ? Promise.resolve([])
+          : ListingOverlayItem.find({ run: { $in: runIds }, status: 'submitted' }).distinct('itemId'),
+        ListingOverlayItem.find({ run: { $in: runIds }, listingEnded: true }).distinct('itemId'),
+      ]);
+      badged.forEach((id) => badgedItemIds.add(String(id)));
+      ended.forEach((id) => endedItemIds.add(String(id)));
     }
 
     // The category narrows the query in the database; the keyword grammar then
@@ -572,8 +269,8 @@ router.get('/listings-stream', requireAuthSSE, requirePageAccess(PAGE_ID), async
 
     stream.send({ type: 'started' });
 
-    const cursor = OverlayListingSnapshot.find(query)
-      .select('itemId sku title categoryId categoryName imageUrl syncedAt')
+    const cursor = SellerSkuIndex.find(query)
+      .select('itemId sku title categoryName imageUrl syncedAt')
       .lean()
       .cursor();
 
@@ -597,6 +294,12 @@ router.get('/listings-stream', requireAuthSSE, requirePageAccess(PAGE_ID), async
         continue;
       }
 
+      // Not counted as "already badged" — it was never badged, it is just dead.
+      if (endedItemIds.has(String(doc.itemId))) {
+        hiddenEnded += 1;
+        continue;
+      }
+
       matched += 1;
       stream.send({
         type: 'item',
@@ -604,7 +307,6 @@ router.get('/listings-stream', requireAuthSSE, requirePageAccess(PAGE_ID), async
           itemId: doc.itemId,
           title: doc.title || '',
           sku: doc.sku || '',
-          categoryId: doc.categoryId || '',
           categoryName: doc.categoryName || '',
           image: doc.imageUrl || '',
         },
@@ -616,7 +318,8 @@ router.get('/listings-stream', requireAuthSSE, requirePageAccess(PAGE_ID), async
       scanned,
       matched,
       hiddenBadged,
-      snapshotEmpty: scanned === 0,
+      hiddenEnded,
+      indexEmpty: scanned === 0,
       syncedAt,
     });
     stream.finish();
@@ -824,16 +527,14 @@ router.post('/runs/:runId/submit', requireAuth, requirePageAccess(PAGE_ID), asyn
       }
     })));
 
-    // An ended listing can never be revised, so it is dropped from the snapshot
-    // rather than resurfacing in every future search for this seller.
-    let prunedEnded = 0;
+    // Ended listings are NOT deleted from SellerSkuIndex. That collection is
+    // shared with the stock checks, SKU profit report and active-SKU lookups,
+    // so removing rows here would take listings out of their view too. The
+    // daily sync's own cleanup already drops ended listings on its next
+    // complete pass; until then they are filtered out of this page's search by
+    // the listingEnded flag on the run item, which lives in our own collection.
     if (endedItemIds.length) {
-      const pruned = await OverlayListingSnapshot.deleteMany({
-        seller: seller._id,
-        itemId: { $in: endedItemIds },
-      });
-      prunedEnded = pruned.deletedCount || 0;
-      console.log(`[ListingOverlays] pruned ${prunedEnded} ended listing(s) from the snapshot`);
+      console.log(`[ListingOverlays] ${endedItemIds.length} ended listing(s) flagged, index left untouched`);
     }
 
     await ListingOverlayRun.updateOne(
@@ -847,7 +548,6 @@ router.post('/runs/:runId/submit', requireAuth, requirePageAccess(PAGE_ID), asyn
       failedCount,
       skippedAlreadyBadged,
       endedItemIds,
-      prunedEnded,
       results,
     });
   } catch (error) {
