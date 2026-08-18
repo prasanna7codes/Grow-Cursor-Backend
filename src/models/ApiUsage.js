@@ -4,17 +4,17 @@ const apiUsageSchema = new mongoose.Schema({
   service: {
     type: String,
     required: true,
-    enum: ['ScraperAPI', 'Scrapingdog', 'PAAPI', 'Gemini', 'OpenAI'],
-    index: true
+    enum: ['ScraperAPI', 'Scrapingdog', 'PAAPI', 'Gemini', 'OpenAI']
   },
   asin: {
-    type: String,
-    index: true
+    type: String
   },
   timestamp: {
     type: Date,
     default: Date.now,
-    index: true
+    // 60-day retention: the shortest window that always leaves a full previous
+    // month intact for the month-over-month usage report (getUsageStats).
+    index: { expireAfterSeconds: 5184000 }
   },
   creditsUsed: {
     type: Number,

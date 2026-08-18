@@ -213,7 +213,6 @@ const OrderSchema = new mongoose.Schema(
 
 // Index for faster queries
 OrderSchema.index({ seller: 1, orderId: 1 });
-OrderSchema.index({ seller: 1, creationDate: -1 });
 OrderSchema.index({ seller: 1, dateSold: -1 });
 OrderSchema.index({ seller: 1, lastModifiedDate: -1 });
 OrderSchema.index({ seller: 1, creationDate: -1, lastModifiedDate: -1 }); // Compound index for polling queries

@@ -15,8 +15,7 @@ const templateListingSchema = new mongoose.Schema({
   sellerId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Seller',
-    required: true,
-    index: true
+    required: true
   },
 
   // CORE COLUMNS (38 fixed fields)
@@ -204,9 +203,6 @@ const templateListingSchema = new mongoose.Schema({
 // Compound index for SKU uniqueness per seller per template
 templateListingSchema.index({ templateId: 1, sellerId: 1, customLabel: 1 }, { unique: true });
 
-// Compound index for seller + template filtering
-templateListingSchema.index({ templateId: 1, sellerId: 1 });
-
 // Serves the /stats today/week/month/total counters (polled constantly by the
 // Template Listings page) as pure COUNT_SCANs: equality on
 // templateId+sellerId+status, range on createdAt.
@@ -215,7 +211,6 @@ templateListingSchema.index({ templateId: 1, sellerId: 1, status: 1, createdAt: 
 // Additional indexes for database view performance
 templateListingSchema.index({ sellerId: 1, templateId: 1, createdAt: -1 });
 templateListingSchema.index({ customLabel: 1 });
-templateListingSchema.index({ deletedAt: 1 });
 // Serve /database-stats as pure COUNT_SCANs (no document fetches).
 templateListingSchema.index({ deletedAt: 1, status: 1 });
 templateListingSchema.index({ deletedAt: 1, templateId: 1 });

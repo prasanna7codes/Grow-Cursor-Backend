@@ -29,10 +29,10 @@ const SellerItemSchema = new mongoose.Schema(
 
 const AmazonStockCheckItemSchema = new mongoose.Schema(
   {
-    run: { type: mongoose.Schema.Types.ObjectId, ref: 'AmazonStockCheckRun', required: true, index: true },
+    run: { type: mongoose.Schema.Types.ObjectId, ref: 'AmazonStockCheckRun', required: true },
     sku: { type: String, required: true, index: true },
     asin: { type: String, default: '', index: true },
-    currency: { type: String, required: true, index: true },
+    currency: { type: String, required: true },
     country: { type: String, required: true },
     status: {
       type: String,
@@ -62,7 +62,6 @@ const AmazonStockCheckItemSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-AmazonStockCheckItemSchema.index({ run: 1, status: 1 });
 AmazonStockCheckItemSchema.index({ run: 1, status: 1, hasRecentOrder90d: 1 });
 AmazonStockCheckItemSchema.index({ run: 1, status: 1, asin: 1 });
 AmazonStockCheckItemSchema.index({ run: 1, becameAvailable: 1 });
