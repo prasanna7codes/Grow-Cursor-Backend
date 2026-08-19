@@ -9361,7 +9361,7 @@ router.get('/api/seller/:sellerId/template-listings/api-quota-status', requireAu
  *   get:
  *     tags: [Template Listings – Admin]
  *     summary: ASIN cache statistics
- *     description: Returns NodeCache stats for the in-memory ASIN cache (hit rate, key count, enabled state).
+ *     description: Returns NodeCache stats for the in-memory ASIN cache (hit rate, key count, enabled state) alongside process memory usage.
  *     responses:
  *       200:
  *         description: Cache statistics
@@ -9377,6 +9377,16 @@ router.get('/api/seller/:sellerId/template-listings/api-quota-status', requireAu
  *                     enabled: { type: boolean }
  *                     keys:    { type: integer, example: 42 }
  *                     hitRate: { type: number, example: 78.5 }
+ *                 memory:
+ *                   description: Process memory in MB, plus uptime in minutes.
+ *                   type: object
+ *                   properties:
+ *                     rss:           { type: integer, example: 1642 }
+ *                     heapUsed:      { type: integer, example: 412 }
+ *                     heapTotal:     { type: integer, example: 520 }
+ *                     external:      { type: integer, example: 980 }
+ *                     arrayBuffers:  { type: integer, example: 910 }
+ *                     uptimeMinutes: { type: integer, example: 3140 }
  *                 message: { type: string }
  *       401: { description: Unauthorized }
  *       500: { description: Server error }
@@ -9384,11 +9394,27 @@ router.get('/api/seller/:sellerId/template-listings/api-quota-status', requireAu
 router.get('/cache-stats', requireAuth, async (req, res) => {
   try {
     const stats = getAsinCacheStats();
+    const mem = process.memoryUsage();
+    const mb = (bytes) => Math.round(bytes / 1024 / 1024);
 
     res.json({
       success: true,
       cache: stats,
-      message: `Cache ${stats.enabled ? 'enabled' : 'disabled'} - ${stats.keys} ASINs cached, ${stats.hitRate}% hit rate`
+      // node-cache's own `vsize` counts a flat 80 bytes per top-level key and
+      // does not recurse, so it tracks entry count rather than bytes. These are
+      // the numbers that actually show whether memory is growing, and where:
+      // heapUsed rising with cache.keys points at the cache; rss and external
+      // rising while heapUsed stays flat points off-heap (sharp decode buffers),
+      // which --max-old-space-size does not bound and Render still kills on.
+      memory: {
+        rss: mb(mem.rss),
+        heapUsed: mb(mem.heapUsed),
+        heapTotal: mb(mem.heapTotal),
+        external: mb(mem.external),
+        arrayBuffers: mb(mem.arrayBuffers),
+        uptimeMinutes: Math.round(process.uptime() / 60)
+      },
+      message: `Cache ${stats.enabled ? 'enabled' : 'disabled'} - ${stats.keys} ASINs cached, ${stats.hitRate}% hit rate | rss ${mb(mem.rss)}MB, heap ${mb(mem.heapUsed)}MB`
     });
   } catch (error) {
     console.error('[Cache Stats] Error:', error);
