@@ -416,6 +416,18 @@ function parseShippingDate(shippingValue, scrapedAt, timezone) {
   };
 }
 
+// Brands the ASIN precheck never surfaces. A hit anywhere in the title, brand,
+// or description drops the ASIN from the stream entirely rather than returning
+// it as an excluded row, so these never reach the results table.
+const PRECHECK_BLOCKED_BRANDS = ['spigen', 'otterbox'];
+
+function getBlockedBrand(amazonData = {}) {
+  const haystack = [amazonData.title, amazonData.brand, amazonData.description]
+    .map(value => String(value || '').toLowerCase())
+    .join(' ');
+  return PRECHECK_BLOCKED_BRANDS.find(brand => haystack.includes(brand)) || '';
+}
+
 function getPrecheckEnrichment(amazonData = {}, region = 'US', scrapedAt = new Date()) {
   const rawData = amazonData.rawData?.rawData || amazonData.rawData || {};
   const customerReviews = rawData.product_information?.customer_reviews || {};
@@ -805,6 +817,21 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
           });
         }
 
+        const blockedBrand = getBlockedBrand(amazonData);
+        if (blockedBrand) {
+          // Checked before the eBay Motors classifier so a blocked ASIN never
+          // spends an AI call. The client drops the row on this event.
+          sendSse({
+            type: 'item_blocked',
+            asin,
+            id: `asin-precheck-${asin}`,
+            brand: blockedBrand,
+            progress: ++completed,
+            total: asins.length
+          });
+          return;
+        }
+
         const sourceData = buildAmazonSourceData(amazonData);
         const active = activeSkuSet.has(generated.sku) || activeSkuSet.has(generated.baseSku);
         const enrichment = getPrecheckEnrichment(amazonData, region, scrapedAt);
@@ -823,6 +850,7 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
             activeStatus: active ? 'active' : 'inactive',
             title: amazonData.title || '',
             image: Array.isArray(amazonData.images) ? amazonData.images[0] || '' : '',
+            brand: amazonData.brand || '',
             ...enrichment,
             ebayMotorsMode,
             ebayMotorsEligible: ebayMotorsEligibility?.eligible ?? null,
@@ -853,6 +881,7 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
             activeStatus: active ? 'active' : 'inactive',
             title: '',
             image: '',
+            brand: '',
             price: '',
             priceNumber: null,
             availabilityStatus: '',
