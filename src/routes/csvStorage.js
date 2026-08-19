@@ -112,7 +112,14 @@ router.get('/', requireAuth, async (req, res) => {
             .skip(skip)
             .limit(limitNum);
 
-        const total = await CsvStorage.countDocuments(filter);
+        // With no filter, countDocuments({}) is a full COLLSCAN that reads every
+        // ~40KB+ document (the raw CSV lives inside each doc) just to count them —
+        // ~1.3GB off disk and ~22s. estimatedDocumentCount() returns the total from
+        // collection metadata instantly. Fall back to an exact count only when an
+        // actual filter is present.
+        const total = Object.keys(filter).length === 0
+            ? await CsvStorage.estimatedDocumentCount()
+            : await CsvStorage.countDocuments(filter);
 
         res.json({ records, total });
     } catch (err) {
