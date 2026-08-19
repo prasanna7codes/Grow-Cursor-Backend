@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "node --watch src/index.js",
     "dev:test": "node --env-file=.env.test --watch src/index.js",
