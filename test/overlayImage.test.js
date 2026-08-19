@@ -12,6 +12,7 @@ import {
   resolveSavedImageList,
   resolveTemplateOverlay,
   splitImageList,
+  toLargestEbayVariant,
   withOverlaidImages,
 } from '../src/utils/overlayImage.js';
 import { resolveBadge, listBadges } from '../src/config/overlayBadges.js';
@@ -35,7 +36,8 @@ test('registered badges resolve to a path inside the badge directory', () => {
 
   assert.ok(badge);
   assert.equal(badge.key, 'case-only');
-  assert.ok(badge.filePath.endsWith('public/uploads/overlay-badges/case-only-overlay.png'));
+  // Separators normalised: path.join yields backslashes on Windows.
+  assert.ok(badge.filePath.replace(/\\/g, '/').endsWith('public/uploads/overlay-badges/case-only-overlay.png'));
   assert.equal(typeof badge.version, 'number');
 });
 
@@ -519,4 +521,65 @@ test('an empty image list is handled without touching the input', async () => {
   assert.equal((await withOverlaidImages({ asin: 'B001', images: [] }, overlay, { sellerId: SELLER_ID, token: 't' })).applied, false);
   assert.equal((await withOverlaidImages({ asin: 'B001' }, overlay, { sellerId: SELLER_ID, token: 't' })).applied, false);
   assert.equal((await withOverlaidImages(null, overlay, { sellerId: SELLER_ID, token: 't' })).applied, false);
+});
+
+// ── eBay size variants (bulk overlay of existing listings) ───────────────────
+
+test('eBay picture URLs are rewritten to the largest variant', () => {
+  // The compositor drops anything under 500px as source_too_small, so a
+  // thumbnail variant would silently fail to badge.
+  assert.equal(
+    toLargestEbayVariant('https://i.ebayimg.com/images/g/abc/s-l64.jpg'),
+    'https://i.ebayimg.com/images/g/abc/s-l1600.jpg'
+  );
+  assert.equal(
+    toLargestEbayVariant('https://i.ebayimg.com/images/g/abc/s-l500.webp'),
+    'https://i.ebayimg.com/images/g/abc/s-l1600.webp'
+  );
+  // Already largest — unchanged.
+  assert.equal(
+    toLargestEbayVariant('https://i.ebayimg.com/images/g/abc/s-l1600.jpg'),
+    'https://i.ebayimg.com/images/g/abc/s-l1600.jpg'
+  );
+});
+
+test('non-eBay and malformed URLs pass through the variant rewriter untouched', () => {
+  const amazon = 'https://m.media-amazon.com/images/I/s-l64.jpg';
+  assert.equal(toLargestEbayVariant(amazon), amazon);
+  assert.equal(toLargestEbayVariant('not a url'), 'not a url');
+  assert.equal(toLargestEbayVariant(''), '');
+  assert.equal(toLargestEbayVariant(null), null);
+});
+
+test('rewriting a variant keeps the list uniformly eBay-hosted', () => {
+  // The 20004 invariant still has to hold after rewriting.
+  const rewritten = [
+    'https://i.ebayimg.com/images/g/a/s-l64.jpg',
+    'https://i.ebayimg.com/images/g/b/s-l500.jpg',
+  ].map(toLargestEbayVariant);
+
+  assert.equal(hostsAreUniform(rewritten), true);
+  assert.ok(rewritten.every((u) => u.includes('s-l1600')));
+});
+
+test('legacy eBay picture URLs are rewritten to the full-size rendition', () => {
+  // Real URL from a live listing. The base64 segment decodes to "1500X1432",
+  // so the picture is large — but the $_1 rendition downloads at 382x400 and
+  // is dropped by the 500px floor. $_57 is the full-size one.
+  const legacy = 'https://i.ebayimg.com/00/s/MTUwMFgxNDMy/z/0QEAAeSw1bNqV6hn/$_1.JPG?set_id=8800005007';
+
+  assert.equal(
+    toLargestEbayVariant(legacy),
+    'https://i.ebayimg.com/00/s/MTUwMFgxNDMy/z/0QEAAeSw1bNqV6hn/$_57.JPG?set_id=8800005007'
+  );
+  // Already full-size — unchanged.
+  assert.equal(
+    toLargestEbayVariant('https://i.ebayimg.com/00/s/x/z/y/$_57.JPG'),
+    'https://i.ebayimg.com/00/s/x/z/y/$_57.JPG'
+  );
+});
+
+test('an eBay URL matching neither variant scheme is left alone', () => {
+  const odd = 'https://i.ebayimg.com/images/g/abc/custom.jpg';
+  assert.equal(toLargestEbayVariant(odd), odd);
 });

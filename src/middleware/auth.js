@@ -30,6 +30,9 @@ export const PAGE_DEFAULT_ROLES = {
 
   // Listing & Research
   'ManageTemplates': ['superadmin'],
+  // Revises live listings on eBay, so it stays superadmin-only like template
+  // management rather than following the lister-facing pages.
+  'ListingOverlays': ['superadmin'],
   'ListingsDatabase': ['superadmin'],
   'SelectSeller': ['superadmin', 'lister', 'advancelister', 'trainee'],
   'AsinPrecheck': ['superadmin', 'lister', 'advancelister', 'trainee'],

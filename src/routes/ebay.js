@@ -861,7 +861,11 @@ function extractBaseSku(sku) {
 // In-memory tracking: sellerId (string) → { status, startedAt, totalCount, lastSyncAt, error }
 const skuSyncStatus = new Map();
 const skuSyncDismissed = new Set();
-const SKU_SYNC_CONCURRENCY = 3;
+// Sellers crawled in parallel. The job is latency-bound on eBay rather than
+// CPU-bound, so this scales close to linearly — 19 sellers took ~115 min at 3.
+// Env-configurable so it can be dialled back from Render without a deploy if
+// eBay starts returning more transient errors under the extra load.
+const SKU_SYNC_CONCURRENCY = parseInt(process.env.SKU_SYNC_CONCURRENCY, 10) || 4;
 const SKU_SYNC_PAGE_RETRY_DELAYS_MS = [60_000, 180_000, 300_000];
 let activeSkuSyncRunId = null;
 let skuSyncStopRequested = false;
@@ -1009,6 +1013,8 @@ async function runSkuIndexSync(seller, send = null, options = {}) {
   <OutputSelector>ItemArray.Item.SKU</OutputSelector>
   <OutputSelector>ItemArray.Item.Title</OutputSelector>
   <OutputSelector>ItemArray.Item.SellingStatus.CurrentPrice</OutputSelector>
+  <OutputSelector>ItemArray.Item.PrimaryCategory.CategoryName</OutputSelector>
+  <OutputSelector>ItemArray.Item.PictureDetails.GalleryURL</OutputSelector>
   <OutputSelector>PaginationResult</OutputSelector>
 </GetSellerListRequest>`;
 
@@ -1058,11 +1064,15 @@ async function runSkuIndexSync(seller, send = null, options = {}) {
       const currentPrice = item.SellingStatus?.[0]?.CurrentPrice?.[0];
       const price = currentPrice?._ != null ? Number.parseFloat(currentPrice._) : null;
       const currency = currentPrice?.$?.currencyID || '';
+      // Consumed by the Listing Overlays page for category filtering and its
+      // results thumbnail. Harmless to every other reader of this collection.
+      const categoryName = item.PrimaryCategory?.[0]?.CategoryName?.[0] || '';
+      const imageUrl = item.PictureDetails?.[0]?.GalleryURL?.[0] || '';
       if (sku) skuPresentCount++; else skuBlankCount++;
       ops.push({
         updateOne: {
           filter: { seller: seller._id, itemId },
-          update: { $set: { sku, baseSku: extractBaseSku(sku), title: item.Title?.[0] || '', price, currency, syncedAt: syncStart } },
+          update: { $set: { sku, baseSku: extractBaseSku(sku), title: item.Title?.[0] || '', price, currency, categoryName, imageUrl, syncedAt: syncStart } },
           upsert: true,
         },
       });

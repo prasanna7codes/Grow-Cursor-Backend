@@ -10,6 +10,14 @@ const SellerSkuIndexSchema = new mongoose.Schema({
     sku:    { type: String, default: '' },
     baseSku:{ type: String, default: '' }, // sku with trailing -<number> stripped
     title:  { type: String, default: '' },
+    // Added for the Listing Overlays page, which needs to find listings by
+    // category and show a thumbnail. Both come free from the GetSellerList call
+    // this sync already makes — a second crawl just to collect them would double
+    // the API cost of covering the same ~425k listings.
+    categoryName: { type: String, default: '' },
+    // Gallery thumbnail only. The full picture set is read live from GetItem at
+    // the moment a listing is actually badged.
+    imageUrl: { type: String, default: '' },
     price: { type: Number, default: null },
     currency: { type: String, default: '' },
     syncedAt: { type: Date, required: true },
