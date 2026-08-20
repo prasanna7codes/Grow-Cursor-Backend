@@ -1,4 +1,5 @@
 import express from 'express';
+import v8 from 'node:v8';
 import mongoose from 'mongoose';
 import { requireAuth, requireAuthSSE, requirePageAccess } from '../middleware/auth.js';
 import { requireObjectId } from '../middleware/objectId.js';
@@ -9384,6 +9385,18 @@ router.get('/api/seller/:sellerId/template-listings/api-quota-status', requireAu
   }
 });
 
+// The cgroup memory limit the process is actually running under, in MB.
+// process.constrainedMemory() reports the container's limit rather than the
+// host's RAM; on an unconstrained machine it returns 0 or the cgroup "max"
+// sentinel (a value near 2^64), neither of which is a real limit — both are
+// reported as null so a local reading is not mistaken for a container one.
+function readConstrainedMemoryMb() {
+  if (typeof process.constrainedMemory !== 'function') return null;
+  const bytes = process.constrainedMemory();
+  if (!Number.isFinite(bytes) || bytes <= 0 || bytes > 1024 ** 4) return null;
+  return Math.round(bytes / 1024 / 1024);
+}
+
 /**
  * @swagger
  * /template-listings/cache-stats:
@@ -9416,6 +9429,9 @@ router.get('/api/seller/:sellerId/template-listings/api-quota-status', requireAu
  *                     external:      { type: integer, example: 980 }
  *                     arrayBuffers:  { type: integer, example: 910 }
  *                     uptimeMinutes: { type: integer, example: 3140 }
+ *                     heapLimit:     { type: integer, example: 2144, description: V8 heap ceiling; reflects --max-old-space-size when set }
+ *                     containerLimit: { type: integer, nullable: true, example: 2048, description: "cgroup memory limit Node sees; null if unconstrained" }
+ *                     nodeVersion:   { type: string, example: v20.11.1 }
  *                 message: { type: string }
  *       401: { description: Unauthorized }
  *       500: { description: Server error }
@@ -9441,7 +9457,18 @@ router.get('/cache-stats', requireAuth, async (req, res) => {
         heapTotal: mb(mem.heapTotal),
         external: mb(mem.external),
         arrayBuffers: mb(mem.arrayBuffers),
-        uptimeMinutes: Math.round(process.uptime() / 60)
+        uptimeMinutes: Math.round(process.uptime() / 60),
+        // The ceiling V8 will actually enforce. It is NOT the number passed to
+        // --max-old-space-size: the old space is one of several V8 spaces and the
+        // rest are added on top, so `--max-old-space-size=1536` reports ~1632 here.
+        // Without the flag this shows the default Node derived at startup, which is
+        // the only way to tell whether setting the flag tightens the limit or loosens
+        // it. For the flag to do its job — a clean JS heap OOM instead of a silent
+        // container kill — this has to sit far enough below containerLimit that the
+        // off-heap usage (sharp decode buffers, driver buffers) fits underneath.
+        heapLimit: mb(v8.getHeapStatistics().heap_size_limit),
+        containerLimit: readConstrainedMemoryMb(),
+        nodeVersion: process.version
       },
       message: `Cache ${stats.enabled ? 'enabled' : 'disabled'} - ${stats.keys} ASINs cached, ${stats.hitRate}% hit rate | rss ${mb(mem.rss)}MB, heap ${mb(mem.heapUsed)}MB`
     });
