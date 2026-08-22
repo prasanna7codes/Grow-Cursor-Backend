@@ -4,6 +4,7 @@ import axios from 'axios';
 import pLimit from 'p-limit';
 import { parseStringPromise } from 'xml2js';
 import { requireAuth, requirePageAccess, requireFeatureAccess } from '../middleware/auth.js';
+import { requireObjectId } from '../middleware/objectId.js';
 
 // Feature id used to gate who may run Estimate/Start on this page (superadmin
 // always allowed; others must be explicitly granted via /feature-permissions).
@@ -12,6 +13,10 @@ export const AMAZON_STOCK_CHECK_RUN_FEATURE_ID = 'amazonStockCheck.run';
 // Pages allowed to use these endpoints. SellerSkuStockCheck is the
 // seller-scoped variant of the Amazon Stock Check page.
 const STOCK_CHECK_PAGES = ['AmazonStockCheck', 'SellerSkuStockCheck'];
+
+// The revision history has its own page, and is also reachable from the stock
+// check pages that create the revisions.
+const LISTING_REVISION_PAGES = ['ListingRevisions', ...STOCK_CHECK_PAGES];
 import SellerSkuIndex from '../models/SellerSkuIndex.js';
 import TemplateListing from '../models/TemplateListing.js';
 import Seller from '../models/Seller.js';
@@ -2424,6 +2429,105 @@ router.post('/revise-listing/apply', requireAuth, requirePageAccess(STOCK_CHECK_
       }).catch(() => {});
     }
     res.status(500).json({ error: error.message || 'Failed to revise listing' });
+  }
+});
+
+/**
+ * GET /amazon-stock-checks/revisions
+ *
+ * The ASIN-swap history, newest first. Descriptions and image lists are left
+ * out — they are the bulk of a revision document and are only ever read one at
+ * a time, from the detail route below.
+ */
+router.get('/revisions', requireAuth, requirePageAccess(LISTING_REVISION_PAGES), async (req, res) => {
+  try {
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(200, Math.max(1, Number.parseInt(req.query.limit, 10) || 50));
+    const filter = {};
+
+    if (['pending', 'success', 'failed'].includes(req.query.status)) {
+      filter.status = req.query.status;
+    }
+    if (mongoose.Types.ObjectId.isValid(String(req.query.sellerId || ''))) {
+      filter.seller = req.query.sellerId;
+    }
+
+    // One box for every identifier on the row — an item id, either SKU or
+    // either ASIN — because none of them is worth its own input when they never
+    // overlap in shape.
+    const search = String(req.query.search || '').trim();
+    if (search) {
+      const rx = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      filter.$or = [
+        { itemId: rx }, { previousSku: rx }, { newSku: rx },
+        { previousAsin: rx }, { newAsin: rx }
+      ];
+    }
+
+    const [rows, total] = await Promise.all([
+      ListingRevision.find(filter)
+        .select('-before.description -after.description -before.images -after.images -before.itemSpecifics -after.itemSpecifics')
+        .populate({ path: 'seller', populate: { path: 'user', select: 'username name email' } })
+        .populate('requestedBy', 'username name email')
+        .populate('templateId', 'name')
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      ListingRevision.countDocuments(filter)
+    ]);
+
+    res.json({
+      total,
+      page,
+      limit,
+      rows: rows.map((row) => ({
+        _id: row._id,
+        itemId: row.itemId,
+        sellerName: row.seller?.user?.username || row.seller?.user?.name || row.seller?.user?.email || '',
+        templateName: row.templateId?.name || '',
+        previousAsin: row.previousAsin,
+        previousSku: row.previousSku,
+        newAsin: row.newAsin,
+        newSku: row.newSku,
+        previousTitle: row.before?.title || '',
+        newTitle: row.after?.title || '',
+        previousPrice: row.before?.price ?? null,
+        newPrice: row.after?.price ?? null,
+        currency: row.before?.currency || '',
+        status: row.status,
+        error: row.error || '',
+        bookkeepingError: row.bookkeepingError || '',
+        requestedBy: row.requestedBy?.username || row.requestedBy?.name || row.requestedBy?.email || '',
+        appliedAt: row.appliedAt,
+        createdAt: row.createdAt
+      }))
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to load listing revisions' });
+  }
+});
+
+// GET /amazon-stock-checks/revisions/:id — one revision in full, including the
+// before/after descriptions, pictures and item specifics.
+router.get('/revisions/:id', requireAuth, requirePageAccess(LISTING_REVISION_PAGES), requireObjectId(), async (req, res) => {
+  try {
+    const revision = await ListingRevision.findById(req.params.id)
+      .populate({ path: 'seller', populate: { path: 'user', select: 'username name email' } })
+      .populate('requestedBy', 'username name email')
+      .populate('templateId', 'name')
+      .lean();
+
+    if (!revision) return res.status(404).json({ error: 'Revision not found' });
+
+    res.json({
+      ...revision,
+      sellerName: revision.seller?.user?.username || revision.seller?.user?.name || revision.seller?.user?.email || '',
+      templateName: revision.templateId?.name || '',
+      requestedByName: revision.requestedBy?.username || revision.requestedBy?.name || revision.requestedBy?.email || ''
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to load the revision' });
   }
 });
 
