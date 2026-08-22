@@ -13,6 +13,7 @@ import axios from 'axios';
 import { parseStringPromise } from 'xml2js';
 import { requireAuth } from '../middleware/auth.js';
 import Seller from '../models/Seller.js';
+import TemplateListing from '../models/TemplateListing.js';
 import { ensureValidToken } from './ebay.js';
 
 const router = express.Router();
@@ -51,9 +52,39 @@ const escapeXml = (s) =>
 // ─── Normalise single-item eBay responses to arrays ───────────────────────────
 const toArray = (v) => (v == null ? [] : Array.isArray(v) ? v : [v]);
 
-// ─── Fetch SKU for a single item via GetItem ─────────────────────────────────
-// GetItem always returns Item.SKU (the seller's custom label / SKU) when set.
-async function fetchItemSku(token, siteId, itemId) {
+// ─── Run an async mapper over ids with a bounded number of in-flight calls ───
+// GetBestOffers can return hundreds of offers and find_eligible_items is capped
+// at 200 listings; firing that many GetItem calls at once trips eBay throttling.
+const GETITEM_CONCURRENCY = 8;
+
+async function mapWithConcurrency(items, worker, limit = GETITEM_CONCURRENCY) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await worker(items[index]);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
+
+// ─── Fetch the full item stub for a single listing via GetItem ───────────────
+// Neither GetBestOffers nor the Negotiation API's find_eligible_items returns
+// anything beyond IDs, so one GetItem per unique listing supplies the SKU,
+// title, price, gallery photo, and Best Offer flag that both tabs render.
+const EMPTY_ITEM_DETAILS = {
+  sku: '',
+  title: '',
+  imageUrl: '',
+  currentPrice: null,
+  currentPriceCurrency: 'USD',
+  bestOfferEnabled: null,
+  listingStatus: '',
+};
+
+async function fetchItemDetails(token, siteId, itemId) {
   try {
     const xml = `<?xml version="1.0" encoding="utf-8"?>
 <GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
@@ -65,10 +96,78 @@ async function fetchItemSku(token, siteId, itemId) {
       headers: tradingHeaders('GetItem', siteId),
     });
     const parsed = await parseStringPromise(resp.data, { explicitArray: false });
-    return parsed?.GetItemResponse?.Item?.SKU ?? '';
+    const item = parsed?.GetItemResponse?.Item;
+    if (!item) return { ...EMPTY_ITEM_DETAILS };
+
+    // GetItem returns the current price under SellingStatus; BuyItNowPrice is
+    // only populated for auction-format listings.
+    const price = item.SellingStatus?.CurrentPrice ?? item.BuyItNowPrice;
+    const bestOffer = item.BestOfferDetails?.BestOfferEnabled;
+
+    return {
+      sku: item.SKU ?? '',
+      title: item.Title ?? '',
+      imageUrl: item.PictureDetails?.GalleryURL ?? '',
+      currentPrice: price?._ ?? price ?? null,
+      currentPriceCurrency: price?.['$']?.currencyID ?? item.Currency ?? 'USD',
+      bestOfferEnabled: bestOffer == null ? null : bestOffer === 'true' || bestOffer === true,
+      listingStatus: item.SellingStatus?.ListingStatus ?? '',
+    };
   } catch {
-    return '';
+    return { ...EMPTY_ITEM_DETAILS };
   }
+}
+
+// ─── SKU → ASIN enrichment from the Template Listings database ───────────────
+// eBay knows nothing about ASINs; the SKU ↔ ASIN mapping lives on
+// TemplateListing._asinReference. Mirrors the lookup in amazonStockChecks.js:
+//   - _asinReference is `select: false`, so it must be requested with a leading +
+//   - SKUs are matched on baseCustomLabel (the part before the first "-") under
+//     an en/strength-2 collation, which is what the baseCustomLabel_asin_ci_lookup
+//     index is built for.
+const cleanAsin = (v) => String(v || '').trim().toUpperCase();
+const getBaseLabel = (v) => String(v || '').trim().split('-')[0].trim();
+const isAmazonAsin = (v) => /^B0[A-Z0-9]{8}$/.test(cleanAsin(v));
+
+// itemPhotoUrl stores every image for the listing as a pipe-separated list;
+// the first entry is the primary photo.
+const firstPhotoUrl = (v) => String(v || '').split('|')[0].trim();
+
+async function buildAsinLookup(offers, sellerId) {
+  const labels = [
+    ...new Set(offers.map((o) => getBaseLabel(o.sku)).filter(Boolean)),
+  ];
+  if (labels.length === 0) return new Map();
+
+  const rows = await TemplateListing.find({
+    baseCustomLabel: { $in: labels },
+    _asinReference: { $exists: true, $ne: '' },
+  })
+    .select('customLabel baseCustomLabel sellerId deletedAt itemPhotoUrl amazonLink +_asinReference')
+    .collation({ locale: 'en', strength: 2 })
+    .lean();
+
+  // A SKU can exist under several sellers (and under soft-deleted rows). Rank
+  // candidates so the offer's own seller wins, then any live row, rather than
+  // letting whichever document Mongo returned first decide.
+  const best = new Map();
+  for (const row of rows) {
+    const label = getBaseLabel(row.baseCustomLabel || row.customLabel).toUpperCase();
+    if (!label) continue;
+    const score =
+      (String(row.sellerId) === String(sellerId) ? 2 : 0) + (row.deletedAt ? 0 : 1);
+    const current = best.get(label);
+    if (current && current.score >= score) continue;
+
+    const asin = cleanAsin(row._asinReference);
+    best.set(label, {
+      score,
+      asin,
+      amazonLink: row.amazonLink || `https://www.amazon.com/dp/${asin}`,
+      imageUrl: firstPhotoUrl(row.itemPhotoUrl),
+    });
+  }
+  return best;
 }
 
 // ─── Normalise one eBay BestOffer node into a clean object ───────────────────
@@ -98,6 +197,10 @@ function parseOffer(item, offer) {
     buyerId: offer.Buyer?.UserID ?? '',
     buyerFeedbackScore: offer.Buyer?.FeedbackScore ?? 0,
     buyerEmail: offer.Buyer?.Email ?? '',
+    // Filled in below by the GetItem / TemplateListing enrichment passes.
+    imageUrl: '',
+    asin: '',
+    amazonLink: '',
   };
 }
 
@@ -203,20 +306,44 @@ router.get('/best-offers', requireAuth, async (req, res) => {
       }
     }
 
-    // ── Enrich with SKU via GetItem (parallel, one call per unique item ID) ──
+    // ── Enrich with SKU + photo via GetItem (parallel, one per unique item) ──
     // GetBestOffers does not return Item.SKU in its item stub; GetItem does.
     if (offers.length > 0) {
       const uniqueItemIds = [...new Set(offers.map(o => o.itemId).filter(Boolean))];
-      const skuResults = await Promise.all(
-        uniqueItemIds.map(id => fetchItemSku(token, siteId, id).then(sku => [id, sku]))
+      const detailResults = await mapWithConcurrency(
+        uniqueItemIds,
+        id => fetchItemDetails(token, siteId, id).then(d => [id, d])
       );
-      const skuMap = Object.fromEntries(skuResults);
+      const detailMap = new Map(detailResults);
       for (const offer of offers) {
-        if (skuMap[offer.itemId]) offer.sku = skuMap[offer.itemId];
+        const details = detailMap.get(offer.itemId);
+        if (!details) continue;
+        if (details.sku) offer.sku = details.sku;
+        if (details.imageUrl) offer.imageUrl = details.imageUrl;
+      }
+
+      // ── Enrich with ASIN from the Template Listings DB (one batched query) ──
+      // Resolved after the SKU pass above, since the SKU is the join key.
+      const asinByLabel = await buildAsinLookup(offers, sellerId);
+      for (const offer of offers) {
+        // Some sellers use the ASIN itself as the custom label — no lookup needed.
+        if (isAmazonAsin(offer.sku)) {
+          offer.asin = cleanAsin(offer.sku);
+          offer.amazonLink = `https://www.amazon.com/dp/${offer.asin}`;
+          continue;
+        }
+        const match = asinByLabel.get(getBaseLabel(offer.sku).toUpperCase());
+        if (!match) continue;
+        offer.asin = match.asin;
+        offer.amazonLink = match.amazonLink;
+        if (!offer.imageUrl) offer.imageUrl = match.imageUrl;
       }
     }
 
-    console.log(`[BestOffers] fetched ${offers.length} offer(s) via single GetBestOffers call`);
+    console.log(
+      `[BestOffers] fetched ${offers.length} offer(s) via single GetBestOffers call; ` +
+      `${offers.filter(o => o.asin).length} resolved to an ASIN`
+    );
 
     const pagination = root?.PaginationResult ?? {};
     return res.json({
@@ -423,15 +550,37 @@ router.get('/eligible-offers', requireAuth, async (req, res) => {
       }
     );
 
-    const items = (response.data.eligibleItems ?? []).map((i) => ({
-      listingId: i.listingId,
-      itemId: i.itemId,
-      title: i.listingTitle ?? i.listingId,
-      listingStatus: i.listingStatus ?? 'ACTIVE',
-      minimumOfferPrice: i.minimumOfferPrice?.value ?? null,
-      minimumOfferCurrency: i.minimumOfferPrice?.currency ?? 'USD',
-      interestedBuyers: i.eligibleCounterPartiesCount ?? 0,
-    }));
+    // find_eligible_items returns ONLY listingId per entry (see EligibleItem in
+    // the Negotiation API docs) — no title, price, photo, or buyer count. The
+    // listingId is the same value as the Trading API's ItemID, so GetItem fills
+    // in everything the table renders.
+    const eligibleItems = response.data.eligibleItems ?? [];
+    const siteId = getSiteId(seller);
+
+    const items = await mapWithConcurrency(eligibleItems, async (i) => {
+      const listingId = i.listingId;
+      const details = await fetchItemDetails(token, siteId, listingId);
+      return {
+        listingId,
+        itemId: listingId,
+        title: details.title || listingId,
+        imageUrl: details.imageUrl,
+        currentPrice: details.currentPrice,
+        currentPriceCurrency: details.currentPriceCurrency,
+        bestOfferEnabled: details.bestOfferEnabled,
+        listingStatus: details.listingStatus || 'ACTIVE',
+        // eBay does not expose a minimum offer price or a per-listing buyer
+        // count on this endpoint; both stay null/0 until a richer source exists.
+        minimumOfferPrice: null,
+        minimumOfferCurrency: 'USD',
+        interestedBuyers: 0,
+      };
+    });
+
+    console.log(
+      `[BestOffers] ${items.length} eligible listing(s); ` +
+      `${items.filter(i => i.imageUrl).length} enriched with a photo`
+    );
 
     return res.json({ success: true, items, total: response.data.total ?? items.length });
   } catch (err) {
