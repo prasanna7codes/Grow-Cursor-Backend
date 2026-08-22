@@ -98,6 +98,7 @@ export const PAGE_DEFAULT_ROLES = {
   'ViewAllMessages': ['superadmin'],
   'Attendance': ['superadmin'],
   'PageAccessManagement': ['superadmin'],
+  'PageAccessOverview': ['superadmin'],
   'PageAccessAuditLog': ['superadmin'],
   'UserPasswordManagement': ['superadmin'],
 
