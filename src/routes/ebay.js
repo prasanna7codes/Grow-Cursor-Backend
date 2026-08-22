@@ -1014,7 +1014,7 @@ async function runSkuIndexSync(seller, send = null, options = {}) {
   <OutputSelector>ItemArray.Item.Title</OutputSelector>
   <OutputSelector>ItemArray.Item.SellingStatus.CurrentPrice</OutputSelector>
   <OutputSelector>ItemArray.Item.PrimaryCategory.CategoryName</OutputSelector>
-  <OutputSelector>ItemArray.Item.PictureDetails.GalleryURL</OutputSelector>
+  <OutputSelector>ItemArray.Item.PictureDetails</OutputSelector>
   <OutputSelector>PaginationResult</OutputSelector>
 </GetSellerListRequest>`;
 
@@ -1067,7 +1067,14 @@ async function runSkuIndexSync(seller, send = null, options = {}) {
       // Consumed by the Listing Overlays page for category filtering and its
       // results thumbnail. Harmless to every other reader of this collection.
       const categoryName = item.PrimaryCategory?.[0]?.CategoryName?.[0] || '';
-      const imageUrl = item.PictureDetails?.[0]?.GalleryURL?.[0] || '';
+      // The whole PictureDetails node, not PictureDetails.GalleryURL: eBay
+      // returns nothing for that narrower selector even though the equally
+      // nested PrimaryCategory.CategoryName works. Both other GetSellerList
+      // calls in this file already ask for the whole node.
+      // GalleryURL first (one small thumbnail), falling back to the first
+      // full-size picture when a listing has no gallery image.
+      const pictures = item.PictureDetails?.[0];
+      const imageUrl = pictures?.GalleryURL?.[0] || pictures?.PictureURL?.[0] || '';
       if (sku) skuPresentCount++; else skuBlankCount++;
       ops.push({
         updateOne: {

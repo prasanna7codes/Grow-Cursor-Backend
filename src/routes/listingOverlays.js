@@ -20,6 +20,15 @@ const PAGE_ID = 'ListingOverlays';
 
 const EBAY_API = 'https://api.ebay.com/ws/api.dll';
 
+// One table page's worth of thumbnails — matches the largest sensible rows-
+// per-page choice, so a full page is always covered in a single request. These are plain GetItem reads with no
+// image decoding, but they are a per-view cost that buys nothing permanent, so
+// the cap keeps a broad search from turning into thousands of calls as someone
+// pages through it. Once the SKU sync has stored imageUrl, the client stops
+// asking for these at all.
+const LIVE_IMAGE_LIMIT = 100;
+const LIVE_IMAGE_CONCURRENCY = 6;
+
 // SiteID 0 throughout: these calls read/write item data rather than prices in a
 // site currency, and 0 is what the existing seller-wide crawls use.
 function tradingHeaders(callName) {
@@ -327,6 +336,73 @@ router.get('/listings-stream', requireAuthSSE, requirePageAccess(PAGE_ID), async
     console.error('[ListingOverlays] listings-stream error:', error.message);
     stream.send({ type: 'error', error: error.message });
     stream.finish();
+  }
+});
+
+/**
+ * Gallery thumbnail for one listing, straight from eBay.
+ *
+ * Separate from fetchListingPictures(), which returns the full picture set for
+ * compositing: this wants the smallest usable rendition for a 48px table cell,
+ * so GalleryURL is preferred and the full-size picture is only a fallback.
+ */
+async function fetchListingThumbnail(token, itemId) {
+  const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+<GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
+  <ItemID>${itemId}</ItemID>
+  <OutputSelector>Item.ItemID</OutputSelector>
+  <OutputSelector>Item.PictureDetails</OutputSelector>
+</GetItemRequest>`;
+
+  const response = await axios.post(EBAY_API, xmlRequest, {
+    headers: tradingHeaders('GetItem'),
+    timeout: 20000,
+  });
+
+  const parsed = await parseStringPromise(response.data, { explicitArray: false });
+  const pictures = parsed?.GetItemResponse?.Item?.PictureDetails;
+  if (!pictures) return '';
+
+  return asArray(pictures.GalleryURL)[0] || asArray(pictures.PictureURL)[0] || '';
+}
+
+/**
+ * POST /listing-overlays/live-images   body: { sellerId, itemIds: [] }
+ *
+ * Thumbnails for the rows currently on screen, for listings whose indexed
+ * imageUrl is still empty — which is every row until the SKU sync has run once
+ * with the picture selector. Bounded to a page's worth on purpose.
+ */
+router.post('/live-images', requireAuth, requirePageAccess(PAGE_ID), async (req, res) => {
+  try {
+    const { sellerId } = req.body || {};
+    const itemIds = [...new Set((req.body?.itemIds || []).map((id) => String(id).trim()).filter(Boolean))]
+      .slice(0, LIVE_IMAGE_LIMIT);
+
+    if (!itemIds.length) return res.json({ images: {} });
+
+    const seller = await loadSeller(sellerId);
+    if (!seller) return res.status(404).json({ error: 'Seller not found' });
+
+    const token = await ensureValidToken(seller);
+    const limit = pLimit(LIVE_IMAGE_CONCURRENCY);
+
+    const entries = await Promise.all(itemIds.map((itemId) => limit(async () => {
+      try {
+        const url = await fetchListingThumbnail(token, itemId);
+        return url ? [itemId, url] : null;
+      } catch {
+        // An ended or unavailable listing simply has no thumbnail; one missing
+        // image must never fail the whole page.
+        return null;
+      }
+    })));
+
+    res.json({ images: Object.fromEntries(entries.filter(Boolean)) });
+  } catch (error) {
+    console.error('[ListingOverlays] live-images error:', error.message);
+    res.status(500).json({ error: error.message });
   }
 });
 
