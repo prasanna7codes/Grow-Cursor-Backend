@@ -4,36 +4,19 @@ import AmazonAccount from '../models/AmazonAccount.js';
 import AmazonAccountDailyBalance from '../models/AmazonAccountDailyBalance.js';
 import Seller from '../models/Seller.js';
 import { requireAuth } from '../middleware/auth.js';
+import {
+    DAY_IN_MS,
+    MAX_ORDERS_PER_AMAZON_ACCOUNT,
+    buildDayRange,
+    getPlatformDayString,
+} from '../utils/platformDay.js';
 
 const router = express.Router();
 
 // All routes require authentication
 router.use(requireAuth);
 
-// PST offset used throughout the platform
-const PST_OFFSET_HOURS = 8;
-const DAY_IN_MS = 24 * 60 * 60 * 1000;
 const CARRY_OVER_START_DATE = '2026-03-10';
-const MAX_ORDERS_PER_AMAZON_ACCOUNT = 9;
-
-/**
- * Builds a UTC date range for a given YYYY-MM-DD string (PST day boundaries)
- */
-function buildDayRange(dateStr) {
-    const start = new Date(dateStr);
-    start.setUTCHours(PST_OFFSET_HOURS, 0, 0, 0);
-
-    const end = new Date(dateStr);
-    end.setDate(end.getDate() + 1);
-    end.setUTCHours(PST_OFFSET_HOURS - 1, 59, 59, 999);
-
-    return { start, end };
-}
-
-function getPlatformDayString(dateValue) {
-    const shifted = new Date(new Date(dateValue).getTime() - PST_OFFSET_HOURS * 60 * 60 * 1000);
-    return shifted.toISOString().slice(0, 10);
-}
 
 function getCarryOverLabel(carryOverDays) {
     if (carryOverDays <= 0) return '';
