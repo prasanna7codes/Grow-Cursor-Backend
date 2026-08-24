@@ -582,6 +582,86 @@ export async function overlayListingImages(imageUrls, overlay, ctx = {}) {
 }
 
 /**
+ * Move a set of pictures onto eBay Picture Services without badging any of them.
+ *
+ * The badged paths host as a side effect of compositing, which leaves every
+ * template that has no badge configured pointing its listings at Amazon URLs.
+ * That is survivable when a listing is CREATED — eBay ingests the externals at
+ * publish time — but not when one is REVISED onto a different product: the
+ * pictures change while the item stays live, so anything eBay fails to fetch
+ * leaves the old product's photos on a listing that now describes a new one.
+ *
+ * Uses the same PLAIN_BADGE route the secondary images already take, so these
+ * share the OverlayImage cache and the all-or-nothing failure rule with every
+ * other hosted picture rather than growing a second set of semantics.
+ *
+ * Already-hosted pictures are left alone, which makes this safe to call after a
+ * badge run: it becomes a no-op rather than a second upload of the same bytes.
+ *
+ * @param {string[]} imageUrls - pictures, primary first
+ * @param {{sellerId: string, token: string}} ctx
+ * @returns {Promise<{images: string[], applied: boolean, warning?: string}>}
+ *   `images` is the original list untouched whenever applied is false.
+ */
+export async function hostImagesOnEbay(imageUrls, ctx = {}) {
+  const images = Array.isArray(imageUrls) ? imageUrls.filter(Boolean) : [];
+
+  if (!images.length || !ctx.token || !ctx.sellerId) {
+    return { images, applied: false };
+  }
+
+  // Nothing to do — every picture is already on EPS.
+  if (images.every(isAlreadyOverlaid)) {
+    return { images, applied: false };
+  }
+
+  try {
+    const skips = [];
+    const hosted = await hostAllImages(images, { badge: PLAIN_BADGE, placement: PLAIN_PLACEMENT }, ctx, {
+      skipHosted: true,
+      onSkip: (reason, sourceUrl) => skips.push({ reason, sourceUrl }),
+    });
+
+    if (!hosted) {
+      return { images, applied: false, warning: describeHostSkip(skips) };
+    }
+
+    // A half-hosted list is the 20004 rejection. hostAllImages already bails on
+    // the first failure, so this only fires if that contract ever breaks.
+    if (!hostsAreUniform(hosted)) {
+      console.error('[Overlay] Refusing mixed-host image list from plain hosting');
+      return { images, applied: false, warning: 'Pictures were left on their original host: hosting produced a mixed list.' };
+    }
+
+    return { images: hosted, applied: true };
+  } catch (error) {
+    console.error(`[Overlay] Plain hosting failed: ${error.message}`);
+    return { images, applied: false, warning: `Pictures could not be hosted on eBay: ${error.message}` };
+  }
+}
+
+// describeSkip's wording is about a badge that did not get applied, which is
+// the wrong story when no badge was ever involved.
+function describeHostSkip(skips) {
+  if (!skips.length) {
+    return 'Pictures were left on their original host: not every picture could be uploaded to eBay, and a listing cannot mix eBay-hosted and external pictures.';
+  }
+
+  const tooSmall = skips.filter((s) => s.reason === 'source_too_small').length;
+  const unreadable = skips.filter((s) => s.reason === 'unreadable_source').length;
+  const parts = [];
+
+  if (tooSmall) {
+    parts.push(`${tooSmall} picture${tooSmall === 1 ? ' is' : 's are'} under ${MIN_SOURCE_EDGE}px, which eBay rejects as a listing image`);
+  }
+  if (unreadable) {
+    parts.push(`${unreadable} picture${unreadable === 1 ? ' could' : 's could'} not be read`);
+  }
+
+  return `Pictures were left on their original host: ${parts.join('; ')}.`;
+}
+
+/**
  * Return a copy of amazonData whose primary image carries the overlay badge and
  * whose every image is hosted on eBay Picture Services.
  *
