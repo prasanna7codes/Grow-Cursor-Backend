@@ -3,9 +3,11 @@ import test from 'node:test';
 import {
   applyOverlayMapping,
   buildCacheKey,
+  canReuseCachedImage,
   buildOverlayResult,
   hostsAreUniform,
   isAlreadyOverlaid,
+  isExpiring,
   NO_OVERLAY,
   replaceImages,
   resolveEffectiveBadgeKey,
@@ -582,4 +584,96 @@ test('legacy eBay picture URLs are rewritten to the full-size rendition', () => 
 test('an eBay URL matching neither variant scheme is left alone', () => {
   const odd = 'https://i.ebayimg.com/images/g/abc/custom.jpg';
   assert.equal(toLargestEbayVariant(odd), odd);
+});
+
+// ── Cache expiry ─────────────────────────────────────────────────────────────
+//
+// EPS drops a picture that no live listing references. A cache hit on a dropped
+// picture hands a dead URL into a listing's image list, and hostAllImages()
+// treats one bad image as poisoning the whole listing — so getting this wrong
+// is a listing failure, not a slow path.
+
+const HOUR = 60 * 60 * 1000;
+const NOW = Date.parse('2026-08-27T12:00:00Z');
+
+test('a picture with plenty of runway is reused', () => {
+  assert.equal(isExpiring(new Date(NOW + 5 * 24 * HOUR), NOW), false);
+});
+
+test('a picture already past its expiry is not reused', () => {
+  assert.equal(isExpiring(new Date(NOW - HOUR), NOW), true);
+});
+
+test('a picture expiring inside the safety margin is not reused', () => {
+  // The gap that matters is preview → CSV export → upload, which routinely
+  // spans a working day. Twelve hours of runway is not enough to survive it.
+  assert.equal(isExpiring(new Date(NOW + 12 * HOUR), NOW), true);
+  assert.equal(isExpiring(new Date(NOW + 25 * HOUR), NOW), false);
+});
+
+test('pre-migration rows with no expiry are re-hosted rather than trusted', () => {
+  // UploadSiteHostedPictures returned no expiry and offered no way to query
+  // one, so these rows have an unknown deadline. Re-hosting once is the only
+  // way to get back to a picture whose lifetime is known.
+  assert.equal(isExpiring(null, NOW), true);
+  assert.equal(isExpiring(undefined, NOW), true);
+});
+
+test('an unparseable expiry is treated as expired', () => {
+  assert.equal(isExpiring('not a date', NOW), true);
+});
+
+test('an ISO string expiry is accepted, not just a Date', () => {
+  // Mongo hands back Dates, but .lean() results and any JSON round trip do not.
+  assert.equal(isExpiring('2026-09-05T12:00:00Z', NOW), false);
+  assert.equal(isExpiring('2026-08-27T18:00:00Z', NOW), true);
+});
+
+// ── Cache reuse window ───────────────────────────────────────────────────────
+//
+// The stored expiry describes the picture at upload time, while it was still
+// unattached. Once a listing uses it the real lifetime becomes that listing's,
+// and eBay drops the picture days after the listing ENDS — an event this system
+// never observes. So a row can hold an expiry that outlives its own picture,
+// and age is the second, independent guard against trusting it.
+
+const FRESH = {
+  hostedUrl: 'https://i.ebayimg.com/images/g/abc/s-l1600.jpg',
+  expiresAt: new Date(NOW + 5 * 24 * HOUR),
+  hostedAt: new Date(NOW - HOUR),
+};
+
+test('a freshly hosted picture with runway is reused', () => {
+  assert.equal(canReuseCachedImage(FRESH, NOW), true);
+});
+
+test('a row older than the trust window is re-hosted even with a valid expiry', () => {
+  // The ended-listing case: relisting the same ASIN weeks later must not serve
+  // a URL whose picture eBay reclaimed when the first listing ended.
+  assert.equal(
+    canReuseCachedImage({ ...FRESH, hostedAt: new Date(NOW - 30 * 24 * HOUR) }, NOW),
+    false
+  );
+});
+
+test('the trust window brackets the same-day re-preview case', () => {
+  assert.equal(canReuseCachedImage({ ...FRESH, hostedAt: new Date(NOW - 47 * HOUR) }, NOW), true);
+  assert.equal(canReuseCachedImage({ ...FRESH, hostedAt: new Date(NOW - 49 * HOUR) }, NOW), false);
+});
+
+test('a young row whose picture is expiring is still refused', () => {
+  // Age and expiry are independent reasons to refuse; neither rescues the other.
+  assert.equal(
+    canReuseCachedImage({ ...FRESH, expiresAt: new Date(NOW + 2 * HOUR) }, NOW),
+    false
+  );
+});
+
+test('rows missing the fields this depends on are never reused', () => {
+  assert.equal(canReuseCachedImage(null, NOW), false);
+  assert.equal(canReuseCachedImage({}, NOW), false);
+  // Pre-migration rows: no expiry, no hostedAt.
+  assert.equal(canReuseCachedImage({ hostedUrl: 'https://i.ebayimg.com/x.jpg' }, NOW), false);
+  // Hosted recently, but the row carries no URL to hand back.
+  assert.equal(canReuseCachedImage({ ...FRESH, hostedUrl: '' }, NOW), false);
 });

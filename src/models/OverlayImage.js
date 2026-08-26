@@ -18,7 +18,31 @@ const overlayImageSchema = new mongoose.Schema({
   },
 
   sourceUrl: { type: String, required: true },
-  hostedUrl: { type: String, required: true },
+
+  // Indexed because the refresh path looks rows up BACKWARDS: a CSV export
+  // holds only the hosted URLs, and has to recover each picture's recipe to
+  // rebuild it. See utils/overlayImage.js refreshExpiredImages().
+  hostedUrl: { type: String, required: true, index: true },
+
+  // The Media API's handle for this picture. Kept alongside hostedUrl because
+  // it is the only thing that can be asked about later: getImage(imageId)
+  // answers 404 once EPS has dropped the image, whereas the URL alone can only
+  // be discovered as broken by a listing failing.
+  //
+  // Absent on rows written before the UploadSiteHostedPictures migration —
+  // that call returned a URL and nothing else.
+  imageId: { type: String },
+
+  // When EPS will drop this picture if no live listing references it. Null on
+  // pre-migration rows, which utils/overlayImage.js isExpiring() treats as
+  // stale for exactly that reason.
+  expiresAt: { type: Date, default: null },
+
+  // When hostedUrl was last uploaded. Distinct from createdAt, which records
+  // when the composite was FIRST hosted and never moves: a row whose picture
+  // expired and was re-hosted is new again, and ageing it against createdAt
+  // would retire it immediately. canReuseCachedImage() measures against this.
+  hostedAt: { type: Date, default: null },
 
   badgeKey: { type: String, required: true },
   badgeVersion: { type: Number, required: true },

@@ -106,7 +106,11 @@ app.use(cors({
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-  exposedHeaders: ['Content-Disposition']
+  // Every header the browser is allowed to hand to client JS must be listed
+  // HERE, not with res.setHeader() in a route: setHeader REPLACES this list
+  // rather than adding to it, so a route setting its own value silently hides
+  // Content-Disposition and CSV downloads lose their filename.
+  exposedHeaders: ['Content-Disposition', 'X-Images-Refreshed', 'X-Image-Warnings']
 }));
 app.use(express.json({ limit: '10mb' })); // Increased limit for bulk operations
 app.use(mongoSanitize()); // Sanitize user input to prevent NoSQL injection (strips $ and . from req.body/query/params)
