@@ -16,6 +16,8 @@ import { applyOverlayMapping, resolveEffectiveBadgeKey, resolveSavedImageList, r
 import { ensureValidToken } from './ebay.js';
 import { getUsageStats, getFieldExtractionStats, getRecentErrors, checkQuotaStatus } from '../utils/apiUsageTracker.js';
 import { getAsinCacheStats, clearAsinCache, invalidateAsinCache } from '../utils/asinCache.js';
+import { findActiveAsinsForSeller } from '../utils/sellerActiveSkus.js';
+import { loadAsinSiblings, applyListingUniqueness } from '../utils/listingUniqueness.js';
 import AsinDirectory from '../models/AsinDirectory.js';
 import AsinPrecheckLog from '../models/AsinPrecheckLog.js';
 import ApiUsage from '../models/ApiUsage.js';
@@ -753,22 +755,10 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
       return { asin, sku, baseSku: getBaseSku(sku) };
     });
 
-    const skuValues = [...new Set(generatedRows.flatMap(row => [row.sku, row.baseSku]).filter(Boolean))];
-    const activeRecords = skuValues.length > 0
-      ? await SellerSkuIndex.find({
-          seller: sellerId,
-          $or: [
-            { sku: { $in: skuValues } },
-            { baseSku: { $in: skuValues } }
-          ]
-        }).select('sku baseSku').lean()
-      : [];
-
-    const activeSkuSet = new Set();
-    activeRecords.forEach(record => {
-      if (record.sku) activeSkuSet.add(record.sku);
-      if (record.baseSku) activeSkuSet.add(record.baseSku);
-    });
+    // Active = the SKU generated from the ASIN exists in this seller's synced
+    // SKU index. Shared with the sourcing exclusion via sellerActiveSkus.js so
+    // both answer the question identically — they drifted apart once already.
+    const activeAsinSet = await findActiveAsinsForSeller(sellerId, asins);
 
     const streamConcurrency = parseInt(process.env.ASIN_PRECHECK_CONCURRENCY, 10)
       || parseInt(process.env.SCRAPER_API_CONCURRENT, 10)
@@ -833,7 +823,7 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
         }
 
         const sourceData = buildAmazonSourceData(amazonData);
-        const active = activeSkuSet.has(generated.sku) || activeSkuSet.has(generated.baseSku);
+        const active = activeAsinSet.has(String(asin).toUpperCase());
         const enrichment = getPrecheckEnrichment(amazonData, region, scrapedAt);
         const ebayMotorsEligibility = ebayMotorsMode
           ? await classifyEbayMotorsTitle(amazonData.title || '', asin, usageContext)
@@ -868,7 +858,7 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
         });
       } catch (error) {
         console.error(`[ASIN Precheck] Error processing ${asin}:`, error.message);
-        const active = activeSkuSet.has(generated.sku) || activeSkuSet.has(generated.baseSku);
+        const active = activeAsinSet.has(String(asin).toUpperCase());
 
         sendSse({
           type: 'item',
@@ -3050,6 +3040,12 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
       }])
     );
 
+    // Every OTHER seller's live listing of these ASINs, fetched once for the
+    // whole batch rather than per item. This is what the cross-seller title and
+    // price uniqueness pass below compares against — nothing else in this
+    // pipeline has ever looked outside the current seller.
+    const siblingsByAsin = await loadAsinSiblings(asins, { excludeSellerId: sellerId });
+
     // Process ASINs with controlled concurrency and stream results as they complete.
     let completed = 0;
 
@@ -3234,6 +3230,51 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
           warnings.push('Missing description');
         }
 
+        // ── Cross-seller uniqueness ──────────────────────────────────────
+        // Same ASIN + same template generates the same title for every seller,
+        // and calculateStartPrice is deterministic, so the price is identical
+        // too. eBay reads that as a duplicate listing. Only runs when another
+        // seller actually holds this ASIN, so the common case costs nothing.
+        let uniquenessInfo = null;
+        if (validationErrors.length === 0) {
+          const uniqueness = await applyListingUniqueness({
+            asin,
+            sellerId,
+            title: mergedCoreFields.title,
+            price: mergedCoreFields.startPrice,
+            siblings: siblingsByAsin.get(asin),
+            pricingConfig,
+            sourceData,
+            usageContext: buildAiUsageContext(req, templateId, sellerId, aiRunContext)
+          });
+
+          mergedCoreFields.title = uniqueness.title;
+          mergedCoreFields.startPrice = uniqueness.price;
+          warnings.push(...uniqueness.warnings);
+
+          // Surfaced as metadata rather than a warning: an adjustment is the
+          // system working as intended, and flagging every cross-seller listing
+          // would flip most of a batch to "warning" and train the operator to
+          // ignore the status. pricingCalculation deliberately still reports
+          // the true calculated price — the offset is upward-only, so realised
+          // profit is never below what the breakdown shows.
+          if (uniqueness.titleAdjusted || uniqueness.priceAdjusted) {
+            uniquenessInfo = {
+              titleAdjusted: uniqueness.titleAdjusted,
+              priceAdjusted: uniqueness.priceAdjusted,
+              priceSteps: uniqueness.priceSteps,
+              rephraseAttempts: uniqueness.rephraseAttempts
+            };
+          }
+
+          if (uniqueness.titleAdjusted || uniqueness.priceAdjusted) {
+            console.log(
+              `[uniqueness] ${asin}: ${uniqueness.titleAdjusted ? `title rephrased (${uniqueness.rephraseAttempts}x)` : 'title kept'}`
+              + `, ${uniqueness.priceAdjusted ? `price stepped x${uniqueness.priceSteps}` : 'price kept'}`
+            );
+          }
+        }
+
         // Compute count-based SKU for new listing preview
         const countDoc = await AsinDirectory.findOne({ asin }).select('listingCount').lean();
         const finalSKU = generateSKUWithCount(asin, countDoc?.listingCount || 0);
@@ -3252,6 +3293,7 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
             _amazonSourcePrice: amazonData.price ? String(amazonData.price) : null
           },
           pricingCalculation,
+          uniqueness: uniquenessInfo,
           warnings,
           errors: validationErrors,
           progressStage: 'complete',
@@ -5877,6 +5919,23 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
 
     console.log(`🔍 SKU pre-check: ${existingSKUMap.size} SKU conflicts detected`);
 
+    // ── Cross-seller uniqueness: the authoritative pass ───────────────────
+    // The preview ran this too, but preview-time is only a UX affordance: two
+    // listers generating the same ASIN for two different sellers at the same
+    // moment would BOTH pass their own preview check and BOTH save a colliding
+    // title and price. This pass runs against the database as it stands at save
+    // time, which is the only place the guarantee can actually hold.
+    //
+    // Collisions here need that race to happen, so they are rare and the AI
+    // cost of a save-time rephrase is negligible next to the preview's.
+    const saveTemplate = await getEffectiveTemplate(templateId, sellerId);
+    let savePricingConfig = saveTemplate?.pricingConfig || {};
+    const saveSellerPricing = await SellerPricingConfig.findOne({ sellerId, templateId });
+    if (saveSellerPricing) savePricingConfig = saveSellerPricing.pricingConfig;
+
+    const saveSiblings = await loadAsinSiblings(asinsToSave, { excludeSellerId: sellerId });
+    const saveAiRunContext = createAiRunContext('bulk-save-uniqueness');
+
     // Process each listing
     for (const listingData of listings) {
       try {
@@ -5931,6 +5990,40 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
               updateData[field] = listingData[field];
             }
           }
+          // A re-list is still a listing that has to be unique against OTHER
+          // sellers holding this ASIN. This path returns early, so without its
+          // own check it would be the one hole left in the guarantee. Only the
+          // fields actually being rewritten are adjusted — a title this save
+          // is not touching is pre-existing data, not a collision we created.
+          if (listingData._asinReference && (updateData.title || updateData.startPrice)) {
+            const dupAsinKey = String(listingData._asinReference).toUpperCase();
+            const dupSiblings = saveSiblings.get(dupAsinKey);
+
+            const dupUniqueness = await applyListingUniqueness({
+              asin: dupAsinKey,
+              sellerId,
+              title: updateData.title || existingListing.title,
+              price: updateData.startPrice ?? existingListing.startPrice,
+              siblings: dupSiblings,
+              pricingConfig: savePricingConfig,
+              sourceData: { title: updateData.title || existingListing.title },
+              usageContext: buildAiUsageContext(req, templateId, sellerId, saveAiRunContext)
+            });
+
+            if (updateData.title) updateData.title = dupUniqueness.title;
+            if (updateData.startPrice !== undefined) updateData.startPrice = dupUniqueness.price;
+
+            if (dupSiblings) {
+              dupSiblings.titles.push(dupUniqueness.title);
+              const dupPrice = Number(dupUniqueness.price);
+              if (Number.isFinite(dupPrice) && dupPrice > 0) dupSiblings.prices.push(dupPrice);
+            }
+
+            if (dupUniqueness.titleAdjusted || dupUniqueness.priceAdjusted) {
+              console.log(`[uniqueness/save] ${dupAsinKey}: re-list adjusted against other sellers`);
+            }
+          }
+
           Object.assign(existingListing, updateData);
 
           await existingListing.save();
@@ -6080,6 +6173,42 @@ router.post('/bulk-save', requireAuth, async (req, res) => {
               error: 'Duplicate SKU'
             });
             continue;
+          }
+        }
+
+        // Final uniqueness check against live data — see the note above
+        // saveSiblings. Mutates listingData so the spread below picks it up.
+        if (listingData._asinReference) {
+          const asinKey = String(listingData._asinReference).toUpperCase();
+          const siblingEntry = saveSiblings.get(asinKey);
+
+          const uniqueness = await applyListingUniqueness({
+            asin: asinKey,
+            sellerId,
+            title: listingData.title,
+            price: listingData.startPrice,
+            siblings: siblingEntry,
+            pricingConfig: savePricingConfig,
+            sourceData: { title: listingData.title },
+            usageContext: buildAiUsageContext(req, templateId, sellerId, saveAiRunContext)
+          });
+
+          if (uniqueness.titleAdjusted || uniqueness.priceAdjusted) {
+            console.log(
+              `[uniqueness/save] ${asinKey}: adjusted at save time`
+              + `${uniqueness.titleAdjusted ? ' (title)' : ''}${uniqueness.priceAdjusted ? ` (price stepped x${uniqueness.priceSteps})` : ''}`
+            );
+          }
+
+          listingData.title = uniqueness.title;
+          listingData.startPrice = uniqueness.price;
+
+          // Keep the in-memory set current so two listings of the same ASIN
+          // inside one batch cannot be given the same title or price.
+          if (siblingEntry) {
+            siblingEntry.titles.push(uniqueness.title);
+            const numericPrice = Number(uniqueness.price);
+            if (Number.isFinite(numericPrice) && numericPrice > 0) siblingEntry.prices.push(numericPrice);
           }
         }
 

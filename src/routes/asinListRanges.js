@@ -5,6 +5,7 @@ import AsinDirectory from '../models/AsinDirectory.js';
 import AsinListCategory from '../models/AsinListCategory.js';
 import { requireAuth } from '../middleware/auth.js';
 import { validate } from '../utils/validate.js';
+import { normalizeSearchQueries } from '../utils/searchQueries.js';
 import { createAsinListRangeSchema, renameAsinListRangeSchema } from '../schemas/index.js';
 
 const router = express.Router();
@@ -102,9 +103,13 @@ router.get('/', requireAuth, async (req, res) => {
 // Create a new range under a category
 router.post('/', requireAuth, validate(createAsinListRangeSchema), async (req, res) => {
   try {
-    const { name, categoryId } = req.body;
+    const { name, categoryId, searchQueries } = req.body;
 
-    const range = await AsinListRange.create({ name, categoryId });
+    const range = await AsinListRange.create({
+      name,
+      categoryId,
+      searchQueries: normalizeSearchQueries(searchQueries)
+    });
     res.status(201).json(range);
   } catch (error) {
     if (error.code === 11000) {
@@ -178,10 +183,21 @@ router.post('/', requireAuth, validate(createAsinListRangeSchema), async (req, r
 router.put('/:id', requireAuth, validate(renameAsinListRangeSchema), async (req, res) => {
   try {
     const { id } = req.params;
-    const { name } = req.body;
+    const { name, searchQueries } = req.body;
+
+    // Only touch what was actually sent — a keyword edit must not blank the
+    // name, and a rename must not blank the keywords.
+    const update = {};
+    if (name !== undefined) update.name = name;
+    if (searchQueries !== undefined) update.searchQueries = normalizeSearchQueries(searchQueries);
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ error: 'Nothing to update' });
+    }
+
     const range = await AsinListRange.findByIdAndUpdate(
       id,
-      { name },
+      update,
       { new: true, runValidators: true }
     );
     if (!range) return res.status(404).json({ error: 'Range not found' });

@@ -5,7 +5,8 @@ import AsinListProduct from '../models/AsinListProduct.js';
 import AsinDirectory from '../models/AsinDirectory.js';
 import { requireAuth } from '../middleware/auth.js';
 import { validate } from '../utils/validate.js';
-import { createAsinListCategorySchema } from '../schemas/index.js';
+import { createAsinListCategorySchema, updateAsinListCategorySchema } from '../schemas/index.js';
+import { normalizeSearchQueries } from '../utils/searchQueries.js';
 
 const router = express.Router();
 
@@ -70,9 +71,12 @@ router.get('/', requireAuth, async (req, res) => {
 // Create a new category
 router.post('/', requireAuth, validate(createAsinListCategorySchema), async (req, res) => {
   try {
-    const { name } = req.body;
+    const { name, searchQueries } = req.body;
 
-    const category = await AsinListCategory.create({ name });
+    const category = await AsinListCategory.create({
+      name,
+      searchQueries: normalizeSearchQueries(searchQueries)
+    });
     res.status(201).json(category);
   } catch (error) {
     if (error.code === 11000) {
@@ -80,6 +84,70 @@ router.post('/', requireAuth, validate(createAsinListCategorySchema), async (req
     }
     console.error('Error creating asin list category:', error);
     res.status(500).json({ error: 'Failed to create category' });
+  }
+});
+
+// Update a category's name and/or its sourcing keywords
+/**
+ * @swagger
+ * /asin-list-categories/{id}:
+ *   put:
+ *     tags: [ASIN List Categories]
+ *     summary: Rename a category and/or set the search keywords used to source ASINs for it
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               name:          { type: string }
+ *               searchQueries: { type: array, items: { type: string } }
+ *     responses:
+ *       200:
+ *         description: Updated category
+ *       404:
+ *         description: Category not found
+ *       409:
+ *         description: Duplicate category name
+ *       500:
+ *         description: Internal server error
+ */
+router.put('/:id', requireAuth, validate(updateAsinListCategorySchema), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, searchQueries } = req.body;
+
+    // Only touch what was actually sent — a keyword edit must not blank the
+    // name, and a rename must not blank the keywords.
+    const update = {};
+    if (name !== undefined) update.name = name;
+    if (searchQueries !== undefined) update.searchQueries = normalizeSearchQueries(searchQueries);
+
+    if (Object.keys(update).length === 0) {
+      return res.status(400).json({ error: 'Nothing to update' });
+    }
+
+    const category = await AsinListCategory.findByIdAndUpdate(
+      id,
+      update,
+      { new: true, runValidators: true }
+    );
+    if (!category) return res.status(404).json({ error: 'Category not found' });
+    res.json(category);
+  } catch (error) {
+    if (error.code === 11000) {
+      return res.status(409).json({ error: 'Category already exists' });
+    }
+    console.error('Error updating asin list category:', error);
+    res.status(500).json({ error: 'Failed to update category' });
   }
 });
 

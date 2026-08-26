@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import { normalizeSearchQueries } from '../utils/searchQueries.js';
 
 const asinListProductSchema = new mongoose.Schema({
   name: {
@@ -19,6 +20,16 @@ const asinListProductSchema = new mongoose.Schema({
     required: true,
     index: true
   },
+  // Keywords this node is searched by in the automated ASIN sourcing flow.
+  // Scrapingdog's search API has no category parameter, so a saved keyword
+  // set is what stands in for an Amazon browse node. Empty falls back to the
+  // node's own name (see utils/searchQueries.js).
+  searchQueries: {
+    type: [String],
+    default: [],
+    set: normalizeSearchQueries
+  },
+
   createdAt: {
     type: Date,
     default: Date.now

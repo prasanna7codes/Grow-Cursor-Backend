@@ -134,6 +134,25 @@ const pricingConfigSchema = new mongoose.Schema({
     type: Number,
     default: 10
   },
+  // ── Cross-seller uniqueness ────────────────────────────────────────────
+  // calculateStartPrice() is a pure function of this config and the Amazon
+  // cost, so the same ASIN under the same template produces a byte-identical
+  // price for every seller. eBay reads same-item-same-price across accounts as
+  // a duplicate, so a colliding price is stepped upward until it is clear.
+  // Upward only: a downward step would eat margin, and a profit tier can sit
+  // right on a floor. 20 cents matches the step the ASIN Review modal already
+  // uses client-side, so both layers land on the same figure.
+  priceUniquenessStepCents: {
+    type: Number,
+    default: 20,
+    min: 1
+  },
+  // Whether the pipeline rephrases a title that matches another seller's
+  // listing of the same ASIN. Off means the operator keeps doing it by hand.
+  enforceCrossSellerUniqueness: {
+    type: Boolean,
+    default: true
+  },
   // Tiered profit system
   profitTiers: {
     enabled: {

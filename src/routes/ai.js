@@ -5,6 +5,7 @@ import OpenAI from 'openai';
 import { requireAuth, requirePageAccess } from '../middleware/auth.js';
 import AiFitmentUsage from '../models/AiFitmentUsage.js';
 import User from '../models/User.js';
+import { rephraseTitle } from '../utils/titleRephraser.js';
 
 const router = express.Router();
 
@@ -312,38 +313,11 @@ router.post('/rephrase-title', requireAuth, async (req, res) => {
             return res.status(400).json({ error: 'currentTitle is required' });
         }
 
-        const vehicleSection = vehicleMentions
-            ? `\nVerified vehicle compatibility (from customer reviews): ${vehicleMentions}\nYou MUST include 1–2 of these models/years in the rephrased title. Shorten other parts of the title if needed to stay within the character limit.`
-            : '';
-
-        const prompt = `You are an eBay listing SEO expert.
-Rephrase the following eBay product title. The rephrased title must:
-- Convey the same product and key attributes
-- Use different word order or synonyms compared to the original
-- Be strictly between 75 and 80 characters (including spaces) — not shorter, not longer
-- Contain no markdown, quotes, or extra commentary — return only the plain title text
-
-Amazon product title (context only): ${sourceTitle}
-Brand: ${brand}
-Color: ${color}
-Compatibility: ${compatibility}${vehicleSection}
-
-eBay title to rephrase: ${currentTitle}`;
-
-        const completion = await getOpenAI().chat.completions.create({
-            messages: [{ role: 'user', content: prompt }],
-            model: 'gpt-4o-mini',
-            temperature: 0.7,
-            max_tokens: 60,
+        // The prompt lives in utils/titleRephraser.js so this button and the
+        // automatic cross-seller uniqueness pass rewrite titles identically.
+        const rephrasedTitle = await rephraseTitle({
+            currentTitle, sourceTitle, brand, color, compatibility, vehicleMentions
         });
-
-        let rephrasedTitle = completion.choices[0]?.message?.content?.trim() || '';
-        // Strip any surrounding quotes the model may add
-        rephrasedTitle = rephrasedTitle.replace(/^["']|["']$/g, '').trim();
-        // Hard safety truncation to 80 chars
-        if (rephrasedTitle.length > 80) {
-            rephrasedTitle = rephrasedTitle.substring(0, 80);
-        }
 
         res.json({ rephrasedTitle });
     } catch (error) {

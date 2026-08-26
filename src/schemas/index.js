@@ -391,8 +391,19 @@ export const updatePerformanceRemarksSchema = z.object({
 
 // ── ASIN list categories ──────────────────────────────────────────────────────
 
+// Keyword sets stand in for Amazon browse nodes in the ASIN sourcing flow —
+// the search API has no category parameter. Normalization (trim/dedupe/cap)
+// happens in the model setter; this only guards the shape.
+const searchQueriesField = z.array(z.string()).max(25, 'At most 25 keywords').optional();
+
 export const createAsinListCategorySchema = z.object({
   name: z.string().trim().min(1, 'Category name is required'),
+  searchQueries: searchQueriesField,
+});
+
+export const updateAsinListCategorySchema = z.object({
+  name: z.string().trim().min(1, 'Category name is required').optional(),
+  searchQueries: searchQueriesField,
 });
 
 // ── ASIN list ranges ──────────────────────────────────────────────────────────
@@ -400,10 +411,12 @@ export const createAsinListCategorySchema = z.object({
 export const createAsinListRangeSchema = z.object({
   name: z.string().trim().min(1, 'Range name is required'),
   categoryId: z.string().min(1, 'categoryId is required'),
+  searchQueries: searchQueriesField,
 });
 
 export const renameAsinListRangeSchema = z.object({
-  name: z.string().trim().min(1, 'Range name is required'),
+  name: z.string().trim().min(1, 'Range name is required').optional(),
+  searchQueries: searchQueriesField,
 });
 
 // ── ASIN list products ────────────────────────────────────────────────────────
@@ -412,10 +425,25 @@ export const createAsinListProductSchema = z.object({
   name: z.string().trim().min(1, 'Product name is required'),
   rangeId: z.string().min(1, 'rangeId is required'),
   categoryId: z.string().min(1, 'categoryId is required'),
+  searchQueries: searchQueriesField,
 });
 
 export const renameAsinListProductSchema = z.object({
-  name: z.string().trim().min(1, 'Product name is required'),
+  name: z.string().trim().min(1, 'Product name is required').optional(),
+  searchQueries: searchQueriesField,
+});
+
+// ── ASIN sourcing runs ───────────────────────────────────────────────────────
+
+export const recordDiscardedAsinsSchema = z.object({
+  asins: z.array(z.string()).min(1, 'asins must be a non-empty array'),
+});
+
+export const recordContinuedAsinsSchema = z.object({
+  asins: z.array(z.string()).min(1, 'asins must be a non-empty array'),
+  // Counts only, keyed by reason — see AsinSourcingRun.precheckStats.
+  dropped: z.record(z.string(), z.number()).optional(),
+  served: z.number().optional(),
 });
 
 export const moveAsinsSchema = z.object({
