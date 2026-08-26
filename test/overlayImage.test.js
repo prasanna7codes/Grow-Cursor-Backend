@@ -656,9 +656,12 @@ test('a row older than the trust window is re-hosted even with a valid expiry', 
   );
 });
 
-test('the trust window brackets the same-day re-preview case', () => {
-  assert.equal(canReuseCachedImage({ ...FRESH, hostedAt: new Date(NOW - 47 * HOUR) }, NOW), true);
-  assert.equal(canReuseCachedImage({ ...FRESH, hostedAt: new Date(NOW - 49 * HOUR) }, NOW), false);
+test('the trust window brackets a week, not a fortnight', () => {
+  // Seven days. Wide enough that re-exporting a batch days later reuses its
+  // pictures instead of re-uploading them, and still far short of the 30-day
+  // retention that measurement (scripts/checkEpsImages.js) confirmed.
+  assert.equal(canReuseCachedImage({ ...FRESH, hostedAt: new Date(NOW - 6 * 24 * HOUR) }, NOW), true);
+  assert.equal(canReuseCachedImage({ ...FRESH, hostedAt: new Date(NOW - 8 * 24 * HOUR) }, NOW), false);
 });
 
 test('a young row whose picture is expiring is still refused', () => {

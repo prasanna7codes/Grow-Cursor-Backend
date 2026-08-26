@@ -14,7 +14,9 @@
     "test": "node --test test/*.test.js",
     "clone": "node copy-prod-to-test.js",
     "backfill:template-base-labels": "node src/scripts/backfillTemplateListingBaseCustomLabel.js",
-    "restore:us-amazon-stock-qty-one": "node src/scripts/restoreUsAmazonStockQtyOne.js"
+    "restore:us-amazon-stock-qty-one": "node src/scripts/restoreUsAmazonStockQtyOne.js",
+    "check:eps-images": "node src/scripts/checkEpsImages.js",
+    "migrate:overlay-cachekey": "node src/scripts/dropOverlayImageCacheKeyUnique.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",

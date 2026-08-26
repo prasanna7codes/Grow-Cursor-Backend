@@ -25,16 +25,16 @@ import { compositeBadge, MIN_SOURCE_EDGE, normalizeForUpload, normalizePlacement
  * EPS-hosted or entirely untouched, and never a blend of the two.
  */
 
-// A pseudo-badge for the secondary images: same upload and cache machinery, no
-// artwork composited. The key namespaces their cache rows away from badged
-// composites of the same source URL, which would otherwise collide.
+// A pseudo-badge for the secondary images: same upload path, no artwork
+// composited. The key also keeps their ledger rows distinguishable from badged
+// composites of the same source picture.
 const PLAIN_BADGE = { key: '__plain__', version: 0 };
 
-// Cache-key discriminators, not geometry. PLAIN_BADGE has no filePath, so
-// getOrCreateHostedImage routes these images to normalizeForUpload(), which
-// takes no placement at all — nothing here ever reaches computeBadgeBox. The
-// values only have to be constant, so that every unbadged image of a given
-// source URL lands on one cache row.
+// Ledger-key discriminators, not geometry. PLAIN_BADGE has no filePath, so
+// hostImage() routes these images to normalizeForUpload(), which takes no
+// placement at all — nothing here ever reaches computeBadgeBox. The values
+// only have to be constant, so that every unbadged copy of a given source
+// picture is recorded the same way.
 //
 // So read `scale: 0` as "unused", not as "a badge scaled to nothing": these
 // never go through normalizePlacement, which would clamp 0 up to 0.05 and
@@ -111,9 +111,12 @@ export function toLargestEbayVariant(url) {
 }
 
 /**
- * Stable cache key. Every input that changes the rendered pixels — or the
- * account the picture is hosted under — has to be in here, or a config change
- * would silently keep serving the previous composite.
+ * Fingerprint of one rendered composite: source picture, artwork, placement and
+ * account. Names the file sent to eBay and is stored on the ledger row.
+ *
+ * No longer a lookup key — pictures are never reused, so nothing is fetched by
+ * this. It groups rows describing the same composite, which is what makes a
+ * duplicate upload recognisable as one in the data.
  */
 export function buildCacheKey({ sourceUrl, badgeKey, badgeVersion, scale, anchor, margin, sellerId }) {
   return crypto
@@ -397,15 +400,21 @@ export function isExpiring(expiresAt, now = Date.now()) {
 // while it was still unattached to any listing. Once a listing references it,
 // its real lifetime becomes that listing's — and when the listing ENDS, eBay
 // drops the picture within a few days. We never see that event, so a stored
-// expiry can outlive the picture it describes.
+// expiry can outlive the picture it describes. Bounding the age closes that
+// hole without needing to model eBay's retention rules.
 //
-// Bounding the age closes that hole without needing to model eBay's retention
-// rules: past this window we stop believing the expiry and re-host instead.
-// It costs nothing in practice, because reuse of the same ASIN by the same
-// seller is rare and separated by weeks. What it preserves is the case that
-// actually repeats — an operator previewing a batch, adjusting it, and
-// previewing again within a day or two.
-const MAX_TRUSTED_AGE_MS = 48 * 60 * 60 * 1000;
+// Seven days, not the two this started at. Two was chosen while eBay's unused
+// retention was unknown and the docs contradicted themselves; measuring real
+// uploads (scripts/checkEpsImages.js) shows a flat 30 days, so a week of trust
+// still leaves three weeks of headroom on the expiry itself.
+//
+// The residual risk this accepts: a picture listed and then ENDED inside the
+// window could be reclaimed while a row still vouches for it. That needs the
+// same ASIN re-listed by the same seller within seven days of ending — rare,
+// since same-seller reuse runs to about once a month. Verifying each old row
+// with getImage() would remove even that; it costs a request per picture and
+// is worth adding if the assumption ever stops holding.
+const MAX_TRUSTED_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
  * Whether a cache row may be handed back instead of re-hosting.
@@ -432,24 +441,30 @@ export function canReuseCachedImage(cached, now = Date.now()) {
 }
 
 /**
- * Composite (optionally) + host one image, reusing a previous result when possible.
+ * Composite (optionally) + host one image. Always uploads a fresh copy.
  *
  * A badge without a `filePath` — i.e. PLAIN_BADGE — means "upload this image
  * unchanged", which is what images 2-N need.
  *
- * WHY THE CACHE EARNS ITS KEEP
- * A miss costs exactly what having no cache costs; the only overhead a hit
- * avoids paying twice is one indexed findOne. Set against a miss path that
- * spends seconds on a download, a Sharp composite and two eBay round trips,
- * the asymmetry justifies the cache without needing to know the hit rate.
+ * ONE PICTURE PER LISTING, NEVER SHARED
+ * This used to hand back a previously hosted URL when the same source, badge
+ * and seller came round again, so two listings of one ASIN shared a picture.
+ * They no longer do. Sharing makes two listings a single point of failure:
+ * eBay ties a picture's life to the listings using it, so ending one can pull
+ * the picture out from under the other, and nothing tells us when it happens.
+ * A separate copy per listing costs an upload and removes the coupling.
  *
- * It also stops repeats accumulating on eBay: EPS has no delete call, so every
- * redundant upload leaves a copy that is only reclaimed when it expires.
+ * The OverlayImage collection is therefore a LEDGER, not a cache. Each row
+ * records how one hosted picture was made — source URL, badge, placement,
+ * seller — so refreshExpiredImages() and ensureImagesForSeller() can rebuild
+ * that exact picture later, looking the row up by its hostedUrl. Rows are
+ * inserted, never overwritten: an overwritten row would strand the previous
+ * URL with no recipe, which is precisely what those two functions need.
  *
  * @returns {Promise<string|null>} hosted URL, or null if this image could not be
  *   hosted (source too small or unreadable)
  */
-async function getOrCreateHostedImage({ sourceUrl, badge, placement, sellerId, token, onSkip }) {
+async function hostImage({ sourceUrl, badge, placement, sellerId, token, onSkip }) {
   const cacheKey = buildCacheKey({
     sourceUrl,
     badgeKey: badge.key,
@@ -459,9 +474,6 @@ async function getOrCreateHostedImage({ sourceUrl, badge, placement, sellerId, t
     margin: placement.margin,
     sellerId,
   });
-
-  const cached = await OverlayImage.findOne({ cacheKey }).lean();
-  if (canReuseCachedImage(cached)) return cached.hostedUrl;
 
   const productBuffer = await downloadImage(sourceUrl);
   const result = badge.filePath
@@ -488,37 +500,31 @@ async function getOrCreateHostedImage({ sourceUrl, badge, placement, sellerId, t
     fileName
   );
 
-  // Concurrent previews of the same ASIN can race here, and a re-upload of an
-  // expired row has to land on the existing document, so the picture fields are
-  // $set rather than $setOnInsert. A race therefore ends with whichever upload
-  // wrote last, which is safe: both uploaded identical pixels, both hold a live
-  // URL, and each caller returns its own regardless of what the row says. Only
-  // the identity of the composite is immutable, so only that is insert-only.
-  await OverlayImage.updateOne(
-    { cacheKey },
-    {
-      $set: {
-        hostedUrl,
-        imageId,
-        expiresAt,
-        // Refreshed on every upload, unlike createdAt — this is what the age
-        // check in canReuseCachedImage() measures against.
-        hostedAt: new Date(),
-        host: 'eps',
-      },
-      $setOnInsert: {
-        cacheKey,
-        sourceUrl,
-        badgeKey: badge.key,
-        badgeVersion: badge.version,
-        scale: placement.scale,
-        anchor: placement.anchor,
-        margin: placement.margin,
-        sellerId,
-      },
-    },
-    { upsert: true }
-  );
+  // Insert, never upsert. Every upload is its own picture with its own URL, so
+  // it needs its own row: overwriting an earlier row would leave that earlier
+  // URL — still live on eBay, still referenced by a listing — with no record of
+  // how it was built, and nothing could rebuild it when it expired.
+  //
+  // Concurrent previews of the same ASIN therefore no longer race. They each
+  // upload, each write a row, and each return their own URL.
+  await OverlayImage.create({
+    cacheKey,
+    sourceUrl,
+    hostedUrl,
+    imageId,
+    expiresAt,
+    // Distinct from createdAt only in intent here, since rows are never
+    // rewritten — this is what canReuseCachedImage() ages against when the
+    // refresh paths ask whether a URL is still worth trusting.
+    hostedAt: new Date(),
+    badgeKey: badge.key,
+    badgeVersion: badge.version,
+    scale: placement.scale,
+    anchor: placement.anchor,
+    margin: placement.margin,
+    sellerId,
+    host: 'eps',
+  });
 
   return hostedUrl;
 }
@@ -551,7 +557,7 @@ async function hostAllImages(images, overlay, ctx, { skipHosted = true, onSkip }
     }
 
     const isPrimary = index === 0;
-    const hostedUrl = await getOrCreateHostedImage({
+    const hostedUrl = await hostImage({
       sourceUrl,
       badge: isPrimary ? overlay.badge : PLAIN_BADGE,
       placement: isPrimary ? overlay.placement : PLAIN_PLACEMENT,
@@ -844,16 +850,16 @@ export async function refreshExpiredImages(imageList, ctx = {}) {
 
   const byUrl = new Map(rows.map((row) => [row.hostedUrl, row]));
 
-  const mappings = [];
-  const next = [];
+  // Decide everything before uploading anything, so a listing that cannot be
+  // rebuilt costs no uploads at all rather than failing partway through one.
+  const stale = [];
 
   for (const url of images) {
-    const row = byUrl.get(url);
+    // An external URL has no EPS expiry to worry about; eBay fetches it at
+    // publish time. Left exactly where it is.
+    if (!isAlreadyOverlaid(url)) continue;
 
-    if (row && canReuseCachedImage(row)) {
-      next.push(url);
-      continue;
-    }
+    const row = byUrl.get(url);
 
     // No row means no recipe: this picture was hosted by something that did not
     // record where it came from, so there is nothing to rebuild it from.
@@ -865,6 +871,8 @@ export async function refreshExpiredImages(imageList, ctx = {}) {
           'Some pictures on this listing have expired on eBay and cannot be rebuilt automatically. Re-run the preview for it before uploading.',
       };
     }
+
+    if (canReuseCachedImage(row)) continue;
 
     // resolveBadge returns the CURRENT artwork, which may be a newer version
     // than the row was hosted with. That is intended: a rebuild should carry
@@ -880,41 +888,78 @@ export async function refreshExpiredImages(imageList, ctx = {}) {
       };
     }
 
-    const placement = isPlain
-      ? PLAIN_PLACEMENT
-      : { scale: row.scale, anchor: row.anchor, margin: row.margin };
-
-    const hosted = await getOrCreateHostedImage({
-      sourceUrl: row.sourceUrl,
+    stale.push({
+      url,
+      row,
       badge,
-      placement,
-      sellerId: ctx.sellerId,
-      token: ctx.token,
+      placement: isPlain
+        ? PLAIN_PLACEMENT
+        : { scale: row.scale, anchor: row.anchor, margin: row.margin },
     });
-
-    if (!hosted) {
-      return {
-        images,
-        refreshed: false,
-        warning:
-          'Some pictures on this listing could not be re-hosted on eBay, so its images were left as they are.',
-      };
-    }
-
-    mappings.push({ from: url, to: hosted });
-    next.push(hosted);
   }
 
-  if (!mappings.length) {
+  if (!stale.length) {
     return { images, refreshed: false };
   }
+
+  // Concurrent, unlike the badging path this shares a module with. That one
+  // runs under a caller already processing several listings at once; this runs
+  // per listing inside an export that walks them one at a time, so without
+  // concurrency here nothing is parallel at all — and a stale re-download of a
+  // hundred listings would sit for half an hour and time out the request.
+  const limit = pLimit(REHOST_CONCURRENCY);
+  const remap = new Map();
+  let failure = null;
+
+  await Promise.all(
+    stale.map((item) =>
+      limit(async () => {
+        // One picture failing dooms the whole listing anyway, so the rest of
+        // the batch is abandoned rather than uploaded and then discarded.
+        if (failure) return;
+
+        try {
+          const hosted = await hostImage({
+            sourceUrl: item.row.sourceUrl,
+            badge: item.badge,
+            placement: item.placement,
+            sellerId: ctx.sellerId,
+            token: ctx.token,
+          });
+
+          if (!hosted) {
+            failure =
+              'Some pictures on this listing could not be re-hosted on eBay, so its images were left as they are.';
+            return;
+          }
+
+          remap.set(item.url, hosted);
+        } catch (error) {
+          failure = `Re-hosting this listing's pictures failed: ${error.message}`;
+        }
+      })
+    )
+  );
+
+  // ALL OR NOTHING. A list where some pictures moved and others did not is the
+  // mixed-host state eBay rejects with 20004, so a single failure discards
+  // every replacement and the caller exports the originals untouched.
+  if (failure) {
+    return { images, refreshed: false, warning: failure };
+  }
+
+  const next = images.map((url) => remap.get(url) || url);
 
   if (!hostsAreUniform(next)) {
     console.error('[Overlay] Refusing mixed-host image list after refresh');
     return { images, refreshed: false, warning: 'Refresh skipped: mixed image hosts.' };
   }
 
-  return { images: next, refreshed: true, mappings };
+  return {
+    images: next,
+    refreshed: true,
+    mappings: [...remap].map(([from, to]) => ({ from, to })),
+  };
 }
 
 /**
@@ -1007,7 +1052,7 @@ export async function ensureImagesForSeller(imageList, ctx = {}) {
           : { scale: row.scale, anchor: row.anchor, margin: row.margin };
 
         try {
-          const rehosted = await getOrCreateHostedImage({
+          const rehosted = await hostImage({
             sourceUrl: row.sourceUrl,
             badge,
             placement,
