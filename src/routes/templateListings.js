@@ -12,7 +12,7 @@ import { calculateStartPrice } from '../utils/pricingCalculator.js';
 import { generateWithGemini } from '../utils/gemini.js';
 import { generateSKUFromASIN, generateSKUWithCount } from '../utils/skuGenerator.js';
 import { getEffectiveTemplate } from '../utils/templateMerger.js';
-import { applyOverlayMapping, IMAGE_LIST_SEPARATOR, refreshExpiredImages, resolveEffectiveBadgeKey, resolveSavedImageList, resolveTemplateOverlay, splitImageList, withOverlaidImages } from '../utils/overlayImage.js';
+import { applyOverlayMapping, buildOverlayResult, hostImagesOnEbay, IMAGE_LIST_SEPARATOR, refreshExpiredImages, resolveEffectiveBadgeKey, resolveSavedImageList, resolveTemplateOverlay, splitImageList, withOverlaidImages } from '../utils/overlayImage.js';
 import { ensureValidToken } from './ebay.js';
 import { getUsageStats, getFieldExtractionStats, getRecentErrors, checkQuotaStatus } from '../utils/apiUsageTracker.js';
 import { getAsinCacheStats, clearAsinCache, invalidateAsinCache } from '../utils/asinCache.js';
@@ -225,6 +225,28 @@ function buildAmazonSourceData(amazonData) {
  * or no usable seller token — so the preview runs exactly as it did before
  * rather than failing.
  */
+// Whether templates with NO badge configured should still have their pictures
+// moved onto eBay Picture Services.
+//
+// Off, a listing without a badge keeps its Amazon URLs and eBay fetches each
+// picture at publish time, storing its own copy against that listing. On, we
+// upload them ourselves first. The finished listing is EPS-hosted either way —
+// what changes is that we take on the pre-listing window in which a picture
+// exists on EPS without a listing claiming it, and so also take on its expiry
+// and its account ownership. Everything downstream (the export-time refresh,
+// the upload-time re-host) exists to manage exactly that window.
+//
+// Set HOST_ALL_LISTING_IMAGES=false to go back to leaving them on Amazon.
+const HOST_ALL_LISTING_IMAGES = process.env.HOST_ALL_LISTING_IMAGES !== 'false';
+
+/**
+ * Work out what should happen to a batch's pictures.
+ *
+ * Returns null when nothing should, and otherwise a context whose `overlay` is
+ * either a resolved badge or null. A null overlay means "host these pictures
+ * unbadged" — which is a real instruction, not an absence of one, so it cannot
+ * be represented by returning null from here.
+ */
 async function prepareOverlayContext(template, seller, badgeKey, source = 'listing') {
   const { badgeKey: effectiveKey, usingDefault, optedOut } = resolveEffectiveBadgeKey(template, badgeKey);
 
@@ -236,43 +258,72 @@ async function prepareOverlayContext(template, seller, badgeKey, source = 'listi
   // problem — routing it through the "unavailable" warning below would put a
   // misconfiguration-shaped line in the log every time someone deliberately
   // turned the badge off, and this log is how overlay problems get diagnosed.
+  let overlay = null;
+
   if (optedOut) {
     console.log(`🏷️ [${source}] Overlay turned off for this batch`);
-    return null;
-  }
-
-  if (!effectiveKey) {
+  } else if (!effectiveKey) {
     console.log(`🏷️ [${source}] No overlay requested and no template default`);
-    return null;
+  } else {
+    overlay = resolveTemplateOverlay(template, effectiveKey);
+    if (!overlay) {
+      console.warn(`🏷️ [${source}] Overlay "${effectiveKey}" unavailable (not enabled on this template, or not registered) — continuing without it`);
+    }
   }
 
-  const overlay = resolveTemplateOverlay(template, effectiveKey);
-  if (!overlay) {
-    console.warn(`🏷️ [${source}] Overlay "${effectiveKey}" unavailable (not enabled on this template, or not registered) — continuing without it`);
-    return null;
-  }
+  // No badge to draw and no instruction to host anyway: leave the pictures on
+  // Amazon and skip the token fetch entirely.
+  if (!overlay && !HOST_ALL_LISTING_IMAGES) return null;
 
   try {
     const token = await ensureValidToken(seller);
-    console.log(`🏷️ [${source}] Overlay "${effectiveKey}"${usingDefault ? ' (template default)' : ''} active (${Math.round(overlay.placement.scale * 100)}% ${overlay.placement.anchor})`);
+
+    if (overlay) {
+      console.log(`🏷️ [${source}] Overlay "${effectiveKey}"${usingDefault ? ' (template default)' : ''} active (${Math.round(overlay.placement.scale * 100)}% ${overlay.placement.anchor})`);
+    } else {
+      console.log(`🏷️ [${source}] No badge — hosting pictures on eBay unbadged`);
+    }
+
     return { overlay, ctx: { sellerId: seller._id, token } };
   } catch (error) {
-    console.error(`🏷️ [${source}] Overlay "${effectiveKey}" skipped — no eBay token for seller ${seller._id}: ${error.message}`);
+    console.error(`🏷️ [${source}] Image hosting skipped — no eBay token for seller ${seller._id}: ${error.message}`);
     return null;
   }
 }
 
 /**
- * Apply the batch's overlay to amazonData's images, if one is active. Badges
- * the primary and moves every image onto eBay Picture Services, since eBay
- * rejects listings that mix its own hosted pictures with external URLs.
+ * Move a batch's pictures onto eBay Picture Services, badging the primary one
+ * if this batch has a badge. eBay rejects listings that mix its own hosted
+ * pictures with external URLs, so either every picture moves or none does.
  *
- * Always returns a usable object — never throws — so a badge failure can't
- * take down a preview.
+ * `applied` means the picture list changed; `badged` means artwork was actually
+ * composited. They were the same thing while only badged batches were hosted,
+ * and callers reporting an overlay to the UI want `badged`.
+ *
+ * Always returns a usable object — never throws — so a hosting failure can't
+ * take down a preview. A batch that fails to host keeps its Amazon URLs, which
+ * eBay still ingests at publish time.
  */
 async function applyBatchOverlay(amazonData, overlayContext) {
-  if (!overlayContext) return { data: amazonData, applied: false };
-  return withOverlaidImages(amazonData, overlayContext.overlay, overlayContext.ctx);
+  if (!overlayContext) return { data: amazonData, applied: false, badged: false };
+
+  if (overlayContext.overlay) {
+    const result = await withOverlaidImages(amazonData, overlayContext.overlay, overlayContext.ctx);
+    return { ...result, badged: result.applied };
+  }
+
+  // No badge: same hosting, no compositing. hostImagesOnEbay() returns early
+  // once every picture is already on EPS, so a re-preview costs nothing.
+  const images = Array.isArray(amazonData?.images) ? amazonData.images : [];
+  if (!images.length) return { data: amazonData, applied: false, badged: false };
+
+  const hosted = await hostImagesOnEbay(images, overlayContext.ctx);
+
+  if (!hosted.applied) {
+    return { data: amazonData, applied: false, badged: false, warning: hosted.warning };
+  }
+
+  return { ...buildOverlayResult(amazonData, images, hosted.images), badged: false };
 }
 
 /**
@@ -3286,7 +3337,7 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
           asin,
           id: `preview-${asin}`,
           sourceData,
-          overlayApplied: overlayResult.applied,
+          overlayApplied: overlayResult.badged,
           overlayWarning: overlayResult.warning || null,
           progressStage: 'generating'
         });
@@ -4597,7 +4648,7 @@ router.post('/autofill-from-asin', requireAuth, async (req, res) => {
     // so an autofill without sellerId simply keeps the original image.
     const seller = sellerId ? await Seller.findById(sellerId) : null;
     const overlayContext = seller ? await prepareOverlayContext(template, seller, overlayBadgeId, 'autofill-single') : null;
-    const { data: stagedData, applied: overlayApplied } = await applyBatchOverlay(amazonData, overlayContext);
+    const { data: stagedData, badged: overlayApplied } = await applyBatchOverlay(amazonData, overlayContext);
 
     // 3. Apply field configurations (AI + direct mappings)
     console.log(`Processing ${template.asinAutomation.fieldConfigs.length} field configs`);
