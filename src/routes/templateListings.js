@@ -12,7 +12,7 @@ import { calculateStartPrice } from '../utils/pricingCalculator.js';
 import { generateWithGemini } from '../utils/gemini.js';
 import { generateSKUFromASIN, generateSKUWithCount } from '../utils/skuGenerator.js';
 import { getEffectiveTemplate } from '../utils/templateMerger.js';
-import { applyOverlayMapping, buildOverlayResult, hostImagesOnEbay, IMAGE_LIST_SEPARATOR, refreshExpiredImages, resolveEffectiveBadgeKey, resolveSavedImageList, resolveTemplateOverlay, splitImageList, withOverlaidImages } from '../utils/overlayImage.js';
+import { applyOverlayMapping, buildOverlayResult, hostImagesOnEbay, IMAGE_LIST_SEPARATOR, prefetchImageRecipes, refreshExpiredImages, resolveEffectiveBadgeKey, resolveSavedImageList, resolveTemplateOverlay, splitImageList, withOverlaidImages } from '../utils/overlayImage.js';
 import { ensureValidToken } from './ebay.js';
 import { getUsageStats, getFieldExtractionStats, getRecentErrors, checkQuotaStatus } from '../utils/apiUsageTracker.js';
 import { getAsinCacheStats, clearAsinCache, invalidateAsinCache } from '../utils/asinCache.js';
@@ -326,6 +326,27 @@ async function applyBatchOverlay(amazonData, overlayContext) {
   return { ...buildOverlayResult(amazonData, images, hosted.images), badged: false };
 }
 
+// How long the export-time refresh may spend before it gives up and lets the
+// download proceed.
+//
+// The work is unbounded by nature: a re-download of an old batch can find every
+// picture in it stale, and each one costs a source download, a sharp decode and
+// two eBay round trips. Nothing is written to the response until the CSV is
+// complete, so an export that runs long looks like a hung request and can be
+// cut by the proxy — leaving the operator with no file at all.
+//
+// Past the budget the remaining listings keep the URLs they already had, which
+// is exactly what happens today to a listing that cannot be rebuilt, and the
+// count is reported. A truncated refresh with a file is strictly better than a
+// complete refresh the operator never receives.
+//
+// This bounds the wait, not the work. The real fix for a large stale batch is
+// to move the refresh off the request entirely.
+const IMAGE_REFRESH_BUDGET_MS = Math.max(
+  0,
+  parseInt(process.env.IMAGE_REFRESH_BUDGET_MS, 10) || 60000
+);
+
 /**
  * Re-host expired pictures across a batch on its way out as a CSV.
  *
@@ -365,12 +386,38 @@ async function refreshBatchImages(listings, seller) {
     return result;
   }
 
-  const ctx = { sellerId: seller._id, token };
+  // One lookup for the whole batch instead of one per listing. The rows are
+  // keyed by hostedUrl and the filter is otherwise identical, so walking the
+  // listings to collect their URLs first turns N round trips into one — worth
+  // it here because this runs on the request path before any CSV is written.
+  const recipes = await prefetchImageRecipes(
+    listings.flatMap((listing) => splitImageList(listing.itemPhotoUrl || '')),
+    { sellerId: seller._id }
+  );
+
+  const ctx = { sellerId: seller._id, token, recipes };
+
+  const deadline = Date.now() + IMAGE_REFRESH_BUDGET_MS;
+  let checked = 0;
 
   // Sequential across listings, because each listing already uploads its own
   // pictures one at a time and eBay caps Media API uploads at 50 per 5 seconds
   // per user. A stale batch is slow by nature; going wider risks 429s on top.
   for (const listing of listings) {
+    // Checked between listings, never inside one: a listing part-way through
+    // its uploads has to finish or its picture list ends up half moved, which
+    // is the mixed-host state refreshExpiredImages() exists to prevent.
+    if (IMAGE_REFRESH_BUDGET_MS && Date.now() > deadline) {
+      const remaining = listings.length - checked;
+      console.warn(`[Export] Image refresh budget spent - ${remaining} listing(s) not checked`);
+      result.warnings.push(
+        `Image expiry check stopped after ${Math.round(IMAGE_REFRESH_BUDGET_MS / 1000)}s - ${remaining} listing(s) were not checked and kept their existing pictures.`
+      );
+      break;
+    }
+
+    checked += 1;
+
     const images = splitImageList(listing.itemPhotoUrl || '');
     if (!images.length) continue;
 

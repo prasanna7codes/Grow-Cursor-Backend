@@ -827,6 +827,50 @@ export async function withOverlaidImages(amazonData, overlay, ctx = {}) {
  * @param {{sellerId: string, token: string}} ctx
  * @returns {Promise<{images: string[], refreshed: boolean, mappings?: Array<{from: string, to: string}>, warning?: string}>}
  */
+// URLs per lookup when recipes are prefetched for a whole batch. Mongo has no
+// trouble with a large $in, but the query document itself travels over the
+// wire, so a batch of a few thousand pictures is split rather than sent as one
+// oversized filter.
+const RECIPE_LOOKUP_CHUNK = 1000;
+
+/**
+ * Load the ledger rows for many listings' pictures in one pass.
+ *
+ * refreshExpiredImages() looks up its own rows when called alone, which costs a
+ * round trip PER LISTING when an export walks a batch. The rows are keyed by
+ * hostedUrl and the filter is identical apart from the URL list, so the whole
+ * batch can be fetched up front and handed back through ctx.recipes.
+ *
+ * Seller scoping is applied here for the same reason it is applied there: EPS
+ * pictures are account-scoped, and a row belonging to another account is not a
+ * recipe this caller may re-run. Keeping that rule in this module means a
+ * caller cannot batch the lookup and accidentally widen it.
+ *
+ * @param {string[]} urls - every picture URL in the batch; non-EPS ones ignored
+ * @param {{sellerId: string}} ctx
+ * @returns {Promise<Map<string, object>>} hostedUrl -> ledger row
+ */
+export async function prefetchImageRecipes(urls, ctx = {}) {
+  const recipes = new Map();
+  if (!ctx.sellerId) return recipes;
+
+  // Only EPS URLs can have a row, and a batch is mostly the same few pictures
+  // repeated across listings, so this is usually far smaller than it looks.
+  const unique = [...new Set((urls || []).filter((url) => url && isAlreadyOverlaid(url)))];
+  if (!unique.length) return recipes;
+
+  for (let i = 0; i < unique.length; i += RECIPE_LOOKUP_CHUNK) {
+    const rows = await OverlayImage.find({
+      hostedUrl: { $in: unique.slice(i, i + RECIPE_LOOKUP_CHUNK) },
+      sellerId: ctx.sellerId,
+    }).lean();
+
+    for (const row of rows) recipes.set(row.hostedUrl, row);
+  }
+
+  return recipes;
+}
+
 export async function refreshExpiredImages(imageList, ctx = {}) {
   const images = Array.isArray(imageList) ? imageList.filter(Boolean) : [];
 
@@ -843,12 +887,22 @@ export async function refreshExpiredImages(imageList, ctx = {}) {
 
   // Scoped by seller as well as URL: EPS pictures are account-scoped, and a row
   // belonging to another account is not a recipe this caller may re-run.
-  const rows = await OverlayImage.find({
-    hostedUrl: { $in: images },
-    sellerId: ctx.sellerId,
-  }).lean();
-
-  const byUrl = new Map(rows.map((row) => [row.hostedUrl, row]));
+  //
+  // ctx.recipes is the same lookup already done for a whole batch — see
+  // prefetchImageRecipes(). A caller exporting many listings passes it so this
+  // does not spend a round trip per listing; a caller with one listing omits it
+  // and the query happens here. A prefetched map covers every URL in the batch,
+  // so a miss below means no row exists, not that it went unfetched.
+  const byUrl =
+    ctx.recipes ||
+    new Map(
+      (
+        await OverlayImage.find({
+          hostedUrl: { $in: images },
+          sellerId: ctx.sellerId,
+        }).lean()
+      ).map((row) => [row.hostedUrl, row])
+    );
 
   // Decide everything before uploading anything, so a listing that cannot be
   // rebuilt costs no uploads at all rather than failing partway through one.

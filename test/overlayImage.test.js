@@ -9,6 +9,7 @@ import {
   isAlreadyOverlaid,
   isExpiring,
   NO_OVERLAY,
+  refreshExpiredImages,
   replaceImages,
   resolveEffectiveBadgeKey,
   resolveSavedImageList,
@@ -679,4 +680,82 @@ test('rows missing the fields this depends on are never reused', () => {
   assert.equal(canReuseCachedImage({ hostedUrl: 'https://i.ebayimg.com/x.jpg' }, NOW), false);
   // Hosted recently, but the row carries no URL to hand back.
   assert.equal(canReuseCachedImage({ ...FRESH, hostedUrl: '' }, NOW), false);
+});
+
+// The export path prefetches every listing's ledger rows in one query and hands
+// the result down through ctx.recipes. These pin that the prefetched map is
+// actually used: there is no database connection in this suite, so anything
+// that fell back to querying per listing would hang or throw rather than pass.
+test('a prefetched recipe map is used instead of a per-listing query', async () => {
+  const url = 'https://i.ebayimg.com/images/g/prefetched/s-l1600.jpg';
+
+  const recipes = new Map([
+    [
+      url,
+      {
+        hostedUrl: url,
+        sourceUrl: 'https://m.media-amazon.com/images/I/abc.jpg',
+        badgeKey: 'case-only',
+        expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        hostedAt: new Date(),
+      },
+    ],
+  ]);
+
+  const result = await refreshExpiredImages([url], {
+    sellerId: SELLER_ID,
+    token: 'token',
+    recipes,
+  });
+
+  // Fresh expiry and freshly hosted, so nothing to rebuild.
+  assert.equal(result.refreshed, false);
+  assert.deepEqual(result.images, [url]);
+  assert.equal(result.warning, undefined);
+});
+
+test('a picture missing from the prefetched map is reported, not re-queried', async () => {
+  const known = 'https://i.ebayimg.com/images/g/known/s-l1600.jpg';
+  const unknown = 'https://i.ebayimg.com/images/g/unknown/s-l1600.jpg';
+
+  const recipes = new Map([
+    [
+      known,
+      {
+        hostedUrl: known,
+        sourceUrl: 'https://m.media-amazon.com/images/I/abc.jpg',
+        badgeKey: 'case-only',
+        expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        hostedAt: new Date(),
+      },
+    ],
+  ]);
+
+  const result = await refreshExpiredImages([known, unknown], {
+    sellerId: SELLER_ID,
+    token: 'token',
+    recipes,
+  });
+
+  // The prefetch covers every URL in the batch, so absent means no row exists —
+  // there is no recipe to rebuild from, and the list is exported untouched.
+  assert.equal(result.refreshed, false);
+  assert.deepEqual(result.images, [known, unknown]);
+  assert.match(result.warning, /cannot be rebuilt automatically/);
+});
+
+test('images with no EPS pictures skip the lookup entirely', async () => {
+  const amazonOnly = [
+    'https://m.media-amazon.com/images/I/one.jpg',
+    'https://m.media-amazon.com/images/I/two.jpg',
+  ];
+
+  // No recipes passed and no database available: reaching a query would fail.
+  const result = await refreshExpiredImages(amazonOnly, {
+    sellerId: SELLER_ID,
+    token: 'token',
+  });
+
+  assert.equal(result.refreshed, false);
+  assert.deepEqual(result.images, amazonOnly);
 });
