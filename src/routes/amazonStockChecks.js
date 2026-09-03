@@ -38,6 +38,7 @@ import {
   regionForCurrency,
   resolveAvailableSku
 } from '../utils/reviseListingGenerator.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = express.Router();
 const activeRuns = new Set();
@@ -1652,7 +1653,7 @@ router.post('/runs', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), requireF
   }
 });
 
-router.post('/runs/:runId/pause', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), async (req, res) => {
+router.post('/runs/:runId/pause', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), asyncHandler(async (req, res) => {
   const run = await AmazonStockCheckRun.findById(req.params.runId);
   if (!run) return res.status(404).json({ error: 'Run not found' });
   if (!['queued', 'running'].includes(run.status)) {
@@ -1666,9 +1667,9 @@ router.post('/runs/:runId/pause', requireAuth, requirePageAccess(STOCK_CHECK_PAG
     { $set: { status: 'queued' } }
   );
   res.json({ run, message: 'Run paused.' });
-});
+}));
 
-router.post('/runs/:runId/resume', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), async (req, res) => {
+router.post('/runs/:runId/resume', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), asyncHandler(async (req, res) => {
   const run = await AmazonStockCheckRun.findById(req.params.runId);
   if (!run) return res.status(404).json({ error: 'Run not found' });
   if (run.status !== 'paused') {
@@ -1688,9 +1689,9 @@ router.post('/runs/:runId/resume', requireAuth, requirePageAccess(STOCK_CHECK_PA
   );
   setTimeout(() => processRun(run._id), 0);
   res.json({ run, message: 'Run resumed.' });
-});
+}));
 
-router.post('/runs/:runId/cancel', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), async (req, res) => {
+router.post('/runs/:runId/cancel', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), requireFeatureAccess(AMAZON_STOCK_CHECK_RUN_FEATURE_ID), asyncHandler(async (req, res) => {
   const run = await AmazonStockCheckRun.findById(req.params.runId);
   if (!run) return res.status(404).json({ error: 'Run not found' });
   if (['completed', 'failed', 'cancelled'].includes(run.status)) {
@@ -1705,9 +1706,9 @@ router.post('/runs/:runId/cancel', requireAuth, requirePageAccess(STOCK_CHECK_PA
     { $set: { status: 'queued' } }
   );
   res.json({ run, message: 'Run cancelled.' });
-});
+}));
 
-router.get('/runs', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
+router.get('/runs', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), asyncHandler(async (req, res) => {
   const page = Math.max(1, Number.parseInt(req.query.page || '1', 10));
   const limit = Math.min(50, Math.max(5, Number.parseInt(req.query.limit || '20', 10)));
   const skip = (page - 1) * limit;
@@ -1733,16 +1734,16 @@ router.get('/runs', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (re
       totalPages: Math.max(1, Math.ceil(total / limit))
     }
   });
-});
+}));
 
-router.get('/runs/:runId', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
+router.get('/runs/:runId', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), asyncHandler(async (req, res) => {
   const run = await AmazonStockCheckRun.findById(req.params.runId).populate('requestedBy', 'username name email').lean();
   if (!run) return res.status(404).json({ error: 'Run not found' });
   const itemCounts = await getItemFilterCounts(req.params.runId, req.query.sellerId);
   res.json({ run, itemCounts });
-});
+}));
 
-router.get('/runs/:runId/items', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
+router.get('/runs/:runId/items', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), asyncHandler(async (req, res) => {
   const filter = String(req.query.filter || 'actionable').trim();
   const page = Math.max(1, Number.parseInt(req.query.page || '1', 10));
   const limit = Math.min(500, Math.max(25, Number.parseInt(req.query.limit || '100', 10)));
@@ -1770,9 +1771,9 @@ router.get('/runs/:runId/items', requireAuth, requirePageAccess(STOCK_CHECK_PAGE
       totalPages: Math.max(1, Math.ceil(total / limit))
     }
   });
-});
+}));
 
-router.post('/items/:itemId/set-quantity-zero', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
+router.post('/items/:itemId/set-quantity-zero', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), asyncHandler(async (req, res) => {
   const item = await AmazonStockCheckItem.findById(req.params.itemId).lean();
   if (!item) return res.status(404).json({ error: 'Item result not found' });
 
@@ -1806,9 +1807,9 @@ router.post('/items/:itemId/set-quantity-zero', requireAuth, requirePageAccess(S
       ? `Quantity set to zero for item ${sellerItem.itemId}`
       : result.error || `Failed to set quantity to zero for item ${sellerItem.itemId}`
   });
-});
+}));
 
-router.post('/items/:itemId/set-quantity-one', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
+router.post('/items/:itemId/set-quantity-one', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), asyncHandler(async (req, res) => {
   const item = await AmazonStockCheckItem.findById(req.params.itemId).lean();
   if (!item) return res.status(404).json({ error: 'Item result not found' });
 
@@ -1844,7 +1845,7 @@ router.post('/items/:itemId/set-quantity-one', requireAuth, requirePageAccess(ST
       ? `Quantity set to one for item ${sellerItem.itemId}`
       : result.error || `Failed to set quantity to one for item ${sellerItem.itemId}`
   });
-});
+}));
 
 // POST /amazon-stock-checks/revise-listing
 // Revises title/price for one item ID on eBay. Self-contained (not scoped to

@@ -3,6 +3,7 @@ import { requireAuth, requirePageAccess } from '../middleware/auth.js';
 import { validate } from '../utils/validate.js';
 import { createCategorySchema } from '../schemas/index.js';
 import Category from '../models/Category.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = Router();
 
@@ -59,9 +60,9 @@ router.post('/', requireAuth, requirePageAccess('ManageCategories'), validate(cr
  *       200: { description: Array of categories sorted by name }
  *       401: { description: Unauthorized }
  */
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, asyncHandler(async (req, res) => {
   const items = await Category.find().sort({ name: 1 }).lean();
   res.json(items);
-});
+}));
 
 export default router;

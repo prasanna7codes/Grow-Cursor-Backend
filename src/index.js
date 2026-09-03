@@ -82,6 +82,23 @@ import imageCache from './lib/imageCache.js';
 import * as Sentry from '@sentry/node';
 import logger from './lib/logger.js';
 
+// ── Unhandled rejection safety net ───────────────────────────────────────────
+// Since Node 15 an unhandled promise rejection is rethrown as an uncaught
+// exception and the process exits. Sentry.init() does not change that. On
+// Render the resulting restart is indistinguishable from an out-of-memory kill,
+// which makes these expensive to diagnose from the dashboard alone.
+//
+// Route handlers are covered by asyncHandler() (see src/utils/asyncHandler.js),
+// but detached work is not: cron callbacks in scheduledJobs.js, the
+// fire-and-forget setTimeout that kicks off a stock-check run, the resume
+// helpers below. A rejection in any of those would take down every in-flight
+// request with it. Report it and stay up instead.
+process.on('unhandledRejection', (reason) => {
+  const error = reason instanceof Error ? reason : new Error(String(reason));
+  logger.error('Unhandled promise rejection', { error: error.message, stack: error.stack });
+  Sentry.captureException(error);
+});
+
 const app = express();
 
 // Trust the first proxy hop (required on Render/Heroku/etc. for express-rate-limit

@@ -53,6 +53,7 @@ import {
   getOrderTotalAmount
 } from '../utils/exchangeRateUtils.js';
 import { getExcludedItemIdsFrom, normalizeItemId } from '../utils/quantityUpdateExclusions.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
 
 const upload = multer({ storage: multer.memoryStorage() });
 const router = express.Router();
@@ -10918,9 +10919,9 @@ router.post('/sync-all-sellers-listings', requireAuth, async (req, res) => {
  *                 sellersTotal:
  *                   type: integer
  */
-router.get('/sync-all-sellers-status', requireAuth, async (req, res) => {
+router.get('/sync-all-sellers-status', requireAuth, asyncHandler(async (req, res) => {
   res.json(syncAllStatus);
-});
+}));
 
 // 2. GET LISTINGS (With Search & Sort) - For Compatibility Dashboard (Uses Listing collection)
 /**
