@@ -1262,8 +1262,12 @@ router.get('/sync-sku-index/status/:sellerId', requireAuth, async (req, res) => 
       };
     }
     const dbCount = await SellerSkuIndex.countDocuments({ seller: sellerId });
-    // Get the syncedAt from the most recent record for this seller
-    const latest = await SellerSkuIndex.findOne({ seller: sellerId }).sort({ syncedAt: -1 }).select('syncedAt').lean();
+    // When a sync completes, every one of this seller's records carries the same
+    // `syncStart`, so any record answers "when was this index last synced" and
+    // there is nothing for a sort to order. There is no index on syncedAt, so
+    // sorting here meant an in-memory sort over the seller's entire document set
+    // (tens of thousands of rows) to pick between identical values.
+    const latest = await SellerSkuIndex.findOne({ seller: sellerId }).select('syncedAt').lean();
     return res.json({
       ...mem,
       dbCount,
