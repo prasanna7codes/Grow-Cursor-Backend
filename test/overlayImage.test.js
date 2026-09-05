@@ -3,10 +3,13 @@ import test from 'node:test';
 import {
   applyOverlayMapping,
   buildCacheKey,
+  canReuseCachedImage,
   buildOverlayResult,
   hostsAreUniform,
   isAlreadyOverlaid,
+  isExpiring,
   NO_OVERLAY,
+  refreshExpiredImages,
   replaceImages,
   resolveEffectiveBadgeKey,
   resolveSavedImageList,
@@ -582,4 +585,177 @@ test('legacy eBay picture URLs are rewritten to the full-size rendition', () => 
 test('an eBay URL matching neither variant scheme is left alone', () => {
   const odd = 'https://i.ebayimg.com/images/g/abc/custom.jpg';
   assert.equal(toLargestEbayVariant(odd), odd);
+});
+
+// ── Cache expiry ─────────────────────────────────────────────────────────────
+//
+// EPS drops a picture that no live listing references. A cache hit on a dropped
+// picture hands a dead URL into a listing's image list, and hostAllImages()
+// treats one bad image as poisoning the whole listing — so getting this wrong
+// is a listing failure, not a slow path.
+
+const HOUR = 60 * 60 * 1000;
+const NOW = Date.parse('2026-08-27T12:00:00Z');
+
+test('a picture with plenty of runway is reused', () => {
+  assert.equal(isExpiring(new Date(NOW + 5 * 24 * HOUR), NOW), false);
+});
+
+test('a picture already past its expiry is not reused', () => {
+  assert.equal(isExpiring(new Date(NOW - HOUR), NOW), true);
+});
+
+test('a picture expiring inside the safety margin is not reused', () => {
+  // The gap that matters is preview → CSV export → upload, which routinely
+  // spans a working day. Twelve hours of runway is not enough to survive it.
+  assert.equal(isExpiring(new Date(NOW + 12 * HOUR), NOW), true);
+  assert.equal(isExpiring(new Date(NOW + 25 * HOUR), NOW), false);
+});
+
+test('pre-migration rows with no expiry are re-hosted rather than trusted', () => {
+  // UploadSiteHostedPictures returned no expiry and offered no way to query
+  // one, so these rows have an unknown deadline. Re-hosting once is the only
+  // way to get back to a picture whose lifetime is known.
+  assert.equal(isExpiring(null, NOW), true);
+  assert.equal(isExpiring(undefined, NOW), true);
+});
+
+test('an unparseable expiry is treated as expired', () => {
+  assert.equal(isExpiring('not a date', NOW), true);
+});
+
+test('an ISO string expiry is accepted, not just a Date', () => {
+  // Mongo hands back Dates, but .lean() results and any JSON round trip do not.
+  assert.equal(isExpiring('2026-09-05T12:00:00Z', NOW), false);
+  assert.equal(isExpiring('2026-08-27T18:00:00Z', NOW), true);
+});
+
+// ── Cache reuse window ───────────────────────────────────────────────────────
+//
+// The stored expiry describes the picture at upload time, while it was still
+// unattached. Once a listing uses it the real lifetime becomes that listing's,
+// and eBay drops the picture days after the listing ENDS — an event this system
+// never observes. So a row can hold an expiry that outlives its own picture,
+// and age is the second, independent guard against trusting it.
+
+const FRESH = {
+  hostedUrl: 'https://i.ebayimg.com/images/g/abc/s-l1600.jpg',
+  expiresAt: new Date(NOW + 5 * 24 * HOUR),
+  hostedAt: new Date(NOW - HOUR),
+};
+
+test('a freshly hosted picture with runway is reused', () => {
+  assert.equal(canReuseCachedImage(FRESH, NOW), true);
+});
+
+test('a row older than the trust window is re-hosted even with a valid expiry', () => {
+  // The ended-listing case: relisting the same ASIN weeks later must not serve
+  // a URL whose picture eBay reclaimed when the first listing ended.
+  assert.equal(
+    canReuseCachedImage({ ...FRESH, hostedAt: new Date(NOW - 30 * 24 * HOUR) }, NOW),
+    false
+  );
+});
+
+test('the trust window brackets a week, not a fortnight', () => {
+  // Seven days. Wide enough that re-exporting a batch days later reuses its
+  // pictures instead of re-uploading them, and still far short of the 30-day
+  // retention that measurement (scripts/checkEpsImages.js) confirmed.
+  assert.equal(canReuseCachedImage({ ...FRESH, hostedAt: new Date(NOW - 6 * 24 * HOUR) }, NOW), true);
+  assert.equal(canReuseCachedImage({ ...FRESH, hostedAt: new Date(NOW - 8 * 24 * HOUR) }, NOW), false);
+});
+
+test('a young row whose picture is expiring is still refused', () => {
+  // Age and expiry are independent reasons to refuse; neither rescues the other.
+  assert.equal(
+    canReuseCachedImage({ ...FRESH, expiresAt: new Date(NOW + 2 * HOUR) }, NOW),
+    false
+  );
+});
+
+test('rows missing the fields this depends on are never reused', () => {
+  assert.equal(canReuseCachedImage(null, NOW), false);
+  assert.equal(canReuseCachedImage({}, NOW), false);
+  // Pre-migration rows: no expiry, no hostedAt.
+  assert.equal(canReuseCachedImage({ hostedUrl: 'https://i.ebayimg.com/x.jpg' }, NOW), false);
+  // Hosted recently, but the row carries no URL to hand back.
+  assert.equal(canReuseCachedImage({ ...FRESH, hostedUrl: '' }, NOW), false);
+});
+
+// The export path prefetches every listing's ledger rows in one query and hands
+// the result down through ctx.recipes. These pin that the prefetched map is
+// actually used: there is no database connection in this suite, so anything
+// that fell back to querying per listing would hang or throw rather than pass.
+test('a prefetched recipe map is used instead of a per-listing query', async () => {
+  const url = 'https://i.ebayimg.com/images/g/prefetched/s-l1600.jpg';
+
+  const recipes = new Map([
+    [
+      url,
+      {
+        hostedUrl: url,
+        sourceUrl: 'https://m.media-amazon.com/images/I/abc.jpg',
+        badgeKey: 'case-only',
+        expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        hostedAt: new Date(),
+      },
+    ],
+  ]);
+
+  const result = await refreshExpiredImages([url], {
+    sellerId: SELLER_ID,
+    token: 'token',
+    recipes,
+  });
+
+  // Fresh expiry and freshly hosted, so nothing to rebuild.
+  assert.equal(result.refreshed, false);
+  assert.deepEqual(result.images, [url]);
+  assert.equal(result.warning, undefined);
+});
+
+test('a picture missing from the prefetched map is reported, not re-queried', async () => {
+  const known = 'https://i.ebayimg.com/images/g/known/s-l1600.jpg';
+  const unknown = 'https://i.ebayimg.com/images/g/unknown/s-l1600.jpg';
+
+  const recipes = new Map([
+    [
+      known,
+      {
+        hostedUrl: known,
+        sourceUrl: 'https://m.media-amazon.com/images/I/abc.jpg',
+        badgeKey: 'case-only',
+        expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+        hostedAt: new Date(),
+      },
+    ],
+  ]);
+
+  const result = await refreshExpiredImages([known, unknown], {
+    sellerId: SELLER_ID,
+    token: 'token',
+    recipes,
+  });
+
+  // The prefetch covers every URL in the batch, so absent means no row exists —
+  // there is no recipe to rebuild from, and the list is exported untouched.
+  assert.equal(result.refreshed, false);
+  assert.deepEqual(result.images, [known, unknown]);
+  assert.match(result.warning, /cannot be rebuilt automatically/);
+});
+
+test('images with no EPS pictures skip the lookup entirely', async () => {
+  const amazonOnly = [
+    'https://m.media-amazon.com/images/I/one.jpg',
+    'https://m.media-amazon.com/images/I/two.jpg',
+  ];
+
+  // No recipes passed and no database available: reaching a query would fail.
+  const result = await refreshExpiredImages(amazonOnly, {
+    sellerId: SELLER_ID,
+    token: 'token',
+  });
+
+  assert.equal(result.refreshed, false);
+  assert.deepEqual(result.images, amazonOnly);
 });

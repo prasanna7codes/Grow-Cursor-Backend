@@ -4,6 +4,7 @@ import axios from 'axios';
 import pLimit from 'p-limit';
 import { parseStringPromise } from 'xml2js';
 import { requireAuth, requirePageAccess, requireFeatureAccess } from '../middleware/auth.js';
+import { requireObjectId } from '../middleware/objectId.js';
 
 // Feature id used to gate who may run Estimate/Start on this page (superadmin
 // always allowed; others must be explicitly granted via /feature-permissions).
@@ -12,6 +13,10 @@ export const AMAZON_STOCK_CHECK_RUN_FEATURE_ID = 'amazonStockCheck.run';
 // Pages allowed to use these endpoints. SellerSkuStockCheck is the
 // seller-scoped variant of the Amazon Stock Check page.
 const STOCK_CHECK_PAGES = ['AmazonStockCheck', 'SellerSkuStockCheck'];
+
+// The revision history has its own page, and is also reachable from the stock
+// check pages that create the revisions.
+const LISTING_REVISION_PAGES = ['ListingRevisions', ...STOCK_CHECK_PAGES];
 import SellerSkuIndex from '../models/SellerSkuIndex.js';
 import TemplateListing from '../models/TemplateListing.js';
 import Seller from '../models/Seller.js';
@@ -21,7 +26,18 @@ import AmazonStockCheckItem from '../models/AmazonStockCheckItem.js';
 import AmazonStockSkuState from '../models/AmazonStockSkuState.js';
 import AmazonStockActionLog from '../models/AmazonStockActionLog.js';
 import EndListingLog from '../models/EndListingLog.js';
+import ListingRevision from '../models/ListingRevision.js';
+import SellerPricingConfig from '../models/SellerPricingConfig.js';
 import { ensureValidToken } from './ebay.js';
+import { getEffectiveTemplate } from '../utils/templateMerger.js';
+import { hostImagesOnEbay, hostsAreUniform, IMAGE_LIST_SEPARATOR, splitImageList } from '../utils/overlayImage.js';
+import {
+  buildItemSpecifics,
+  buildReviseUsageContext,
+  generateListingFromAsin,
+  regionForCurrency,
+  resolveAvailableSku
+} from '../utils/reviseListingGenerator.js';
 
 const router = express.Router();
 const activeRuns = new Set();
@@ -1869,6 +1885,649 @@ router.post('/revise-listing', requireAuth, requirePageAccess(STOCK_CHECK_PAGES)
     });
   } catch (error) {
     res.status(500).json({ error: error.message || 'Failed to revise listing' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Revise onto a new ASIN
+//
+// Repoints a live eBay listing at a different Amazon product: the ItemID never
+// changes, but its SKU, title, description, price, pictures and item specifics
+// are all replaced with template-generated content for the new ASIN.
+//
+// In the database this is a NEW listing, not an edit. The row describing the
+// old ASIN is left exactly as it is — history — and a fresh templatelistings
+// row is inserted for the new ASIN under its own ASIN-derived SKU. Nothing ties
+// the two together in that collection (the system is keyed on SKU end to end);
+// the link lives in ListingRevision.
+// ---------------------------------------------------------------------------
+
+const ASIN_PATTERN = /^B[0-9A-Z]{9}$/;
+
+// Every core column on TemplateListing. The generated listing is copied field
+// by field rather than spread wholesale: the payload comes from the browser
+// after the user has edited it, and spreading it would let a crafted request
+// set status, downloadBatchId, deletedAt or any other bookkeeping field.
+const TEMPLATE_LISTING_CORE_FIELDS = [
+  'action', 'categoryId', 'categoryName', 'title', 'relationship', 'relationshipDetails',
+  'upc', 'epid', 'startPrice', 'quantity', 'itemPhotoUrl', 'videoId', 'conditionId',
+  'description', 'format', 'duration', 'buyItNowPrice', 'bestOfferEnabled',
+  'bestOfferAutoAcceptPrice', 'minimumBestOfferPrice', 'immediatePayRequired', 'location',
+  'shippingService1Option', 'shippingService1Cost', 'shippingService1Priority',
+  'shippingService2Option', 'shippingService2Cost', 'shippingService2Priority',
+  'maxDispatchTime', 'returnsAcceptedOption', 'returnsWithinOption', 'refundOption',
+  'returnShippingCostPaidBy', 'shippingProfileName', 'returnProfileName', 'paymentProfileName'
+];
+
+function asXmlArray(value) {
+  if (value === undefined || value === null) return [];
+  return Array.isArray(value) ? value : [value];
+}
+
+// GetItem returns money and other attributed elements as { _: value, $: {...} }
+// under explicitArray:false, but as a bare string when there are no attributes.
+function readXmlValue(node) {
+  if (node === undefined || node === null) return '';
+  if (typeof node === 'object') return node._ ?? '';
+  return String(node);
+}
+
+/**
+ * What is actually live on this listing right now.
+ *
+ * Read from eBay rather than from templatelistings because the two can differ —
+ * a listing may have been revised by hand in Seller Hub — and a snapshot that
+ * describes something other than what was overwritten is worse than none.
+ */
+async function getListingSnapshot(token, itemId) {
+  const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+<GetItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
+  <ItemID>${itemId}</ItemID>
+  <DetailLevel>ReturnAll</DetailLevel>
+  <IncludeItemSpecifics>true</IncludeItemSpecifics>
+  <OutputSelector>Item.ItemID</OutputSelector>
+  <OutputSelector>Item.Title</OutputSelector>
+  <OutputSelector>Item.SKU</OutputSelector>
+  <OutputSelector>Item.StartPrice</OutputSelector>
+  <OutputSelector>Item.Currency</OutputSelector>
+  <OutputSelector>Item.Description</OutputSelector>
+  <OutputSelector>Item.PictureDetails</OutputSelector>
+  <OutputSelector>Item.PrimaryCategory</OutputSelector>
+  <OutputSelector>Item.ItemSpecifics</OutputSelector>
+</GetItemRequest>`;
+
+  const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
+    headers: {
+      'X-EBAY-API-SITEID': '0',
+      'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
+      'X-EBAY-API-CALL-NAME': 'GetItem',
+      'Content-Type': 'text/xml'
+    },
+    timeout: 45000
+  });
+
+  const parsed = await parseStringPromise(response.data, { explicitArray: false });
+  const body = parsed?.GetItemResponse;
+  if (body?.Ack === 'Failure') {
+    const errors = asXmlArray(body.Errors);
+    throw new Error(errors[0]?.LongMessage || 'GetItem failed');
+  }
+
+  const item = body?.Item || {};
+  const rawPrice = readXmlValue(item.StartPrice);
+  const parsedPrice = rawPrice === '' ? null : Number(rawPrice);
+
+  return {
+    sku: item.SKU || '',
+    title: item.Title || '',
+    price: Number.isFinite(parsedPrice) ? parsedPrice : null,
+    currency: item.StartPrice?.$?.currencyID || item.Currency || '',
+    description: item.Description || '',
+    images: asXmlArray(item.PictureDetails?.PictureURL).filter(Boolean),
+    itemSpecifics: asXmlArray(item.ItemSpecifics?.NameValueList).map((nv) => ({
+      name: nv?.Name || '',
+      value: asXmlArray(nv?.Value).filter(Boolean).join(', ')
+    })).filter((nv) => nv.name),
+    categoryId: item.PrimaryCategory?.CategoryID || '',
+    categoryName: item.PrimaryCategory?.CategoryName || ''
+  };
+}
+
+function buildItemSpecificsXml(specifics) {
+  if (!specifics.length) return '';
+  const entries = specifics
+    .map((s) => `<NameValueList><Name>${escapeXmlText(s.name)}</Name><Value>${escapeXmlText(s.value)}</Value></NameValueList>`)
+    .join('');
+  return `<ItemSpecifics>${entries}</ItemSpecifics>`;
+}
+
+/**
+ * Replace a live listing's content with the new ASIN's.
+ *
+ * The picture list is always sent whole: eBay treats a partial PictureDetails
+ * as the complete new set anyway, and rejects one that mixes its own hosted
+ * pictures with external URLs (20004). hostsAreUniform is the last line of
+ * defence against sending such a list.
+ */
+async function reviseListingToNewAsin({ token, itemId, sku, title, price, description, images, specifics }) {
+  if (images.length && !hostsAreUniform(images)) {
+    throw new Error('Refusing to revise: the image list mixes eBay-hosted and external pictures, which eBay rejects (error 20004).');
+  }
+
+  let itemContent = `<ItemID>${itemId}</ItemID>`;
+  if (sku) itemContent += `<SKU>${escapeXmlText(sku)}</SKU>`;
+  if (title) itemContent += `<Title>${escapeXmlText(title)}</Title>`;
+  if (price != null) itemContent += `<StartPrice>${Number(price).toFixed(2)}</StartPrice>`;
+  if (description) {
+    // CDATA keeps the generated HTML intact. A literal "]]>" inside the
+    // description would close the section early and corrupt the request, so the
+    // only sequence that can do that is neutralised.
+    itemContent += `<Description><![CDATA[${String(description).replace(/]]>/g, ']]&gt;')}]]></Description>`;
+  }
+  if (images.length) {
+    itemContent += `<PictureDetails>${images.map((url) => `<PictureURL>${escapeXmlText(url)}</PictureURL>`).join('')}</PictureDetails>`;
+  }
+  itemContent += buildItemSpecificsXml(specifics);
+
+  const xmlRequest = `<?xml version="1.0" encoding="utf-8"?>
+<ReviseFixedPriceItemRequest xmlns="urn:ebay:apis:eBLBaseComponents">
+  <RequesterCredentials><eBayAuthToken>${token}</eBayAuthToken></RequesterCredentials>
+  <ErrorLanguage>en_US</ErrorLanguage>
+  <WarningLevel>High</WarningLevel>
+  <Item>${itemContent}</Item>
+</ReviseFixedPriceItemRequest>`;
+
+  const response = await axios.post('https://api.ebay.com/ws/api.dll', xmlRequest, {
+    headers: {
+      'X-EBAY-API-SITEID': '0',
+      'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
+      'X-EBAY-API-CALL-NAME': 'ReviseFixedPriceItem',
+      'Content-Type': 'text/xml'
+    },
+    timeout: 90000
+  });
+
+  const parsed = await parseStringPromise(response.data, { explicitArray: false });
+  const body = parsed?.ReviseFixedPriceItemResponse;
+  const ack = body?.Ack;
+
+  if (ack !== 'Success' && ack !== 'Warning') {
+    const errors = asXmlArray(body?.Errors);
+    throw new Error(errors.map((e) => e.LongMessage).filter(Boolean).join('; ') || 'ReviseFixedPriceItem failed');
+  }
+
+  return {
+    ack,
+    warnings: asXmlArray(body?.Errors).map((e) => e.LongMessage).filter(Boolean)
+  };
+}
+
+/**
+ * The templatelistings row that currently describes a live listing.
+ *
+ * SKU is the only link templatelistings has to eBay — it stores no item id — so
+ * this is the lookup, and it is read-only: the row is history and the revise
+ * never writes to it.
+ *
+ * Collated to match the customLabel index, because a SKU imported from eBay
+ * need not carry the casing this flow generates, and sorted newest-first so a
+ * label that appears under more than one template resolves the same way twice.
+ */
+async function findListingRowForSku(sellerId, sku) {
+  if (!sku) return null;
+  return TemplateListing.findOne({ sellerId, customLabel: sku, deletedAt: null })
+    .select('+_asinReference')
+    .collation({ locale: 'en', strength: 2 })
+    .sort({ createdAt: -1 })
+    .lean();
+}
+
+/**
+ * Shared setup for both halves of the flow: validate the request, load the
+ * seller, the effective template and the seller's pricing config, and get a
+ * token. Returns { error } for the caller to surface, or the loaded context.
+ */
+async function loadReviseContext({ sellerId, itemId, asin, templateId }) {
+  if (!mongoose.Types.ObjectId.isValid(String(sellerId || '')) || !String(itemId || '').trim()) {
+    return { error: 'sellerId and itemId are required.', status: 400 };
+  }
+
+  const cleanAsinValue = String(asin || '').trim().toUpperCase();
+  if (!ASIN_PATTERN.test(cleanAsinValue)) {
+    return { error: 'A valid 10-character ASIN is required.', status: 400 };
+  }
+
+  if (!mongoose.Types.ObjectId.isValid(String(templateId || ''))) {
+    return { error: 'A template must be selected.', status: 400 };
+  }
+
+  const seller = await Seller.findById(sellerId);
+  if (!seller) return { error: 'Seller not found.', status: 404 };
+
+  const template = await getEffectiveTemplate(templateId, sellerId);
+  if (!template) return { error: 'Template not found.', status: 404 };
+  if (!template.asinAutomation?.enabled) {
+    return { error: `ASIN automation is not enabled for template "${template.name}".`, status: 400 };
+  }
+
+  // Seller-specific pricing overrides the template default, same precedence as
+  // the bulk listing pipeline.
+  const sellerConfig = await SellerPricingConfig.findOne({ sellerId, templateId });
+  const pricingConfig = sellerConfig ? sellerConfig.pricingConfig : template.pricingConfig;
+
+  const token = await ensureValidToken(seller);
+
+  return { seller, template, pricingConfig, token, asin: cleanAsinValue };
+}
+
+/**
+ * POST /amazon-stock-checks/revise-listing/preview
+ *
+ * Generates what the listing would become, and reads what it is now. Writes
+ * nothing anywhere — the user reviews and edits the result before any of it
+ * reaches eBay.
+ */
+router.post('/revise-listing/preview', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
+  try {
+    const { sellerId, itemId, asin, templateId, currency, overlayBadgeId = '' } = req.body || {};
+
+    const context = await loadReviseContext({ sellerId, itemId, asin, templateId });
+    if (context.error) return res.status(context.status).json({ error: context.error });
+
+    const { seller, template, pricingConfig, token } = context;
+    const region = regionForCurrency(currency);
+
+    const [snapshot, generated, skuResult] = await Promise.all([
+      getListingSnapshot(token, String(itemId).trim()),
+      generateListingFromAsin({
+        asin: context.asin,
+        template,
+        seller,
+        pricingConfig,
+        region,
+        overlayBadgeId,
+        usageContext: buildReviseUsageContext(req, templateId, sellerId),
+        ensureValidToken
+      }),
+      resolveAvailableSku({ asin: context.asin, sellerId })
+    ]);
+
+    const previousListing = await findListingRowForSku(sellerId, snapshot.sku);
+
+    const warnings = [...generated.warnings];
+    if (skuResult.bumped) {
+      warnings.push(`SKU ${skuResult.sku} was chosen because earlier suffixes are already in use.`);
+    }
+    // Stated rather than left implicit: a revise that leaves pictures on Amazon
+    // depends on eBay fetching each one while the listing is live, and a fetch
+    // that fails strands the previous product's photo on the listing.
+    if (generated.generatedListing.itemPhotoUrl && !generated.imagesHosted) {
+      warnings.push('Pictures are not hosted on eBay — they will be sent as Amazon URLs for eBay to fetch.');
+    }
+    if (template.categoryId && snapshot.categoryId && String(template.categoryId) !== String(snapshot.categoryId)) {
+      warnings.push(`This listing sits in eBay category ${snapshot.categoryId} (${snapshot.categoryName || 'unnamed'}) but the template targets ${template.categoryId}. The category is not changed by a revise.`);
+    }
+    if (!previousListing) {
+      warnings.push(`No listing row found for SKU "${snapshot.sku}" — the old details cannot be linked to this revision.`);
+    }
+
+    res.json({
+      itemId: String(itemId).trim(),
+      asin: context.asin,
+      region,
+      // Echoed back so the apply call is bound to the template this preview was
+      // actually generated from, rather than whatever the picker holds by then.
+      templateId,
+      newSku: skuResult.sku,
+      imagesHosted: generated.imagesHosted,
+      before: {
+        ...snapshot,
+        asin: previousListing?._asinReference || '',
+        listingId: previousListing?._id || null
+      },
+      after: generated.generatedListing,
+      sourceData: generated.sourceData,
+      pricingCalculation: generated.pricingCalculation,
+      overlayApplied: generated.overlayApplied,
+      templateColumns: (template.customColumns || []).map((col) => ({
+        name: col.name,
+        displayName: col.displayName,
+        dataType: col.dataType
+      })),
+      warnings,
+      errors: generated.errors
+    });
+  } catch (error) {
+    console.error('[revise-listing/preview] failed:', error.message);
+    res.status(500).json({ error: error.message || 'Failed to build revise preview' });
+  }
+});
+
+/**
+ * POST /amazon-stock-checks/revise-listing/apply
+ *
+ * Pushes the reviewed content onto the live listing, then records the new ASIN
+ * as its own listing row.
+ *
+ * Ordering matters: the before-snapshot is persisted BEFORE the eBay call, so a
+ * crash in between still leaves a record the listing can be restored from —
+ * the same discipline ListingOverlayItem uses.
+ */
+router.post('/revise-listing/apply', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
+  let revision = null;
+
+  try {
+    const { sellerId, itemId, asin, templateId, listing = {} } = req.body || {};
+
+    const context = await loadReviseContext({ sellerId, itemId, asin, templateId });
+    if (context.error) return res.status(context.status).json({ error: context.error });
+
+    const { template, token } = context;
+    const cleanItemId = String(itemId).trim();
+
+    const title = String(listing.title || '').trim();
+    const price = listing.startPrice === '' || listing.startPrice == null ? null : Number(listing.startPrice);
+    if (!title) return res.status(400).json({ error: 'Title is required.' });
+    if (price == null || !Number.isFinite(price) || price <= 0) {
+      return res.status(400).json({ error: 'A valid start price is required.' });
+    }
+    if (title.length > 80) return res.status(400).json({ error: 'Title must be 80 characters or fewer.' });
+
+    // Read the live state and re-resolve the SKU server-side. Both were shown in
+    // the preview, but either may have moved since — a concurrent revise, or a
+    // bulk save that claimed the SKU.
+    const [snapshot, skuResult] = await Promise.all([
+      getListingSnapshot(token, cleanItemId),
+      resolveAvailableSku({ asin: context.asin, sellerId })
+    ]);
+
+    const previousListing = await findListingRowForSku(sellerId, snapshot.sku);
+
+    // Last guarantee that the pictures are eBay-hosted. A pure no-op when the
+    // preview already hosted them — hostImagesOnEbay returns early once every
+    // URL is on ebayimg.com — so the happy path costs nothing, and the only
+    // time it does work is when hosting failed during preview and the reviewer
+    // went ahead regardless.
+    const requestedImages = splitImageList(listing.itemPhotoUrl || '');
+    const hostResult = await hostImagesOnEbay(requestedImages, { sellerId: context.seller._id, token });
+    const images = hostResult.applied ? hostResult.images : requestedImages;
+
+    // The description embeds these same URLs. If hosting only happened just
+    // now, rewrite them there too, or the gallery would sit on EPS while the
+    // description still pointed at Amazon. Positional because hostImagesOnEbay
+    // preserves order one-for-one; a literal split/join avoids having to escape
+    // the URLs into a regex.
+    let description = listing.description || '';
+    if (hostResult.applied) {
+      requestedImages.forEach((originalUrl, index) => {
+        const hostedUrl = hostResult.images[index];
+        if (hostedUrl && hostedUrl !== originalUrl) {
+          description = description.split(originalUrl).join(hostedUrl);
+        }
+      });
+    }
+
+    const specifics = buildItemSpecifics(listing.customFields || {}, template.customColumns || []);
+
+    revision = await ListingRevision.create({
+      seller: sellerId,
+      itemId: cleanItemId,
+      templateId,
+      previousAsin: previousListing?._asinReference || '',
+      previousSku: snapshot.sku || '',
+      previousListing: previousListing?._id || null,
+      newAsin: context.asin,
+      newSku: skuResult.sku,
+      before: snapshot,
+      after: {
+        sku: skuResult.sku,
+        title,
+        price,
+        currency: snapshot.currency,
+        description,
+        images,
+        itemSpecifics: specifics.map((s) => ({ name: s.name, value: s.value })),
+        categoryId: snapshot.categoryId,
+        categoryName: snapshot.categoryName
+      },
+      status: 'pending',
+      requestedBy: req.user?.userId || null
+    });
+
+    let ebayResult;
+    try {
+      ebayResult = await reviseListingToNewAsin({
+        token,
+        itemId: cleanItemId,
+        sku: skuResult.sku,
+        title,
+        price,
+        description,
+        images,
+        specifics
+      });
+    } catch (ebayError) {
+      await ListingRevision.findByIdAndUpdate(revision._id, {
+        status: 'failed',
+        error: ebayError.message || 'Revise failed'
+      });
+      await AmazonStockActionLog.create({
+        sku: snapshot.sku || '',
+        asin: context.asin,
+        seller: sellerId,
+        itemId: cleanItemId,
+        actionType: 'revise_listing',
+        requestedBy: req.user?.userId || null,
+        status: 'failed',
+        requestPayload: { mode: 'asin_swap', newAsin: context.asin, newSku: skuResult.sku, revisionId: String(revision._id) },
+        error: ebayError.message || 'Revise failed'
+      });
+      return res.status(502).json({ error: ebayError.message || 'eBay rejected the revise.' });
+    }
+
+    // eBay is committed from here on. Anything that fails below leaves a live
+    // listing whose database row is missing, so it is reported as a distinct
+    // state rather than rolled into a plain failure — the revise itself worked.
+    try {
+      const newListing = new TemplateListing({
+        templateId,
+        sellerId,
+        customLabel: skuResult.sku,
+        customFields: new Map(Object.entries(listing.customFields || {})),
+        status: 'active',
+        createdBy: req.user?.userId || null,
+        aiRunId: listing._aiRunId || null,
+        _asinReference: context.asin,
+        _amazonSourcePrice: listing._amazonSourcePrice || null,
+        // Already live on eBay, so it must never reach the CSV exporter — an
+        // export would re-list it as a second listing carrying the same SKU.
+        // The Active Batch view uses this same filter, so it stays out of there
+        // too, while remaining visible under All batches.
+        downloadBatchId: `revise-${revision._id}`,
+        downloadedAt: new Date(),
+        pendingRedownload: false,
+        downloadBatchNumber: null,
+        scheduleTime: ''
+      });
+
+      for (const field of TEMPLATE_LISTING_CORE_FIELDS) {
+        if (listing[field] !== undefined && listing[field] !== null && listing[field] !== '') {
+          newListing[field] = listing[field];
+        }
+      }
+      // What eBay was actually given, which is not necessarily what the browser
+      // sent: the hosting step above may have moved the pictures to EPS and
+      // rewritten the description to match. The row has to record what is live.
+      newListing.title = title;
+      newListing.startPrice = price;
+      newListing.description = description;
+      if (images.length) newListing.itemPhotoUrl = images.join(IMAGE_LIST_SEPARATOR);
+
+      await newListing.save();
+
+      await ListingRevision.findByIdAndUpdate(revision._id, {
+        status: 'success',
+        newListing: newListing._id,
+        appliedAt: new Date()
+      });
+
+      await AmazonStockActionLog.create({
+        sku: skuResult.sku,
+        asin: context.asin,
+        seller: sellerId,
+        itemId: cleanItemId,
+        actionType: 'revise_listing',
+        requestedBy: req.user?.userId || null,
+        status: 'success',
+        requestPayload: {
+          mode: 'asin_swap',
+          title,
+          price,
+          previousTitle: snapshot.title,
+          previousPrice: snapshot.price,
+          previousAsin: previousListing?._asinReference || '',
+          previousSku: snapshot.sku || '',
+          newAsin: context.asin,
+          newSku: skuResult.sku,
+          revisionId: String(revision._id)
+        },
+        responseSummary: { ack: ebayResult.ack, warnings: ebayResult.warnings }
+      });
+
+      res.json({
+        ok: true,
+        itemId: cleanItemId,
+        newSku: skuResult.sku,
+        newAsin: context.asin,
+        previousSku: snapshot.sku || '',
+        previousAsin: previousListing?._asinReference || '',
+        listingId: newListing._id,
+        revisionId: revision._id,
+        warnings: ebayResult.warnings,
+        message: `Item ${cleanItemId} now lists ${context.asin} as ${skuResult.sku}`
+      });
+    } catch (bookkeepingError) {
+      console.error('[revise-listing/apply] eBay revised but bookkeeping failed:', bookkeepingError.message);
+      await ListingRevision.findByIdAndUpdate(revision._id, {
+        status: 'success',
+        appliedAt: new Date(),
+        bookkeepingError: bookkeepingError.message || 'Failed to save the new listing row'
+      });
+      res.status(500).json({
+        error: `eBay item ${cleanItemId} was revised to ${context.asin}, but saving the new listing row failed: ${bookkeepingError.message}. The listing is live — add the row manually or retry.`,
+        ebayRevised: true,
+        revisionId: revision._id
+      });
+    }
+  } catch (error) {
+    console.error('[revise-listing/apply] failed:', error.message);
+    if (revision) {
+      await ListingRevision.findByIdAndUpdate(revision._id, {
+        status: 'failed',
+        error: error.message || 'Revise failed'
+      }).catch(() => {});
+    }
+    res.status(500).json({ error: error.message || 'Failed to revise listing' });
+  }
+});
+
+/**
+ * GET /amazon-stock-checks/revisions
+ *
+ * The ASIN-swap history, newest first. Descriptions and image lists are left
+ * out — they are the bulk of a revision document and are only ever read one at
+ * a time, from the detail route below.
+ */
+router.get('/revisions', requireAuth, requirePageAccess(LISTING_REVISION_PAGES), async (req, res) => {
+  try {
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(200, Math.max(1, Number.parseInt(req.query.limit, 10) || 50));
+    const filter = {};
+
+    if (['pending', 'success', 'failed'].includes(req.query.status)) {
+      filter.status = req.query.status;
+    }
+    if (mongoose.Types.ObjectId.isValid(String(req.query.sellerId || ''))) {
+      filter.seller = req.query.sellerId;
+    }
+
+    // One box for every identifier on the row — an item id, either SKU or
+    // either ASIN — because none of them is worth its own input when they never
+    // overlap in shape.
+    const search = String(req.query.search || '').trim();
+    if (search) {
+      const rx = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
+      filter.$or = [
+        { itemId: rx }, { previousSku: rx }, { newSku: rx },
+        { previousAsin: rx }, { newAsin: rx }
+      ];
+    }
+
+    const [rows, total] = await Promise.all([
+      ListingRevision.find(filter)
+        .select('-before.description -after.description -before.images -after.images -before.itemSpecifics -after.itemSpecifics')
+        .populate({ path: 'seller', populate: { path: 'user', select: 'username name email' } })
+        .populate('requestedBy', 'username name email')
+        .populate('templateId', 'name')
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      ListingRevision.countDocuments(filter)
+    ]);
+
+    res.json({
+      total,
+      page,
+      limit,
+      rows: rows.map((row) => ({
+        _id: row._id,
+        itemId: row.itemId,
+        sellerName: row.seller?.user?.username || row.seller?.user?.name || row.seller?.user?.email || '',
+        templateName: row.templateId?.name || '',
+        previousAsin: row.previousAsin,
+        previousSku: row.previousSku,
+        newAsin: row.newAsin,
+        newSku: row.newSku,
+        previousTitle: row.before?.title || '',
+        newTitle: row.after?.title || '',
+        previousPrice: row.before?.price ?? null,
+        newPrice: row.after?.price ?? null,
+        currency: row.before?.currency || '',
+        status: row.status,
+        error: row.error || '',
+        bookkeepingError: row.bookkeepingError || '',
+        requestedBy: row.requestedBy?.username || row.requestedBy?.name || row.requestedBy?.email || '',
+        appliedAt: row.appliedAt,
+        createdAt: row.createdAt
+      }))
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to load listing revisions' });
+  }
+});
+
+// GET /amazon-stock-checks/revisions/:id — one revision in full, including the
+// before/after descriptions, pictures and item specifics.
+router.get('/revisions/:id', requireAuth, requirePageAccess(LISTING_REVISION_PAGES), requireObjectId(), async (req, res) => {
+  try {
+    const revision = await ListingRevision.findById(req.params.id)
+      .populate({ path: 'seller', populate: { path: 'user', select: 'username name email' } })
+      .populate('requestedBy', 'username name email')
+      .populate('templateId', 'name')
+      .lean();
+
+    if (!revision) return res.status(404).json({ error: 'Revision not found' });
+
+    res.json({
+      ...revision,
+      sellerName: revision.seller?.user?.username || revision.seller?.user?.name || revision.seller?.user?.email || '',
+      templateName: revision.templateId?.name || '',
+      requestedByName: revision.requestedBy?.username || revision.requestedBy?.name || revision.requestedBy?.email || ''
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to load the revision' });
   }
 });
 

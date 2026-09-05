@@ -12,7 +12,7 @@ import { calculateStartPrice } from '../utils/pricingCalculator.js';
 import { generateWithGemini } from '../utils/gemini.js';
 import { generateSKUFromASIN, generateSKUWithCount } from '../utils/skuGenerator.js';
 import { getEffectiveTemplate } from '../utils/templateMerger.js';
-import { applyOverlayMapping, resolveEffectiveBadgeKey, resolveSavedImageList, resolveTemplateOverlay, withOverlaidImages } from '../utils/overlayImage.js';
+import { applyOverlayMapping, buildOverlayResult, hostImagesOnEbay, IMAGE_LIST_SEPARATOR, prefetchImageRecipes, refreshExpiredImages, resolveEffectiveBadgeKey, resolveSavedImageList, resolveTemplateOverlay, splitImageList, withOverlaidImages } from '../utils/overlayImage.js';
 import { ensureValidToken } from './ebay.js';
 import { getUsageStats, getFieldExtractionStats, getRecentErrors, checkQuotaStatus } from '../utils/apiUsageTracker.js';
 import { getAsinCacheStats, clearAsinCache, invalidateAsinCache } from '../utils/asinCache.js';
@@ -225,6 +225,28 @@ function buildAmazonSourceData(amazonData) {
  * or no usable seller token — so the preview runs exactly as it did before
  * rather than failing.
  */
+// Whether templates with NO badge configured should still have their pictures
+// moved onto eBay Picture Services.
+//
+// Off, a listing without a badge keeps its Amazon URLs and eBay fetches each
+// picture at publish time, storing its own copy against that listing. On, we
+// upload them ourselves first. The finished listing is EPS-hosted either way —
+// what changes is that we take on the pre-listing window in which a picture
+// exists on EPS without a listing claiming it, and so also take on its expiry
+// and its account ownership. Everything downstream (the export-time refresh,
+// the upload-time re-host) exists to manage exactly that window.
+//
+// Set HOST_ALL_LISTING_IMAGES=false to go back to leaving them on Amazon.
+const HOST_ALL_LISTING_IMAGES = process.env.HOST_ALL_LISTING_IMAGES !== 'false';
+
+/**
+ * Work out what should happen to a batch's pictures.
+ *
+ * Returns null when nothing should, and otherwise a context whose `overlay` is
+ * either a resolved badge or null. A null overlay means "host these pictures
+ * unbadged" — which is a real instruction, not an absence of one, so it cannot
+ * be represented by returning null from here.
+ */
 async function prepareOverlayContext(template, seller, badgeKey, source = 'listing') {
   const { badgeKey: effectiveKey, usingDefault, optedOut } = resolveEffectiveBadgeKey(template, badgeKey);
 
@@ -236,43 +258,207 @@ async function prepareOverlayContext(template, seller, badgeKey, source = 'listi
   // problem — routing it through the "unavailable" warning below would put a
   // misconfiguration-shaped line in the log every time someone deliberately
   // turned the badge off, and this log is how overlay problems get diagnosed.
+  let overlay = null;
+
   if (optedOut) {
     console.log(`🏷️ [${source}] Overlay turned off for this batch`);
-    return null;
-  }
-
-  if (!effectiveKey) {
+  } else if (!effectiveKey) {
     console.log(`🏷️ [${source}] No overlay requested and no template default`);
-    return null;
+  } else {
+    overlay = resolveTemplateOverlay(template, effectiveKey);
+    if (!overlay) {
+      console.warn(`🏷️ [${source}] Overlay "${effectiveKey}" unavailable (not enabled on this template, or not registered) — continuing without it`);
+    }
   }
 
-  const overlay = resolveTemplateOverlay(template, effectiveKey);
-  if (!overlay) {
-    console.warn(`🏷️ [${source}] Overlay "${effectiveKey}" unavailable (not enabled on this template, or not registered) — continuing without it`);
-    return null;
-  }
+  // No badge to draw and no instruction to host anyway: leave the pictures on
+  // Amazon and skip the token fetch entirely.
+  if (!overlay && !HOST_ALL_LISTING_IMAGES) return null;
 
   try {
     const token = await ensureValidToken(seller);
-    console.log(`🏷️ [${source}] Overlay "${effectiveKey}"${usingDefault ? ' (template default)' : ''} active (${Math.round(overlay.placement.scale * 100)}% ${overlay.placement.anchor})`);
+
+    if (overlay) {
+      console.log(`🏷️ [${source}] Overlay "${effectiveKey}"${usingDefault ? ' (template default)' : ''} active (${Math.round(overlay.placement.scale * 100)}% ${overlay.placement.anchor})`);
+    } else {
+      console.log(`🏷️ [${source}] No badge — hosting pictures on eBay unbadged`);
+    }
+
     return { overlay, ctx: { sellerId: seller._id, token } };
   } catch (error) {
-    console.error(`🏷️ [${source}] Overlay "${effectiveKey}" skipped — no eBay token for seller ${seller._id}: ${error.message}`);
+    console.error(`🏷️ [${source}] Image hosting skipped — no eBay token for seller ${seller._id}: ${error.message}`);
     return null;
   }
 }
 
 /**
- * Apply the batch's overlay to amazonData's images, if one is active. Badges
- * the primary and moves every image onto eBay Picture Services, since eBay
- * rejects listings that mix its own hosted pictures with external URLs.
+ * Move a batch's pictures onto eBay Picture Services, badging the primary one
+ * if this batch has a badge. eBay rejects listings that mix its own hosted
+ * pictures with external URLs, so either every picture moves or none does.
  *
- * Always returns a usable object — never throws — so a badge failure can't
- * take down a preview.
+ * `applied` means the picture list changed; `badged` means artwork was actually
+ * composited. They were the same thing while only badged batches were hosted,
+ * and callers reporting an overlay to the UI want `badged`.
+ *
+ * Always returns a usable object — never throws — so a hosting failure can't
+ * take down a preview. A batch that fails to host keeps its Amazon URLs, which
+ * eBay still ingests at publish time.
  */
 async function applyBatchOverlay(amazonData, overlayContext) {
-  if (!overlayContext) return { data: amazonData, applied: false };
-  return withOverlaidImages(amazonData, overlayContext.overlay, overlayContext.ctx);
+  if (!overlayContext) return { data: amazonData, applied: false, badged: false };
+
+  if (overlayContext.overlay) {
+    const result = await withOverlaidImages(amazonData, overlayContext.overlay, overlayContext.ctx);
+    return { ...result, badged: result.applied };
+  }
+
+  // No badge: same hosting, no compositing. hostImagesOnEbay() returns early
+  // once every picture is already on EPS, so a re-preview costs nothing.
+  const images = Array.isArray(amazonData?.images) ? amazonData.images : [];
+  if (!images.length) return { data: amazonData, applied: false, badged: false };
+
+  const hosted = await hostImagesOnEbay(images, overlayContext.ctx);
+
+  if (!hosted.applied) {
+    return { data: amazonData, applied: false, badged: false, warning: hosted.warning };
+  }
+
+  return { ...buildOverlayResult(amazonData, images, hosted.images), badged: false };
+}
+
+// How long the export-time refresh may spend before it gives up and lets the
+// download proceed.
+//
+// The work is unbounded by nature: a re-download of an old batch can find every
+// picture in it stale, and each one costs a source download, a sharp decode and
+// two eBay round trips. Nothing is written to the response until the CSV is
+// complete, so an export that runs long looks like a hung request and can be
+// cut by the proxy — leaving the operator with no file at all.
+//
+// Past the budget the remaining listings keep the URLs they already had, which
+// is exactly what happens today to a listing that cannot be rebuilt, and the
+// count is reported. A truncated refresh with a file is strictly better than a
+// complete refresh the operator never receives.
+//
+// This bounds the wait, not the work. The real fix for a large stale batch is
+// to move the refresh off the request entirely.
+const IMAGE_REFRESH_BUDGET_MS = Math.max(
+  0,
+  parseInt(process.env.IMAGE_REFRESH_BUDGET_MS, 10) || 60000
+);
+
+/**
+ * Re-host expired pictures across a batch on its way out as a CSV.
+ *
+ * Pictures are hosted when a listing is PREVIEWED, but the CSV reaches eBay
+ * whenever the operator uploads it — which can be a week later, or from a file
+ * kept and re-used much later than that. eBay reclaims any picture no live
+ * listing has claimed, and the call that used to extend that deadline was
+ * decommissioned in July 2025, so the only remedy is to replace the pictures.
+ *
+ * Export is the right moment for it: it is the last point we control before the
+ * file leaves, so the clock starts as late as it possibly can.
+ *
+ * Both the photo column and the description carry image URLs — {image_main} is
+ * substituted into the description HTML at generation time — so a refresh has
+ * to rewrite both or the description keeps pointing at pictures that are gone.
+ *
+ * Never throws: a listing that cannot be refreshed is reported and exported
+ * unchanged, exactly as it would have been before this existed.
+ *
+ * @param {Array} listings - TemplateListing documents, mutated in place
+ * @param {object|null} seller
+ * @returns {Promise<{refreshed: number, warnings: string[]}>}
+ */
+async function refreshBatchImages(listings, seller) {
+  const result = { refreshed: 0, warnings: [] };
+
+  if (!seller || !listings?.length) return result;
+
+  let token;
+  try {
+    token = await ensureValidToken(seller);
+  } catch (error) {
+    // No token means no refresh, but the export itself is still valid — the
+    // pictures may well be fine. Say so rather than failing the download.
+    console.warn(`[Export] Image refresh skipped — no eBay token: ${error.message}`);
+    result.warnings.push('Could not check image expiry: no valid eBay token for this seller.');
+    return result;
+  }
+
+  // One lookup for the whole batch instead of one per listing. The rows are
+  // keyed by hostedUrl and the filter is otherwise identical, so walking the
+  // listings to collect their URLs first turns N round trips into one — worth
+  // it here because this runs on the request path before any CSV is written.
+  const recipes = await prefetchImageRecipes(
+    listings.flatMap((listing) => splitImageList(listing.itemPhotoUrl || '')),
+    { sellerId: seller._id }
+  );
+
+  const ctx = { sellerId: seller._id, token, recipes };
+
+  const deadline = Date.now() + IMAGE_REFRESH_BUDGET_MS;
+  let checked = 0;
+
+  // Sequential across listings, because each listing already uploads its own
+  // pictures one at a time and eBay caps Media API uploads at 50 per 5 seconds
+  // per user. A stale batch is slow by nature; going wider risks 429s on top.
+  for (const listing of listings) {
+    // Checked between listings, never inside one: a listing part-way through
+    // its uploads has to finish or its picture list ends up half moved, which
+    // is the mixed-host state refreshExpiredImages() exists to prevent.
+    if (IMAGE_REFRESH_BUDGET_MS && Date.now() > deadline) {
+      const remaining = listings.length - checked;
+      console.warn(`[Export] Image refresh budget spent - ${remaining} listing(s) not checked`);
+      result.warnings.push(
+        `Image expiry check stopped after ${Math.round(IMAGE_REFRESH_BUDGET_MS / 1000)}s - ${remaining} listing(s) were not checked and kept their existing pictures.`
+      );
+      break;
+    }
+
+    checked += 1;
+
+    const images = splitImageList(listing.itemPhotoUrl || '');
+    if (!images.length) continue;
+
+    try {
+      const refreshed = await refreshExpiredImages(images, ctx);
+
+      if (refreshed.warning) {
+        result.warnings.push(`${listing.customLabel || listing._id}: ${refreshed.warning}`);
+        continue;
+      }
+
+      if (!refreshed.refreshed) continue;
+
+      listing.itemPhotoUrl = refreshed.images.join(IMAGE_LIST_SEPARATOR);
+      listing.description = applyOverlayMapping(listing.description || '', refreshed.mappings);
+
+      // The direct-export path hands us plain objects carried through from the
+      // review modal, not saved documents — deliberately, since edits made
+      // there are not persisted. Those still get refreshed URLs in the CSV;
+      // there is simply no row to write back to.
+      const persistId = listing._id || listing._existingListingId;
+      if (persistId) {
+        await TemplateListing.updateOne(
+          { _id: persistId },
+          { $set: { itemPhotoUrl: listing.itemPhotoUrl, description: listing.description } }
+        );
+      }
+
+      result.refreshed += 1;
+    } catch (error) {
+      // One listing's failure must not cost the operator the whole download.
+      console.error(`[Export] Image refresh failed for ${listing.customLabel}: ${error.message}`);
+      result.warnings.push(`${listing.customLabel || listing._id}: ${error.message}`);
+    }
+  }
+
+  if (result.refreshed) {
+    console.log(`🖼️ [Export] Re-hosted expired pictures on ${result.refreshed} listing(s)`);
+  }
+
+  return result;
 }
 
 function calculatePricingOnly(asin, amazonPrice, pricingConfig) {
@@ -3198,7 +3384,7 @@ router.get('/bulk-preview-stream', requireAuthSSE, async (req, res) => {
           asin,
           id: `preview-${asin}`,
           sourceData,
-          overlayApplied: overlayResult.applied,
+          overlayApplied: overlayResult.badged,
           overlayWarning: overlayResult.warning || null,
           progressStage: 'generating'
         });
@@ -4509,7 +4695,7 @@ router.post('/autofill-from-asin', requireAuth, async (req, res) => {
     // so an autofill without sellerId simply keeps the original image.
     const seller = sellerId ? await Seller.findById(sellerId) : null;
     const overlayContext = seller ? await prepareOverlayContext(template, seller, overlayBadgeId, 'autofill-single') : null;
-    const { data: stagedData, applied: overlayApplied } = await applyBatchOverlay(amazonData, overlayContext);
+    const { data: stagedData, badged: overlayApplied } = await applyBatchOverlay(amazonData, overlayContext);
 
     // 3. Apply field configurations (AI + direct mappings)
     console.log(`Processing ${template.asinAutomation.fieldConfigs.length} field configs`);
@@ -6937,6 +7123,11 @@ router.get('/export-csv/:templateId', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'No active listings to download' });
     }
 
+    // Replace any pictures eBay has dropped since these were previewed, so the
+    // file that leaves here has live URLs in it. Runs before the CSV rows are
+    // built, and mutates the listing documents the rows are read from.
+    const imageRefresh = await refreshBatchImages(listings, seller);
+
     // Generate batch ID and get next batch number
     const crypto = await import('crypto');
     const batchId = crypto.randomUUID();
@@ -7123,6 +7314,16 @@ router.get('/export-csv/:templateId', requireAuth, async (req, res) => {
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    // The body is the file itself, so anything the operator should know about
+    // the refresh has to travel as headers. Counts only — header values must
+    // stay single-line ASCII, and the per-listing detail is in the server log.
+    // Both names are registered in the CORS exposedHeaders list in index.js;
+    // setting Access-Control-Expose-Headers here instead would drop
+    // Content-Disposition and break the download filename.
+    res.setHeader('X-Images-Refreshed', String(imageRefresh.refreshed));
+    res.setHeader('X-Image-Warnings', String(imageRefresh.warnings.length));
+
     res.send(csvContent);
 
     // Snapshot: if this is a real (non-Testing) seller, upsert TemplateListing records
@@ -7259,6 +7460,11 @@ router.post('/export-csv-direct/:templateId', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Template not found' });
     }
 
+    // Usually a no-op here — these were previewed moments ago — but the file
+    // this produces can still be kept and uploaded much later, so the same
+    // check applies. See refreshBatchImages().
+    const imageRefresh = await refreshBatchImages(listings, seller);
+
     // Generate batch ID and get next batch number
     const crypto = await import('crypto');
     const batchId = crypto.randomUUID();
@@ -7382,6 +7588,10 @@ router.post('/export-csv-direct/:templateId', requireAuth, async (req, res) => {
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    res.setHeader('X-Images-Refreshed', String(imageRefresh.refreshed));
+    res.setHeader('X-Image-Warnings', String(imageRefresh.warnings.length));
+
     res.send(csvContent);
 
     // Snapshot: upsert TemplateListing records for the chosen real seller.
@@ -7637,6 +7847,11 @@ router.get('/re-download-batch/:templateId/:batchId', requireAuth, async (req, r
 
     const batchNumber = listings[0].downloadBatchNumber;
 
+    // The staleness case this matters most for. A re-download is by definition
+    // of an OLD batch — months old, in some cases — so its pictures are the
+    // likeliest of any export path to have been reclaimed by eBay already.
+    const imageRefresh = await refreshBatchImages(listings, seller);
+
     // Use the action field that was saved at download time; fall back to current template value
     const actionField = listings[0].downloadedActionField || template.customActionField || '*Action(SiteID=US|Country=US|Currency=USD|Version=1193)';
     console.log('📝 Using Action field:', actionField);
@@ -7789,6 +8004,8 @@ router.get('/re-download-batch/:templateId/:batchId', requireAuth, async (req, r
     const filename = `${templateName}_${sellerName}_batch_${batchNumber}_${dateStr}.csv`;
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('X-Images-Refreshed', String(imageRefresh.refreshed));
+    res.setHeader('X-Image-Warnings', String(imageRefresh.warnings.length));
     res.send(csvContent);
 
   } catch (error) {
