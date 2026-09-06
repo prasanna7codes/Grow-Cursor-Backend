@@ -81,6 +81,42 @@ import { swaggerSpec } from './swagger.js';
 import imageCache from './lib/imageCache.js';
 import * as Sentry from '@sentry/node';
 import logger from './lib/logger.js';
+import sharp from 'sharp';
+
+// libvips runs outside the V8 heap, so nothing it allocates is bounded by
+// --max-old-space-size — it lands in the container RSS that Render kills on.
+// Set here rather than at the call sites because both are process-global:
+// utils/overlayCompositor.js and routes/ebay.js share one libvips, and the last
+// caller to set them would win.
+
+// Disable the operation cache, which defaults to 50MB / 20 files / 100 items.
+// It exists so a repeated operation can skip the decode, and nothing here ever
+// repeats one: every image is downloaded, composited once and discarded. Buffer
+// inputs do not dedupe across calls either, so even the same source URL
+// composited for two listings misses. It is retained native memory with no
+// reader.
+sharp.cache(false);
+
+// Pin one worker thread per operation.
+//
+// Note this is already the default: sharp has shipped concurrency 1 on
+// glibc Linux since 0.33 specifically to limit memory fragmentation, so on
+// Render this call currently changes nothing (verified against 0.34.5 —
+// sharp.concurrency() reports 1 on a 16-core host).
+//
+// It is here as a guard rather than a fix. The default is platform-conditional:
+// a musl base image, or a jemalloc-linked build, gets one thread per detected
+// core instead — and inside a container that count is the HOST's, not the
+// cgroup allocation. A base-image change would quietly multiply the native
+// footprint of every composite. Parallelism is already bounded above this by
+// p-limit at every call site (LISTING_OVERLAY_CONCURRENCY,
+// EBAY_REHOST_CONCURRENCY, liveImageLimit), so extra threads here would only
+// widen work that was already concurrent.
+//
+// SHARP_CONCURRENCY raises it if a measurement ever shows compositing is the
+// bottleneck. Normally it is not: a picture's cost is dominated by the source
+// download and the two eBay Media API round trips.
+sharp.concurrency(Math.max(1, parseInt(process.env.SHARP_CONCURRENCY, 10) || 1));
 
 // ── Unhandled rejection safety net ───────────────────────────────────────────
 // Since Node 15 an unhandled promise rejection is rethrown as an uncaught
@@ -123,7 +159,11 @@ app.use(cors({
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
-  exposedHeaders: ['Content-Disposition']
+  // Every header the browser is allowed to hand to client JS must be listed
+  // HERE, not with res.setHeader() in a route: setHeader REPLACES this list
+  // rather than adding to it, so a route setting its own value silently hides
+  // Content-Disposition and CSV downloads lose their filename.
+  exposedHeaders: ['Content-Disposition', 'X-Images-Refreshed', 'X-Image-Warnings']
 }));
 app.use(express.json({ limit: '10mb' })); // Increased limit for bulk operations
 app.use(mongoSanitize()); // Sanitize user input to prevent NoSQL injection (strips $ and . from req.body/query/params)

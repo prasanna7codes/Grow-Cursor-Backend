@@ -54,6 +54,9 @@ import {
 } from '../utils/exchangeRateUtils.js';
 import { getExcludedItemIdsFrom, normalizeItemId } from '../utils/quantityUpdateExclusions.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
+import { uploadImageToEps } from '../utils/ebayMediaApi.js';
+import { locateImageColumns, parseCsv, toCsv } from '../utils/feedCsv.js';
+import { applyOverlayMapping, ensureImagesForSeller, IMAGE_LIST_SEPARATOR, splitImageList } from '../utils/overlayImage.js';
 
 const upload = multer({ storage: multer.memoryStorage() });
 const router = express.Router();
@@ -1260,8 +1263,12 @@ router.get('/sync-sku-index/status/:sellerId', requireAuth, async (req, res) => 
       };
     }
     const dbCount = await SellerSkuIndex.countDocuments({ seller: sellerId });
-    // Get the syncedAt from the most recent record for this seller
-    const latest = await SellerSkuIndex.findOne({ seller: sellerId }).sort({ syncedAt: -1 }).select('syncedAt').lean();
+    // When a sync completes, every one of this seller's records carries the same
+    // `syncStart`, so any record answers "when was this index last synced" and
+    // there is nothing for a sort to order. There is no index on syncedAt, so
+    // sorting here meant an in-memory sort over the seller's entire document set
+    // (tens of thousands of rows) to pick between identical values.
+    const latest = await SellerSkuIndex.findOne({ seller: sellerId }).select('syncedAt').lean();
     return res.json({
       ...mem,
       dbCount,
@@ -1748,6 +1755,107 @@ router.get(
  *       500:
  *         description: Internal server error
  */
+/**
+ * Put every picture in a feed file under the seller it is being uploaded for.
+ *
+ * A CSV carries literal URLs, so a file exported for one seller and uploaded
+ * under another leaves the new listings pointing at pictures hosted in the
+ * FIRST seller's account — a shared dependency that breaks the moment the
+ * original listing ends or that account is suspended. The same pass also
+ * replaces pictures that simply expired while the file sat unused, since the
+ * remedy is identical: re-host under the uploading seller.
+ *
+ * Rewrites the photo column and the description together, because feed files
+ * name the same picture in both and a half-rewritten row would leave the
+ * description pointing at images that are about to disappear.
+ *
+ * Never throws — a file it cannot understand is uploaded exactly as supplied,
+ * which is what happened before this existed.
+ *
+ * @returns {Promise<{buffer: Buffer, rehosted: number, foreign: number, warnings: string[]}>}
+ */
+async function rehostFeedImagesForSeller(file, seller, token) {
+  const unchanged = { buffer: file.buffer, rehosted: 0, foreign: 0, warnings: [] };
+
+  try {
+    const rows = parseCsv(file.buffer.toString('utf8'));
+    const columns = locateImageColumns(rows);
+
+    // No photo column means this is not a listing feed — inventory or order
+    // feeds go through here too, and must pass straight through.
+    if (!columns) {
+      console.log('[Feed Upload] No "Item photo URL" column — image check skipped');
+      return unchanged;
+    }
+
+    const dataRows = rows.slice(columns.headerIndex + 1);
+
+    // Gathered across the WHOLE file before anything is uploaded, so a picture
+    // shared by twenty rows is re-hosted once rather than twenty times.
+    const everyUrl = [];
+    for (const row of dataRows) {
+      everyUrl.push(...splitImageList(row[columns.photo] || ''));
+    }
+
+    // Every URL is external (Amazon, typically) rather than eBay-hosted. That
+    // is the SAFE shape for a cross-seller file: eBay fetches each picture at
+    // publish time and hosts its own copy under the uploading account, so
+    // nothing is shared between sellers and there is nothing to re-host.
+    const epsCount = everyUrl.filter((url) => /(^|\.)ebayimg\.com/i.test(url)).length;
+    console.log(
+      `[Feed Upload] Image check: ${dataRows.length} row(s), ${everyUrl.length} picture reference(s), ${epsCount} eBay-hosted`
+    );
+
+    if (!everyUrl.length || !epsCount) return unchanged;
+
+    const outcome = await ensureImagesForSeller(everyUrl, {
+      sellerId: seller._id,
+      token,
+    });
+
+    for (const warning of outcome.warnings) {
+      console.warn(`[Feed Upload] ${warning}`);
+    }
+
+    if (!outcome.mappings.length) {
+      console.log(
+        `[Feed Upload] Nothing re-hosted — ${outcome.foreign} picture(s) belonged to another seller`
+      );
+      return { ...unchanged, foreign: outcome.foreign, warnings: outcome.warnings };
+    }
+
+    for (const row of dataRows) {
+      const photos = splitImageList(row[columns.photo] || '');
+      if (photos.length) {
+        row[columns.photo] = photos
+          .map((url) => outcome.mappings.find((m) => m.from === url)?.to || url)
+          .join(IMAGE_LIST_SEPARATOR);
+      }
+
+      if (columns.description !== -1 && row[columns.description]) {
+        row[columns.description] = applyOverlayMapping(row[columns.description], outcome.mappings);
+      }
+    }
+
+    console.log(
+      `[Feed Upload] Re-hosted ${outcome.rehosted} picture(s) under ${seller._id}` +
+        (outcome.foreign ? ` — ${outcome.foreign} belonged to another seller` : '')
+    );
+
+    return {
+      buffer: Buffer.from(toCsv(rows), 'utf8'),
+      rehosted: outcome.rehosted,
+      foreign: outcome.foreign,
+      warnings: outcome.warnings,
+    };
+  } catch (error) {
+    // Uploading the original file is strictly better than failing the upload:
+    // the pictures may well be fine, and the operator can act on the warning.
+    console.error(`[Feed Upload] Image re-host skipped: ${error.message}`);
+    return { ...unchanged, warnings: [`Image ownership check failed: ${error.message}`] };
+  }
+}
+
 router.post('/feed/upload', requireAuth, upload.single('file'), async (req, res) => {
   try {
     const { sellerId, feedType = 'FX_LISTING', schemaVersion = '1.0', country = 'US', categoryId, rangeId, productId } = req.body;
@@ -1770,6 +1878,11 @@ router.post('/feed/upload', requireAuth, upload.single('file'), async (req, res)
     }
 
     const accessToken = await ensureValidToken(seller);
+
+    // 1b. Make sure every picture in the file belongs to THIS seller and is
+    // still alive. Runs before the task is created so a failure here costs
+    // nothing on eBay's side. See rehostFeedImagesForSeller().
+    const imageFix = await rehostFeedImagesForSeller(file, seller, accessToken);
 
     // 2. Create Task
     // POST https://api.ebay.com/sell/feed/v1/task
@@ -1805,8 +1918,10 @@ router.post('/feed/upload', requireAuth, upload.single('file'), async (req, res)
     console.log(`[Feed Upload] Uploading file to task ${taskId}...`);
 
     const formData = new FormData();
-    // 'file' is the required key name for the file content
-    formData.append('file', file.buffer, {
+    // 'file' is the required key name for the file content.
+    // imageFix.buffer is the supplied file when nothing needed re-hosting, and
+    // a rewritten copy when it did.
+    formData.append('file', imageFix.buffer, {
       filename: file.originalname,
       contentType: file.mimetype,
     });
@@ -1852,7 +1967,16 @@ router.post('/feed/upload', requireAuth, upload.single('file'), async (req, res)
       success: true,
       taskId: taskId,
       message: 'File uploaded and processing started',
-      uploadStatus: uploadRes.status
+      uploadStatus: uploadRes.status,
+      // What the image pass did, so a cross-seller upload is visible rather
+      // than silent. `foreign` is the count that belonged to another account —
+      // worth surfacing even when everything was fixed, because it means the
+      // file came from somewhere else.
+      images: {
+        rehosted: imageFix.rehosted,
+        foreign: imageFix.foreign,
+        warnings: imageFix.warnings
+      }
     });
 
   } catch (error) {
@@ -9635,8 +9759,11 @@ router.post('/sync-thread', requireAuth, requirePageAccess('BuyerMessages'), asy
 
 
 // Helper: Upload Image to eBay Picture Services (EPS)
-// Buyers use the exact same process - they upload via eBay's UI which calls UploadSiteHostedPictures
-// The MediaURL we receive from buyers is also from i.ebayimg.com domain
+// Buyers reach the same place through eBay's UI, so the MediaURL we receive
+// from them is on i.ebayimg.com too.
+//
+// The Sharp pipeline below is tuned for message attachments and stays local to
+// this flow; only the upload itself is shared, via utils/ebayMediaApi.js.
 async function uploadImageToEbay(token, filePath) {
   try {
     console.log('[eBay Upload] Processing image:', filePath);
@@ -9674,56 +9801,15 @@ async function uploadImageToEbay(token, filePath) {
 
     const fileName = path.basename(filePath).replace(/\.[^/.]+$/, '.jpg');
 
-    // Step 3: Use multipart/form-data (eBay's recommended method)
-    const form = new FormData();
+    // Step 3: Upload to eBay Picture Services via the Media API
+    const { imageUrl, expiresAt } = await uploadImageToEps(token, processedBuffer, fileName);
 
-    // Add XML payload as first part
-    const xmlPayload = `<?xml version="1.0" encoding="utf-8"?>
-<UploadSiteHostedPicturesRequest xmlns="urn:ebay:apis:eBLBaseComponents">
-  <RequesterCredentials>
-    <eBayAuthToken>${token}</eBayAuthToken>
-  </RequesterCredentials>
-  <PictureName>${fileName}</PictureName>
-  <PictureSet>Standard</PictureSet>
-</UploadSiteHostedPicturesRequest>`;
-
-    form.append('XML Payload', xmlPayload, {
-      contentType: 'text/xml; charset=utf-8'
-    });
-
-    // Add binary image as second part
-    form.append(fileName, processedBuffer, {
-      filename: fileName,
-      contentType: 'image/jpeg'
-    });
-
-    // Step 4: Upload to eBay Picture Services
-    const response = await axios.post('https://api.ebay.com/ws/api.dll', form, {
-      headers: {
-        ...form.getHeaders(),
-        'X-EBAY-API-SITEID': '0',
-        'X-EBAY-API-COMPATIBILITY-LEVEL': '1423',
-        'X-EBAY-API-CALL-NAME': 'UploadSiteHostedPictures'
-      },
-      timeout: 30000,
-      maxBodyLength: Infinity,
-      maxContentLength: Infinity
-    });
-
-    const result = await parseStringPromise(response.data);
-    const ack = result.UploadSiteHostedPicturesResponse.Ack[0];
-
-    if (ack === 'Success' || ack === 'Warning') {
-      const fullUrl = result.UploadSiteHostedPicturesResponse.SiteHostedPictureDetails[0].FullURL[0];
-      console.log('[eBay Upload] ✅ Success:', fullUrl);
-      return fullUrl;
-    } else {
-      const errors = result.UploadSiteHostedPicturesResponse.Errors;
-      const errorMsg = errors[0].LongMessage[0];
-      const errorCode = errors[0].ErrorCode?.[0];
-      console.error('[eBay Upload] ❌ Failed:', errorCode, errorMsg);
-      throw new Error(`eBay Upload Failed: ${errorMsg}`);
-    }
+    // Attachments live in the message body as plain links, so nothing ever
+    // associates them with a listing and EPS eventually reclaims them. Log the
+    // deadline: an old thread whose images have gone blank looks like a bug
+    // otherwise, and this is the only trace of why.
+    console.log('[eBay Upload] ✅ Success:', imageUrl, expiresAt ? `(expires ${expiresAt.toISOString()})` : '');
+    return imageUrl;
   } catch (error) {
     console.error('[eBay Upload] Error:', error.message);
     if (error.response?.data) {
