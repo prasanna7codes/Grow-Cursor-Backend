@@ -17,6 +17,14 @@ const STOCK_CHECK_PAGES = ['AmazonStockCheck', 'SellerSkuStockCheck'];
 // The revision history has its own page, and is also reachable from the stock
 // check pages that create the revisions.
 const LISTING_REVISION_PAGES = ['ListingRevisions', ...STOCK_CHECK_PAGES];
+
+// The SKU Listing Manager searches the SKU index for a typed SKU and offers the
+// same end/revise actions on what it finds, so it shares those endpoints.
+const SKU_LISTING_MANAGER_PAGE = 'SkuListingManager';
+const LISTING_ACTION_PAGES = [SKU_LISTING_MANAGER_PAGE, ...STOCK_CHECK_PAGES];
+// The same page also answers the read-only SKU / ASIN Lookup route, so that
+// page id may read the lookup — but not the end/revise routes above it.
+const SKU_LOOKUP_PAGES = ['SkuIndexLookup', ...LISTING_ACTION_PAGES];
 import SellerSkuIndex from '../models/SellerSkuIndex.js';
 import TemplateListing from '../models/TemplateListing.js';
 import Seller from '../models/Seller.js';
@@ -459,6 +467,138 @@ async function getSellerNameMap(sellerIds) {
     String(seller._id),
     seller.user?.username || seller.user?.name || seller.user?.email || String(seller._id)
   ]));
+}
+
+// ---------------------------------------------------------------------------
+// Per-listing history
+//
+// Orders, end-listing actions and revisions for a set of eBay item ids, keyed
+// by `${sellerId}:${itemId}`. Shared by the verify drawer and the SKU Listing
+// Manager page, which both show one row per seller listing and need the same
+// order counts and action badges beside it.
+// ---------------------------------------------------------------------------
+async function loadListingHistory(itemIds) {
+  if (!itemIds.length) {
+    return { endedByKey: new Map(), revisedByKey: new Map(), ordersByKey: new Map() };
+  }
+
+  const [endLogs, reviseLogs, orders] = await Promise.all([
+    EndListingLog.find({ itemId: { $in: itemIds } })
+      .populate('endedBy', 'username name email')
+      .sort({ endedAt: -1 })
+      .lean(),
+    AmazonStockActionLog.find({ itemId: { $in: itemIds }, actionType: 'revise_listing', status: 'success' })
+      .populate('requestedBy', 'username name email')
+      .sort({ createdAt: -1 })
+      .lean(),
+    Order.find({
+      $or: [{ itemNumber: { $in: itemIds } }, { 'lineItems.legacyItemId': { $in: itemIds } }]
+    })
+      .select('seller orderId dateSold creationDate itemNumber lineItems quantity subtotal productName')
+      .sort({ dateSold: -1, creationDate: -1 })
+      .lean()
+  ]);
+
+  const endedByKey = new Map();
+  for (const log of endLogs) {
+    const key = `${String(log.seller)}:${log.itemId}`;
+    if (endedByKey.has(key)) continue; // keep the most recent log per item
+    endedByKey.set(key, {
+      endedAt: log.endedAt,
+      endedBy: log.endedBy?.username || log.endedBy?.name || log.endedBy?.email || null,
+      source: log.source
+    });
+  }
+
+  const revisedByKey = new Map();
+  for (const log of reviseLogs) {
+    const key = `${String(log.seller)}:${log.itemId}`;
+    if (revisedByKey.has(key)) continue; // keep the most recent log per item
+    revisedByKey.set(key, {
+      revisedAt: log.createdAt,
+      revisedBy: log.requestedBy?.username || log.requestedBy?.name || log.requestedBy?.email || null,
+      previousTitle: log.requestPayload?.previousTitle || '',
+      newTitle: log.requestPayload?.title || '',
+      previousPrice: log.requestPayload?.previousPrice ?? null,
+      newPrice: log.requestPayload?.price ?? null
+    });
+  }
+
+  // Group orders by (seller, itemId); an order can reference an item id via
+  // the denormalized itemNumber or any of its line items.
+  const ordersByKey = new Map();
+  for (const order of orders) {
+    const orderDate = order.dateSold || order.creationDate || null;
+    if (!orderDate) continue;
+    const ids = new Set();
+    if (order.itemNumber) ids.add(order.itemNumber);
+    for (const lineItem of order.lineItems || []) {
+      if (lineItem?.legacyItemId) ids.add(lineItem.legacyItemId);
+    }
+    for (const itemId of ids) {
+      const key = `${String(order.seller)}:${itemId}`;
+      const list = ordersByKey.get(key) || [];
+      list.push({
+        orderId: order.orderId,
+        date: orderDate,
+        quantity: order.quantity ?? null,
+        subtotal: order.subtotal ?? null,
+        productName: order.productName || ''
+      });
+      ordersByKey.set(key, list);
+    }
+  }
+
+  return { endedByKey, revisedByKey, ordersByKey };
+}
+
+// Folds loadListingHistory() output onto seller-listing rows, adding the 30d /
+// 90d / lifetime order counts and the 12-month sparkline series each row shows.
+function attachListingHistory(sellerItems, history, { fallbackSku = '', fallbackCurrency = '', runSellerId = null } = {}) {
+  const { endedByKey, revisedByKey, ordersByKey } = history;
+  const since30 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const since90 = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
+
+  // Last 12 calendar months (oldest first) for the per-item order sparkline.
+  const monthKeys = [];
+  const now = new Date();
+  for (let i = 11; i >= 0; i -= 1) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    monthKeys.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
+  }
+
+  return sellerItems.map((row) => {
+    const key = `${String(row.sellerId)}:${row.itemId}`;
+    const allOrders = (ordersByKey.get(key) || []).sort((a, b) => new Date(b.date) - new Date(a.date));
+    const recentOrders = allOrders.filter((order) => new Date(order.date) >= since30);
+    const recentOrders90d = allOrders.filter((order) => new Date(order.date) >= since90);
+    const countsByMonth = new Map();
+    for (const order of allOrders) {
+      const d = new Date(order.date);
+      const monthKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+      countsByMonth.set(monthKey, (countsByMonth.get(monthKey) || 0) + 1);
+    }
+    return {
+      sellerId: row.sellerId,
+      sellerName: row.sellerName,
+      itemId: row.itemId,
+      sku: row.sku || fallbackSku,
+      title: row.title || '',
+      price: row.price ?? null,
+      currency: row.currency || fallbackCurrency,
+      imageUrl: row.imageUrl || '',
+      syncedAt: row.syncedAt || null,
+      quantityZeroStatus: row.quantityZeroStatus || 'not_needed',
+      isRunSeller: runSellerId ? String(row.sellerId) === runSellerId : false,
+      orderCount30d: recentOrders.length,
+      orderCount90d: recentOrders90d.length,
+      orders: recentOrders.slice(0, 20),
+      lifetimeOrderCount: allOrders.length,
+      monthlyOrders: monthKeys.map((month) => ({ month, count: countsByMonth.get(month) || 0 })),
+      endedInfo: endedByKey.get(key) || null,
+      revisedInfo: revisedByKey.get(key) || null
+    };
+  });
 }
 
 async function buildOrderSummaryMapForSellerItems(sellerItems) {
@@ -1312,6 +1452,208 @@ router.get('/seller-summary', requireAuth, requirePageAccess(STOCK_CHECK_PAGES),
 // Verification data for one checked SKU: the Amazon product URL for the
 // item's country plus every seller's item IDs for this SKU/currency with
 // their orders from the last 30 days.
+// ---------------------------------------------------------------------------
+// SKU LISTING MANAGER
+//
+// Type a SKU, get every seller listing carrying it straight out of
+// SellerSkuIndex, with the order history for each item id and enough detail to
+// end or revise the listing from the same row. Unlike the verify drawer this
+// is not tied to a stock check run, so no run has to exist for the SKU.
+// ---------------------------------------------------------------------------
+
+// One SKU can be listed by every seller, sometimes several times each; cap the
+// response rather than returning an unbounded list.
+const SKU_LISTING_LOOKUP_MAX_ROWS = 500;
+// Distinct SKU labels resolved from a single ASIN before the index lookup.
+const SKU_LISTING_LOOKUP_MAX_ASIN_LABELS = 200;
+
+router.get('/sku-lookup', requireAuth, requirePageAccess(SKU_LOOKUP_PAGES), async (req, res) => {
+  try {
+    const raw = cleanSku(req.query.query ?? req.query.sku);
+    if (!raw) return res.status(400).json({ error: 'query is required' });
+
+    const isAsinQuery = isAmazonAsin(raw);
+    const queriedAsin = isAsinQuery ? cleanAsin(raw) : '';
+
+    // Match the SKU as typed, its base label (variant suffix stripped) and the
+    // uppercase form of both. All equality matches, so the plain sku / baseSku
+    // indexes are used instead of a collection scan.
+    const candidateSet = new Set();
+    const addCandidate = (value) => {
+      const cleaned = cleanSku(value);
+      if (!cleaned) return;
+      candidateSet.add(cleaned);
+      candidateSet.add(cleaned.toUpperCase());
+      const base = getBaseLabel(cleaned);
+      if (base) {
+        candidateSet.add(base);
+        candidateSet.add(base.toUpperCase());
+      }
+    };
+    addCandidate(raw);
+
+    // An ASIN is not stored on the index (unless a SKU literally is one), so
+    // resolve it to the SKUs listed for it first. Distinct labels are collected
+    // with $addToSet rather than capping documents: one ASIN can be listed
+    // hundreds of times, and a document cap could drop a distinct SKU — and
+    // with it a seller that genuinely carries this ASIN.
+    let asinSkuLabels = [];
+    if (isAsinQuery) {
+      const [grouped] = await TemplateListing.aggregate([
+        { $match: { _asinReference: { $in: [...new Set([queriedAsin, queriedAsin.toLowerCase(), raw])] } } },
+        {
+          $group: {
+            _id: null,
+            labels: { $addToSet: '$customLabel' },
+            baseLabels: { $addToSet: '$baseCustomLabel' }
+          }
+        }
+      ]);
+      asinSkuLabels = [...new Set([...(grouped?.labels || []), ...(grouped?.baseLabels || [])])]
+        .filter(Boolean)
+        .sort();
+      asinSkuLabels.slice(0, SKU_LISTING_LOOKUP_MAX_ASIN_LABELS).forEach(addCandidate);
+    }
+
+    const baseLabel = getBaseLabel(raw);
+    const candidates = [...candidateSet];
+
+    const rows = await SellerSkuIndex.find({
+      $or: [{ sku: { $in: candidates } }, { baseSku: { $in: candidates } }]
+    })
+      .select('seller itemId sku baseSku title price currency imageUrl syncedAt')
+      .sort({ syncedAt: -1 })
+      .limit(SKU_LISTING_LOOKUP_MAX_ROWS + 1)
+      .lean();
+
+    const truncated = rows.length > SKU_LISTING_LOOKUP_MAX_ROWS;
+    if (truncated) rows.length = SKU_LISTING_LOOKUP_MAX_ROWS;
+
+    if (!rows.length) {
+      return res.json({
+        sku: raw,
+        baseSku: baseLabel,
+        queryType: isAsinQuery ? 'asin' : 'sku',
+        queriedAsin,
+        totalListings: 0,
+        sellerCount: 0,
+        matchedSkus: [],
+        asins: [],
+        // SKUs the ASIN is listed under in TemplateListing — lets the page say
+        // "known ASIN, just not in any seller's synced index" instead of
+        // "nothing found".
+        knownSkusForAsin: asinSkuLabels.slice(0, 50),
+        truncated: false,
+        totals: { orderCount90d: 0, lifetimeOrderCount: 0 },
+        sellers: []
+      });
+    }
+
+    const itemIds = [...new Set(rows.map((row) => row.itemId).filter(Boolean))];
+    const labels = [...new Set(rows.map((row) => getBaseLabel(row.baseSku || row.sku)).filter(Boolean))];
+
+    // Seller names, order/action history and the ASIN each SKU points at are
+    // independent lookups — run them together.
+    const [sellerNameMap, history, templateRows] = await Promise.all([
+      getSellerNameMap([...new Set(rows.map((row) => row.seller).filter(Boolean))]),
+      loadListingHistory(itemIds),
+      labels.length
+        ? TemplateListing.find({
+            baseCustomLabel: { $in: labels },
+            _asinReference: { $exists: true, $ne: '' }
+          })
+            .select('customLabel baseCustomLabel +_asinReference')
+            .collation({ locale: 'en', strength: 2 })
+            .lean()
+        : Promise.resolve([])
+    ]);
+
+    const asinByLabel = new Map();
+    for (const row of templateRows) {
+      const label = getBaseLabel(row.baseCustomLabel || row.customLabel).toUpperCase();
+      const asin = cleanAsin(row._asinReference);
+      if (label && asin && !asinByLabel.has(label)) asinByLabel.set(label, asin);
+    }
+    const asinForRow = (row) => {
+      if (isAmazonAsin(row.sku)) return cleanAsin(row.sku);
+      return asinByLabel.get(getBaseLabel(row.baseSku || row.sku).toUpperCase()) || queriedAsin || '';
+    };
+
+    const sellerItems = rows.map((row) => ({
+      sellerId: row.seller,
+      sellerName: sellerNameMap.get(String(row.seller)) || String(row.seller),
+      itemId: row.itemId,
+      sku: cleanSku(row.sku),
+      title: row.title || '',
+      price: row.price ?? null,
+      currency: normalizeCurrency(row.currency),
+      imageUrl: row.imageUrl || '',
+      syncedAt: row.syncedAt,
+      asin: asinForRow(row)
+    }));
+
+    const enriched = attachListingHistory(sellerItems, history);
+    // attachListingHistory returns a fixed row shape, so carry the ASIN across
+    // from the source row it was resolved on.
+    enriched.forEach((row, index) => { row.asin = sellerItems[index].asin; });
+
+    // Exact-SKU rows first, then variants, then by item id so the same search
+    // always reads in the same order.
+    const bySeller = new Map();
+    for (const row of enriched) {
+      const sellerId = String(row.sellerId);
+      if (!bySeller.has(sellerId)) {
+        bySeller.set(sellerId, {
+          sellerId,
+          sellerName: row.sellerName,
+          listingCount: 0,
+          orderCount90d: 0,
+          lifetimeOrderCount: 0,
+          lastSyncedAt: null,
+          listings: []
+        });
+      }
+      const group = bySeller.get(sellerId);
+      group.listingCount += 1;
+      group.orderCount90d += row.orderCount90d || 0;
+      group.lifetimeOrderCount += row.lifetimeOrderCount || 0;
+      if (!group.lastSyncedAt || row.syncedAt > group.lastSyncedAt) group.lastSyncedAt = row.syncedAt;
+      group.listings.push(row);
+    }
+    for (const group of bySeller.values()) {
+      group.listings.sort((a, b) => (
+        (a.sku === raw ? 0 : 1) - (b.sku === raw ? 0 : 1)
+        || String(a.sku).localeCompare(String(b.sku))
+        || String(a.itemId).localeCompare(String(b.itemId))
+      ));
+    }
+
+    const sellers = [...bySeller.values()].sort((a, b) =>
+      a.sellerName.localeCompare(b.sellerName, undefined, { sensitivity: 'base' })
+    );
+
+    res.json({
+      sku: raw,
+      baseSku: baseLabel,
+      queryType: isAsinQuery ? 'asin' : 'sku',
+      queriedAsin,
+      knownSkusForAsin: asinSkuLabels.slice(0, 50),
+      totalListings: enriched.length,
+      sellerCount: sellers.length,
+      matchedSkus: [...new Set(enriched.map((row) => row.sku).filter(Boolean))].sort(),
+      asins: [...new Set(enriched.map((row) => row.asin).filter(Boolean))].sort(),
+      truncated,
+      totals: {
+        orderCount90d: enriched.reduce((sum, row) => sum + (row.orderCount90d || 0), 0),
+        lifetimeOrderCount: enriched.reduce((sum, row) => sum + (row.lifetimeOrderCount || 0), 0)
+      },
+      sellers
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to look up SKU listings' });
+  }
+});
+
 router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
   try {
     const item = await AmazonStockCheckItem.findById(req.params.itemId).lean();
@@ -1355,35 +1697,14 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
     }
 
     const itemIds = [...new Set(sellerItems.map((row) => row.itemId).filter(Boolean))];
-    const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
-    const since90 = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
 
-    // Seller names, prior end-listing actions, prior revisions, and order
-    // history are independent lookups — run them in parallel.
-    const [sellerNameMap, endLogs, reviseLogs, orders] = await Promise.all([
+    // Seller names and per-listing history (orders, prior end/revise actions)
+    // are independent lookups — run them in parallel.
+    const [sellerNameMap, history] = await Promise.all([
       indexRows.length
         ? getSellerNameMap([...new Set(indexRows.map((row) => row.seller).filter(Boolean))])
         : Promise.resolve(new Map()),
-      itemIds.length
-        ? EndListingLog.find({ itemId: { $in: itemIds } })
-            .populate('endedBy', 'username name email')
-            .sort({ endedAt: -1 })
-            .lean()
-        : Promise.resolve([]),
-      itemIds.length
-        ? AmazonStockActionLog.find({ itemId: { $in: itemIds }, actionType: 'revise_listing', status: 'success' })
-            .populate('requestedBy', 'username name email')
-            .sort({ createdAt: -1 })
-            .lean()
-        : Promise.resolve([]),
-      itemIds.length
-        ? Order.find({
-            $or: [{ itemNumber: { $in: itemIds } }, { 'lineItems.legacyItemId': { $in: itemIds } }]
-          })
-            .select('seller orderId dateSold creationDate itemNumber lineItems quantity subtotal productName')
-            .sort({ dateSold: -1, creationDate: -1 })
-            .lean()
-        : Promise.resolve([])
+      loadListingHistory(itemIds)
     ]);
 
     if (sellerNameMap.size) {
@@ -1398,93 +1719,10 @@ router.get('/items/:itemId/verify', requireAuth, requirePageAccess(STOCK_CHECK_P
       || String(a.sellerName).localeCompare(String(b.sellerName))
     ));
 
-    const endedByKey = new Map();
-    for (const log of endLogs) {
-      const key = `${String(log.seller)}:${log.itemId}`;
-      if (endedByKey.has(key)) continue; // keep the most recent log per item
-      endedByKey.set(key, {
-        endedAt: log.endedAt,
-        endedBy: log.endedBy?.username || log.endedBy?.name || log.endedBy?.email || null,
-        source: log.source
-      });
-    }
-
-    const revisedByKey = new Map();
-    for (const log of reviseLogs) {
-      const key = `${String(log.seller)}:${log.itemId}`;
-      if (revisedByKey.has(key)) continue; // keep the most recent log per item
-      revisedByKey.set(key, {
-        revisedAt: log.createdAt,
-        revisedBy: log.requestedBy?.username || log.requestedBy?.name || log.requestedBy?.email || null,
-        previousTitle: log.requestPayload?.previousTitle || '',
-        newTitle: log.requestPayload?.title || '',
-        previousPrice: log.requestPayload?.previousPrice ?? null,
-        newPrice: log.requestPayload?.price ?? null
-      });
-    }
-
-    // Group orders by (seller, itemId); an order can reference an item id via
-    // the denormalized itemNumber or any of its line items.
-    const ordersByKey = new Map();
-    for (const order of orders) {
-      const orderDate = order.dateSold || order.creationDate || null;
-      if (!orderDate) continue;
-      const ids = new Set();
-      if (order.itemNumber) ids.add(order.itemNumber);
-      for (const lineItem of order.lineItems || []) {
-        if (lineItem?.legacyItemId) ids.add(lineItem.legacyItemId);
-      }
-      for (const itemId of ids) {
-        const key = `${String(order.seller)}:${itemId}`;
-        const list = ordersByKey.get(key) || [];
-        list.push({
-          orderId: order.orderId,
-          date: orderDate,
-          quantity: order.quantity ?? null,
-          subtotal: order.subtotal ?? null,
-          productName: order.productName || ''
-        });
-        ordersByKey.set(key, list);
-      }
-    }
-
-    // Last 12 calendar months (oldest first) for the per-item order sparkline.
-    const monthKeys = [];
-    const now = new Date();
-    for (let i = 11; i >= 0; i -= 1) {
-      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-      monthKeys.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
-    }
-
-    const enrichedSellerItems = sellerItems.map((row) => {
-      const key = `${String(row.sellerId)}:${row.itemId}`;
-      const allOrders = (ordersByKey.get(key) || []).sort((a, b) => new Date(b.date) - new Date(a.date));
-      const recentOrders = allOrders.filter((order) => new Date(order.date) >= since);
-      const recentOrders90d = allOrders.filter((order) => new Date(order.date) >= since90);
-      const countsByMonth = new Map();
-      for (const order of allOrders) {
-        const d = new Date(order.date);
-        const monthKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-        countsByMonth.set(monthKey, (countsByMonth.get(monthKey) || 0) + 1);
-      }
-      return {
-        sellerId: row.sellerId,
-        sellerName: row.sellerName,
-        itemId: row.itemId,
-        sku: row.sku || item.sku,
-        title: row.title || '',
-        price: row.price ?? null,
-        currency: row.currency || item.currency,
-        quantityZeroStatus: row.quantityZeroStatus || 'not_needed',
-        isRunSeller: runSellerId ? String(row.sellerId) === runSellerId : false,
-        orderCount30d: recentOrders.length,
-        orderCount90d: recentOrders90d.length,
-        orders: recentOrders.slice(0, 20),
-        lifetimeOrderCount: allOrders.length,
-        monthlyOrders: monthKeys.map((month) => ({ month, count: countsByMonth.get(month) || 0 })),
-        endedInfo: endedByKey.get(key) || null,
-        revisedInfo: revisedByKey.get(key) || null
-      };
+    const enrichedSellerItems = attachListingHistory(sellerItems, history, {
+      fallbackSku: item.sku,
+      fallbackCurrency: item.currency,
+      runSellerId
     });
 
     res.json({
@@ -1851,7 +2089,7 @@ router.post('/items/:itemId/set-quantity-one', requireAuth, requirePageAccess(ST
 // a specific AmazonStockCheckItem/run) so it works from the verify panel
 // regardless of which run or seller the item was found under — same pattern
 // as /ebay/end-item.
-router.post('/revise-listing', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
+router.post('/revise-listing', requireAuth, requirePageAccess(LISTING_ACTION_PAGES), async (req, res) => {
   try {
     const { sellerId, itemId, title, price, previousTitle, previousPrice, sku, asin } = req.body || {};
     if (!sellerId || !itemId) {
@@ -2128,7 +2366,7 @@ async function loadReviseContext({ sellerId, itemId, asin, templateId }) {
  * nothing anywhere — the user reviews and edits the result before any of it
  * reaches eBay.
  */
-router.post('/revise-listing/preview', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
+router.post('/revise-listing/preview', requireAuth, requirePageAccess(LISTING_ACTION_PAGES), async (req, res) => {
   try {
     const { sellerId, itemId, asin, templateId, currency, overlayBadgeId = '' } = req.body || {};
 
@@ -2214,7 +2452,7 @@ router.post('/revise-listing/preview', requireAuth, requirePageAccess(STOCK_CHEC
  * crash in between still leaves a record the listing can be restored from —
  * the same discipline ListingOverlayItem uses.
  */
-router.post('/revise-listing/apply', requireAuth, requirePageAccess(STOCK_CHECK_PAGES), async (req, res) => {
+router.post('/revise-listing/apply', requireAuth, requirePageAccess(LISTING_ACTION_PAGES), async (req, res) => {
   let revision = null;
 
   try {

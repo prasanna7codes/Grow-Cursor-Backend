@@ -27,8 +27,8 @@ function getPTDayBoundsUTC(dateStr) {
 
 /**
  * GET /end-listing-logs/stats
- * Returns per-seller end-listing counts grouped by source (duplicate_sku / expiry_listing)
- * and country,
+ * Returns per-seller end-listing counts grouped by source (duplicate_sku /
+ * expiry_listing / amazon_stock_check / sku_listing_manager) and country,
  * optionally filtered by sellerId and date range.
  *
  * Query params:
@@ -40,9 +40,9 @@ router.get('/stats', requireAuth, validate(endListingStatsQuerySchema, 'query'),
   try {
     const { sellerId, startDate, endDate } = req.query;
 
-    // Reports all three end-listing sources: duplicate-SKU, expiry, and Amazon
-    // stock-check.
-    const matchCriteria = { source: { $in: ['duplicate_sku', 'expiry_listing', 'amazon_stock_check'] } };
+    // Reports every end-listing source: duplicate-SKU, expiry, Amazon stock
+    // check, and the SKU Listing Manager.
+    const matchCriteria = { source: { $in: ['duplicate_sku', 'expiry_listing', 'amazon_stock_check', 'sku_listing_manager'] } };
 
     if (sellerId) {
       if (!mongoose.Types.ObjectId.isValid(sellerId)) {
@@ -122,6 +122,9 @@ router.get('/stats', requireAuth, validate(endListingStatsQuerySchema, 'query'),
       const amazonStockCheckCount = row.sources
         .filter(s => s.source === 'amazon_stock_check')
         .reduce((sum, s) => sum + (s.count || 0), 0);
+      const skuListingManagerCount = row.sources
+        .filter(s => s.source === 'sku_listing_manager')
+        .reduce((sum, s) => sum + (s.count || 0), 0);
       const countryMap = new Map();
 
       for (const sourceRow of row.sources) {
@@ -131,6 +134,7 @@ router.get('/stats', requireAuth, validate(endListingStatsQuerySchema, 'query'),
           duplicateSkuCount: 0,
           expiryListingCount: 0,
           amazonStockCheckCount: 0,
+          skuListingManagerCount: 0,
           total: 0,
         };
         if (sourceRow.source === 'duplicate_sku') {
@@ -139,6 +143,8 @@ router.get('/stats', requireAuth, validate(endListingStatsQuerySchema, 'query'),
           existing.expiryListingCount += sourceRow.count || 0;
         } else if (sourceRow.source === 'amazon_stock_check') {
           existing.amazonStockCheckCount += sourceRow.count || 0;
+        } else if (sourceRow.source === 'sku_listing_manager') {
+          existing.skuListingManagerCount += sourceRow.count || 0;
         }
         existing.total += sourceRow.count || 0;
         countryMap.set(country, existing);
@@ -150,7 +156,8 @@ router.get('/stats', requireAuth, validate(endListingStatsQuerySchema, 'query'),
         duplicateSkuCount,
         expiryListingCount,
         amazonStockCheckCount,
-        total: duplicateSkuCount + expiryListingCount + amazonStockCheckCount,
+        skuListingManagerCount,
+        total: duplicateSkuCount + expiryListingCount + amazonStockCheckCount + skuListingManagerCount,
         countryBreakdown: Array.from(countryMap.values())
           .sort((a, b) => b.total - a.total || a.country.localeCompare(b.country)),
       };
@@ -165,9 +172,10 @@ router.get('/stats', requireAuth, validate(endListingStatsQuerySchema, 'query'),
 
 /**
  * GET /end-listing-logs/by-date
- * Amazon Stock Check end-listing activity grouped by day, then by seller and
- * who performed the action — answers "on which date, how many item IDs were
- * ended, for which sellers, and by whom".
+ * Hand-driven end-listing activity (Amazon Stock Check and SKU Listing Manager)
+ * grouped by day, then by seller and who performed the action — answers "on
+ * which date, how many item IDs were ended, for which sellers, and by whom".
+ * The duplicate-SKU and expiry flows are automated and reported elsewhere.
  *
  * Query params:
  *   sellerId   - optional, filter to one seller
@@ -178,7 +186,7 @@ router.get('/by-date', requireAuth, validate(endListingStatsQuerySchema, 'query'
   try {
     const { sellerId, startDate, endDate, country } = req.query;
 
-    const matchCriteria = { source: 'amazon_stock_check' };
+    const matchCriteria = { source: { $in: ['amazon_stock_check', 'sku_listing_manager'] } };
 
     if (sellerId) {
       if (!mongoose.Types.ObjectId.isValid(sellerId)) {
@@ -276,7 +284,8 @@ router.get('/by-date', requireAuth, validate(endListingStatsQuerySchema, 'query'
  * GET /end-listing-logs/lookup
  * Point lookup: given an eBay item ID or a SKU, return every end-listing log row
  * for it — who ended it, when, from which flow, for which seller and country.
- * Covers all sources (duplicate_sku / expiry_listing / amazon_stock_check).
+ * Covers all sources (duplicate_sku / expiry_listing / amazon_stock_check /
+ * sku_listing_manager).
  * SKU search matches the base SKU and its variants: "GRW25N4VFV" also matches
  * "GRW25N4VFV-1", and searching a variant matches its siblings.
  *
