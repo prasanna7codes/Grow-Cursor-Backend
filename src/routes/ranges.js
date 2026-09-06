@@ -5,6 +5,7 @@ import { validate } from '../utils/validate.js';
 import { createRangeSchema } from '../schemas/index.js';
 import Range from '../models/Range.js';
 import Category from '../models/Category.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = Router();
 
@@ -65,7 +66,7 @@ router.post('/', requireAuth, requirePageAccess('ManageRanges'), validate(create
  *       200: { description: Array of ranges (populated with category) sorted by name }
  *       401: { description: Unauthorized }
  */
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, asyncHandler(async (req, res) => {
   const { categoryId } = req.query || {};
   
   let query = {};
@@ -76,6 +77,6 @@ router.get('/', requireAuth, async (req, res) => {
   
   const items = await Range.find(query).populate('category').sort({ name: 1 }).lean();
   res.json(items);
-});
+}));
 
 export default router;

@@ -6,6 +6,7 @@ import User from '../models/User.js';
 import UserSellerAssignment from '../models/UserSellerAssignment.js';
 import { validate } from '../utils/validate.js';
 import { loginSchema } from '../schemas/index.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = Router();
 
@@ -76,7 +77,7 @@ const loginLimiter = rateLimit({
  *       429:
  *         description: Too many login attempts (rate limited)
  */
-router.post('/login', loginLimiter, validate(loginSchema), async (req, res) => {
+router.post('/login', loginLimiter, validate(loginSchema), asyncHandler(async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
   const user = await User.findOne({ username });
@@ -107,7 +108,7 @@ router.post('/login', loginLimiter, validate(loginSchema), async (req, res) => {
       assignedSellers
     }
   });
-});
+}));
 
 // Seed superadmin if none exists (development helper — disabled in production)
 /**
@@ -138,7 +139,7 @@ router.post('/login', loginLimiter, validate(loginSchema), async (req, res) => {
  *       404:
  *         description: Endpoint disabled in production
  */
-router.post('/seed-superadmin', async (req, res) => {
+router.post('/seed-superadmin', asyncHandler(async (req, res) => {
   if (process.env.NODE_ENV === 'production') {
     return res.status(404).json({ error: 'Not found' });
   }
@@ -149,6 +150,6 @@ router.post('/seed-superadmin', async (req, res) => {
   const passwordHash = await bcrypt.hash(password, 10);
   const user = await User.create({ email, username, passwordHash, role: 'superadmin' });
   res.json({ id: user._id });
-});
+}));
 
 export default router;

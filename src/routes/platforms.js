@@ -3,6 +3,7 @@ import { requireAuth, requirePageAccess } from '../middleware/auth.js';
 import { validate } from '../utils/validate.js';
 import { createPlatformSchema } from '../schemas/index.js';
 import Platform from '../models/Platform.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = Router();
 
@@ -75,12 +76,12 @@ router.post('/', requireAuth, requirePageAccess('ManagePlatforms'), validate(cre
  *               items:
  *                 $ref: '#/components/schemas/Platform'
  */
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, asyncHandler(async (req, res) => {
   const { type } = req.query;
   const query = type ? { type } : {};
   const items = await Platform.find(query).sort({ name: 1 }).lean();
   res.json(items);
-});
+}));
 
 export default router;
 

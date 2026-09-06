@@ -3,6 +3,7 @@ import { requireAuth, requirePageAccess } from '../middleware/auth.js';
 import { validate } from '../utils/validate.js';
 import { createSubcategorySchema } from '../schemas/index.js';
 import Subcategory from '../models/Subcategory.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = Router();
 
@@ -63,12 +64,12 @@ router.post('/', requireAuth, requirePageAccess('ManageCategories'), validate(cr
  *       200: { description: Array of subcategories (populated with category) sorted by name }
  *       401: { description: Unauthorized }
  */
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, asyncHandler(async (req, res) => {
   const { categoryId } = req.query || {};
   const query = categoryId ? { category: categoryId } : {};
   const items = await Subcategory.find(query).populate('category').sort({ name: 1 }).lean();
   res.json(items);
-});
+}));
 
 export default router;
 
