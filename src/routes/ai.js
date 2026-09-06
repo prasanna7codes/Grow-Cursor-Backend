@@ -5,6 +5,8 @@ import OpenAI from 'openai';
 import { requireAuth, requirePageAccess } from '../middleware/auth.js';
 import AiFitmentUsage from '../models/AiFitmentUsage.js';
 import User from '../models/User.js';
+import ListingTemplate from '../models/ListingTemplate.js';
+import { generateWithGemini, replacePlaceholders } from '../utils/gemini.js';
 
 const router = express.Router();
 
@@ -264,7 +266,7 @@ router.post('/track-save-next', requireAuth, async (req, res) => {
  *   post:
  *     tags: [AI]
  *     summary: Rephrase an eBay product title for SEO
- *     description: "Uses GPT-4o-mini to rephrase the title to 75–80 characters while retaining meaning. Optionally injects verified vehicle compatibility."
+ *     description: "Uses GPT-4o-mini to reword the title. The template's own AI title prompt is the authoritative rule set, so the rephrase obeys exactly the same conditions as the original generation. There is no generic fallback: if the template's title rules cannot be resolved the request is refused with an explanation rather than producing a title that may break them. Optionally injects verified vehicle compatibility."
  *     security:
  *       - bearerAuth: []
  *     requestBody:
@@ -289,6 +291,18 @@ router.post('/track-save-next', requireAuth, async (req, res) => {
  *               vehicleMentions:
  *                 type: string
  *                 description: Verified vehicle models from reviews to include
+ *               templateId:
+ *                 type: string
+ *                 description: Listing template whose AI title rules the rephrase must obey. Without it a generic rephrase is used.
+ *               asin:
+ *                 type: string
+ *               description:
+ *                 type: string
+ *               price:
+ *                 type: string
+ *               productInfo:
+ *                 type: object
+ *                 description: Amazon product information map, used for the {product_information} placeholder
  *     responses:
  *       200:
  *         description: Rephrased title
@@ -300,13 +314,29 @@ router.post('/track-save-next', requireAuth, async (req, res) => {
  *                 rephrasedTitle:
  *                   type: string
  *       400:
- *         description: currentTitle is required
+ *         description: currentTitle is required, or no templateId was supplied / the template could not be loaded
+ *       404:
+ *         description: Template not found
+ *       422:
+ *         description: Template has no AI title prompt, so there are no rules the rephrase could follow
  *       500:
  *         description: AI request failed
  */
 router.post('/rephrase-title', requireAuth, async (req, res) => {
     try {
-        const { currentTitle = '', sourceTitle = '', brand = '', color = '', compatibility = '', vehicleMentions = '' } = req.body;
+        const {
+            currentTitle = '',
+            sourceTitle = '',
+            brand = '',
+            color = '',
+            compatibility = '',
+            vehicleMentions = '',
+            templateId = '',
+            asin = '',
+            description = '',
+            price = '',
+            productInfo = null
+        } = req.body;
 
         if (!currentTitle) {
             return res.status(400).json({ error: 'currentTitle is required' });
@@ -316,31 +346,110 @@ router.post('/rephrase-title', requireAuth, async (req, res) => {
             ? `\nVerified vehicle compatibility (from customer reviews): ${vehicleMentions}\nYou MUST include 1–2 of these models/years in the rephrased title. Shorten other parts of the title if needed to stay within the character limit.`
             : '';
 
-        const prompt = `You are an eBay listing SEO expert.
-Rephrase the following eBay product title. The rephrased title must:
-- Convey the same product and key attributes
-- Use different word order or synonyms compared to the original
-- Be strictly between 75 and 80 characters (including spaces) — not shorter, not longer
-- Contain no markdown, quotes, or extra commentary — return only the plain title text
+        // The template's own title rules are the ONLY rules a rephrase may use.
+        // There is deliberately no generic fallback: a rephrase that doesn't know
+        // the template's conditions would silently break them (nearly every
+        // template mandates brand removal and its own character range), so if the
+        // rules can't be loaded we tell the user instead of guessing.
+        if (!templateId) {
+            return res.status(400).json({
+                error: 'Cannot rephrase without a template',
+                reason: 'no_template_id',
+                details: 'No template was supplied for this listing, so the title rules it must follow are unknown. Rephrasing was skipped to avoid producing a title that breaks the template rules.'
+            });
+        }
 
-Amazon product title (context only): ${sourceTitle}
-Brand: ${brand}
-Color: ${color}
-Compatibility: ${compatibility}${vehicleSection}
+        let template;
+        try {
+            template = await ListingTemplate.findById(templateId).select('name asinAutomation');
+        } catch (err) {
+            console.warn(`[AI Rephrase Title] Could not load template ${templateId}: ${err.message}`);
+            return res.status(400).json({
+                error: 'Cannot rephrase — template could not be loaded',
+                reason: 'template_load_failed',
+                details: `The listing template (${templateId}) could not be read, so its title rules are unavailable. Rephrasing was skipped rather than risk breaking those rules.`
+            });
+        }
 
-eBay title to rephrase: ${currentTitle}`;
+        if (!template) {
+            return res.status(404).json({
+                error: 'Cannot rephrase — template not found',
+                reason: 'template_not_found',
+                details: `No listing template exists with id ${templateId}, so its title rules are unavailable. Rephrasing was skipped.`
+            });
+        }
 
-        const completion = await getOpenAI().chat.completions.create({
-            messages: [{ role: 'user', content: prompt }],
-            model: 'gpt-4o-mini',
-            temperature: 0.7,
-            max_tokens: 60,
+        const titleConfig = template.asinAutomation?.fieldConfigs?.find(c => c.ebayField === 'title');
+        const titlePromptTemplate = (titleConfig?.enabled && titleConfig?.source === 'ai')
+            ? (titleConfig.promptTemplate || '')
+            : '';
+
+        if (!titlePromptTemplate) {
+            let why;
+            if (!titleConfig) {
+                why = 'has no title field configured';
+            } else if (!titleConfig.enabled) {
+                why = 'has its title field disabled';
+            } else if (titleConfig.source !== 'ai') {
+                why = `maps the title directly from Amazon (source: ${titleConfig.source}) rather than generating it with AI`;
+            } else {
+                why = 'has an empty AI title prompt';
+            }
+            console.warn(`[AI Rephrase Title] Template "${template.name}" (${templateId}) ${why} — rephrase refused`);
+            return res.status(422).json({
+                error: 'Cannot rephrase — this template has no AI title rules',
+                reason: 'no_ai_title_prompt',
+                details: `Template "${template.name}" ${why}, so there are no title rules to follow. Rephrasing was skipped — edit the title manually, or add an AI title prompt to this template.`
+            });
+        }
+
+        // Same placeholder shape as applyFieldConfigs() in utils/asinAutofill.js,
+        // so {title}, {brand}, {product_information} etc. resolve identically.
+        const placeholderData = {
+            title: sourceTitle,
+            brand,
+            description,
+            price,
+            asin,
+            color,
+            compatibility,
+            product_information: productInfo && typeof productInfo === 'object'
+                ? Object.entries(productInfo)
+                    .filter(([, v]) => v !== null && v !== '' && v !== undefined)
+                    .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(', ') : v}`)
+                    .join('\n')
+                : ''
+        };
+
+        const templateRules = replacePlaceholders(titlePromptTemplate, placeholderData);
+
+        const prompt = `${templateRules}
+
+--- ADDITIONAL REQUIREMENT: REPHRASE ---
+A title was already produced from the instructions above:
+${currentTitle}
+
+Produce a DIFFERENT wording of that title — vary the word order and use synonyms so the result is not identical to the one above.
+Every rule in the instructions above still applies in full and OVERRIDES this rephrase requirement. If rephrasing would break any rule above, follow the rule and rephrase only as much as the rules allow.${vehicleSection}
+
+Return only the plain title text — no quotes, markdown, or commentary.`;
+
+        // Routed through the shared helper so rephrase gets the same model,
+        // temperature, markdown stripping, concurrency limit and usage tracking
+        // as the normal generation run.
+        let rephrasedTitle = await generateWithGemini(prompt, {
+            maxTokens: 150,
+            asin,
+            fieldName: 'title',
+            fieldType: 'core',
+            templateId: templateId || undefined,
+            userId: req.user?.userId,
+            apiKey: process.env.OPENAI_FITMENT_API_KEY
         });
 
-        let rephrasedTitle = completion.choices[0]?.message?.content?.trim() || '';
         // Strip any surrounding quotes the model may add
         rephrasedTitle = rephrasedTitle.replace(/^["']|["']$/g, '').trim();
-        // Hard safety truncation to 80 chars
+        // Hard safety truncation to 80 chars (matches applyFieldConfigs)
         if (rephrasedTitle.length > 80) {
             rephrasedTitle = rephrasedTitle.substring(0, 80);
         }
