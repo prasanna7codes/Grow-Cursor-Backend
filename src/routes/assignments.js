@@ -8,6 +8,7 @@ import Assignment from '../models/Assignment.js';
 import Task from '../models/Task.js';
 import Range from '../models/Range.js';
 import ListingCompletion from '../models/ListingCompletion.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
 
 const IST_TZ = '+05:30';
 
@@ -546,7 +547,7 @@ router.get('/mine/with-status',
 router.post('/:id/complete',
   requireAuth,
   requirePageAccess('Assignments', ['superadmin', 'listingadmin', 'lister']),
-  async (req, res) => {
+  asyncHandler(async (req, res) => {
     const { id } = req.params;
     const { completedQuantity } = req.body || {};
     if (completedQuantity == null || completedQuantity < 0) {
@@ -576,7 +577,7 @@ router.post('/:id/complete',
     ]);
 
     res.json(populated);
-  }
+  })
 );
 
 /* -------------------- ANALYTICS (unchanged from your working state) -------------------- */

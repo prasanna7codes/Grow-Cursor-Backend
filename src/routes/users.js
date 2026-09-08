@@ -15,6 +15,7 @@ import {
   getRequestMetadata,
   normalizePagePermissions,
 } from '../lib/pageAccessAudit.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = Router();
 
@@ -198,10 +199,10 @@ router.post('/', requireAuth, validate(createUserSchema), async (req, res) => {
  *       401: { description: Unauthorized }
  *       403: { description: Forbidden }
  */
-router.get('/listers', requireAuth, requirePageAccess('AddUser'), async (req, res) => {
+router.get('/listers', requireAuth, requirePageAccess('AddUser'), asyncHandler(async (req, res) => {
   const listers = await User.find({ role: 'lister', active: true }).select('email username role').lean();
   res.json(listers);
-});
+}));
 
 // List compatibility editors (for superadmin or compatibilityadmin)
 /**
@@ -219,10 +220,10 @@ router.get('/listers', requireAuth, requirePageAccess('AddUser'), async (req, re
  *       401: { description: Unauthorized }
  *       403: { description: Forbidden }
  */
-router.get('/compatibility-editors', requireAuth, requirePageAccess('AddCompatibilityEditor'), async (req, res) => {
+router.get('/compatibility-editors', requireAuth, requirePageAccess('AddCompatibilityEditor'), asyncHandler(async (req, res) => {
   const editors = await User.find({ role: 'compatibilityeditor', active: true }).select('email username role').lean();
   res.json(editors);
-});
+}));
 
 // Check if email or username already exists (requires auth to prevent user enumeration)
 /**

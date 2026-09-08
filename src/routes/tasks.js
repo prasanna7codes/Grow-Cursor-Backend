@@ -6,6 +6,7 @@ import { createTaskSchema, createAssignmentSchema } from '../schemas/index.js';
 import Task from '../models/Task.js';
 import User from '../models/User.js';
 import { parsePagination } from '../utils/paginate.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = Router();
 
@@ -228,7 +229,7 @@ router.get('/', requireAuth, async (req, res) => {
  *       404: { description: Task not found }
  */
 // Assign a task to a lister (listingadmin or superadmin)
-router.post('/:id/assign', requireAuth, requirePageAccess('Assignments'), async (req, res) => {
+router.post('/:id/assign', requireAuth, requirePageAccess('Assignments'), asyncHandler(async (req, res) => {
   const { listerId, quantity, listingPlatformId, storeId } = req.body || {};
   if (!listerId) return res.status(400).json({ error: 'listerId required' });
   if (!quantity) return res.status(400).json({ error: 'quantity required' });
@@ -245,7 +246,7 @@ router.post('/:id/assign', requireAuth, requirePageAccess('Assignments'), async 
   task.assignedAt = new Date();
   await task.save();
   res.json(task);
-});
+}));
 
 /**
  * @swagger
@@ -345,7 +346,7 @@ router.put('/:id', requireAuth, requirePageAccess(['TaskList', 'ProductResearch'
  *       403: { description: Forbidden }
  *       404: { description: Task not found }
  */
-router.post('/:id/complete', requireAuth, requirePageAccess('TaskList', ['lister']), async (req, res) => {
+router.post('/:id/complete', requireAuth, requirePageAccess('TaskList', ['lister']), asyncHandler(async (req, res) => {
   const { userId } = req.user;
   const { completedQuantity } = req.body || {};
   const task = await Task.findOne({ _id: req.params.id, assignedLister: userId });
@@ -361,7 +362,7 @@ router.post('/:id/complete', requireAuth, requirePageAccess('TaskList', ['lister
   }
   await task.save();
   res.json(task);
-});
+}));
 
 /**
  * @swagger
@@ -385,7 +386,7 @@ router.post('/:id/complete', requireAuth, requirePageAccess('TaskList', ['lister
  *       403: { description: Forbidden }
  */
 // Admin-side analytics (platform/store/lister/date filters)
-router.get('/analytics', requireAuth, requirePageAccess('ListingsSummary'), async (req, res) => {
+router.get('/analytics', requireAuth, requirePageAccess('ListingsSummary'), asyncHandler(async (req, res) => {
   const { platformId, storeId, listerId, date } = req.query || {};
   const match = {};
   if (platformId) match.listingPlatform = platformId;
@@ -426,7 +427,7 @@ router.get('/analytics', requireAuth, requirePageAccess('ListingsSummary'), asyn
 
   const [result] = await Task.aggregate(pipeline);
   res.json(result || { totalListings: 0, numListers: 0, numStores: 0, numCategories: 0, numSubcategories: 0 });
-});
+}));
 
 /**
  * @swagger
@@ -450,7 +451,7 @@ router.get('/analytics', requireAuth, requirePageAccess('ListingsSummary'), asyn
  *       403: { description: Forbidden }
  */
 // Superadmin/listingadmin: admin-lister assignment summary
-router.get('/analytics/admin-lister', requireAuth, requirePageAccess('ListerInfo'), async (req, res) => {
+router.get('/analytics/admin-lister', requireAuth, requirePageAccess('ListerInfo'), asyncHandler(async (req, res) => {
   const { platformId, storeId, listerId, date } = req.query || {};
   const match = {};
   if (platformId) match.listingPlatform = platformId;
@@ -501,7 +502,7 @@ router.get('/analytics/admin-lister', requireAuth, requirePageAccess('ListerInfo
 
   const rows = await Task.aggregate(pipeline);
   res.json(rows);
-});
+}));
 
 /**
  * @swagger
@@ -524,7 +525,7 @@ router.get('/analytics/admin-lister', requireAuth, requirePageAccess('ListerInfo
  *       403: { description: Forbidden }
  */
 // Daily totals (optionally filtered by platform/store/lister)
-router.get('/analytics/daily', requireAuth, requirePageAccess('StoreDailyTasks'), async (req, res) => {
+router.get('/analytics/daily', requireAuth, requirePageAccess('StoreDailyTasks'), asyncHandler(async (req, res) => {
   const { platformId, storeId, listerId } = req.query || {};
   const match = {};
   if (platformId) match.listingPlatform = platformId;
@@ -559,7 +560,7 @@ router.get('/analytics/daily', requireAuth, requirePageAccess('StoreDailyTasks')
 
   const rows = await Task.aggregate(pipeline);
   res.json(rows);
-});
+}));
 
 /**
  * @swagger
@@ -582,7 +583,7 @@ router.get('/analytics/daily', requireAuth, requirePageAccess('StoreDailyTasks')
  *       403: { description: Forbidden }
  */
 // Per-lister per day with platform/store breakdown
-router.get('/analytics/lister-daily', requireAuth, requirePageAccess('ListerInfo'), async (req, res) => {
+router.get('/analytics/lister-daily', requireAuth, requirePageAccess('ListerInfo'), asyncHandler(async (req, res) => {
   const { listerId, platformId, storeId } = req.query || {};
   const match = {};
   if (listerId) match.assignedLister = listerId;
@@ -629,7 +630,7 @@ router.get('/analytics/lister-daily', requireAuth, requirePageAccess('ListerInfo
 
   const rows = await Task.aggregate(pipeline);
   res.json(rows);
-});
+}));
 
 /**
  * @swagger
@@ -651,7 +652,7 @@ router.get('/analytics/lister-daily', requireAuth, requirePageAccess('ListerInfo
  *       403: { description: Forbidden }
  */
 // Listings summary grouped by assignment-day, platform and store (optional filters: platformId, storeId)
-router.get('/analytics/listings-summary', requireAuth, requirePageAccess('ListingsSummary'), async (req, res) => {
+router.get('/analytics/listings-summary', requireAuth, requirePageAccess('ListingsSummary'), asyncHandler(async (req, res) => {
   const { platformId, storeId } = req.query || {};
   const match = {};
   if (platformId) match.listingPlatform = new mongoose.Types.ObjectId(platformId);
@@ -707,7 +708,7 @@ router.get('/analytics/listings-summary', requireAuth, requirePageAccess('Listin
 
   const rows = await Task.aggregate(pipeline);
   res.json(rows);
-});
+}));
 
 /**
  * @swagger

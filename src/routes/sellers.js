@@ -6,6 +6,7 @@ import User from '../models/User.js';
 import UserSellerAssignment from '../models/UserSellerAssignment.js';
 import SellerSkuIndex from '../models/SellerSkuIndex.js';
 import Order from '../models/Order.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = Router();
 
@@ -179,7 +180,7 @@ router.get('/me', requireAuth, requireRole('seller'), async (req, res) => {
  *       403: { description: Requires seller role }
  *       404: { description: Seller not found }
  */
-router.post('/marketplaces', requireAuth, requireRole('seller'), async (req, res) => {
+router.post('/marketplaces', requireAuth, requireRole('seller'), asyncHandler(async (req, res) => {
   const { region } = req.body;
   if (!region) return res.status(400).json({ error: 'Marketplace region required' });
   const seller = await Seller.findOne({ user: req.user.userId });
@@ -190,7 +191,7 @@ router.post('/marketplaces', requireAuth, requireRole('seller'), async (req, res
   seller.ebayMarketplaces.push(region);
   await seller.save();
   res.json(seller);
-});
+}));
 
 // Remove an eBay marketplace region
 /**
@@ -210,14 +211,14 @@ router.post('/marketplaces', requireAuth, requireRole('seller'), async (req, res
  *       403: { description: Requires seller role }
  *       404: { description: Seller or marketplace not found }
  */
-router.delete('/marketplaces/:region', requireAuth, requireRole('seller'), async (req, res) => {
+router.delete('/marketplaces/:region', requireAuth, requireRole('seller'), asyncHandler(async (req, res) => {
   const { region } = req.params;
   const seller = await Seller.findOne({ user: req.user.userId });
   if (!seller) return res.status(404).json({ error: 'Seller not found' });
   seller.ebayMarketplaces = seller.ebayMarketplaces.filter(r => r !== region);
   await seller.save();
   res.json(seller);
-});
+}));
 
 // Disconnect eBay account (clear tokens) - allows re-authorization with new scopes
 /**

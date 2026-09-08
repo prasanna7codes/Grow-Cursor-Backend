@@ -3,6 +3,7 @@ import { requireAuth, requirePageAccess } from '../middleware/auth.js';
 import { validate } from '../utils/validate.js';
 import { createStoreSchema } from '../schemas/index.js';
 import Store from '../models/Store.js';
+import { asyncHandler } from '../utils/asyncHandler.js';
 
 const router = Router();
 
@@ -73,12 +74,12 @@ router.post('/', requireAuth, requirePageAccess('ManageStores'), validate(create
  *               items:
  *                 $ref: '#/components/schemas/Store'
  */
-router.get('/', requireAuth, async (req, res) => {
+router.get('/', requireAuth, asyncHandler(async (req, res) => {
   const { platformId } = req.query || {};
   const query = platformId ? { platform: platformId } : {};
   const items = await Store.find(query).populate('platform').sort({ name: 1 }).lean();
   res.json(items);
-});
+}));
 
 export default router;
 
