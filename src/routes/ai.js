@@ -266,7 +266,7 @@ router.post('/track-save-next', requireAuth, async (req, res) => {
  *   post:
  *     tags: [AI]
  *     summary: Rephrase an eBay product title for SEO
- *     description: "Uses GPT-4o-mini to reword the title. The template's own AI title prompt is the authoritative rule set, so the rephrase obeys exactly the same conditions as the original generation. There is no generic fallback: if the template's title rules cannot be resolved the request is refused with an explanation rather than producing a title that may break them. Optionally injects verified vehicle compatibility."
+ *     description: "Uses GPT-4o-mini to reword the title. The template's own AI title prompt is the authoritative rule set, so the rephrase obeys exactly the same conditions as the original generation. There is no generic fallback: if the template's title rules cannot be resolved the request is refused with an explanation rather than producing a title that may break them. Optionally injects verified vehicle compatibility. Titles passed in avoidTitles are listed in the prompt as already taken, so the caller can retry until the result is unique."
  *     security:
  *       - bearerAuth: []
  *     requestBody:
@@ -303,6 +303,14 @@ router.post('/track-save-next', requireAuth, async (req, res) => {
  *               productInfo:
  *                 type: object
  *                 description: Amazon product information map, used for the {product_information} placeholder
+ *               avoidTitles:
+ *                 type: array
+ *                 items:
+ *                   type: string
+ *                 description: Titles the result must not reproduce - typically the titles of synced same-SKU listings from other sellers, plus any earlier attempt that collided. Capped at 20.
+ *               attempt:
+ *                 type: integer
+ *                 description: 1-based retry counter. Each retry raises the sampling temperature so a collided wording is not simply regenerated.
  *     responses:
  *       200:
  *         description: Rephrased title
@@ -335,7 +343,9 @@ router.post('/rephrase-title', requireAuth, async (req, res) => {
             asin = '',
             description = '',
             price = '',
-            productInfo = null
+            productInfo = null,
+            avoidTitles = [],
+            attempt = 1
         } = req.body;
 
         if (!currentTitle) {
@@ -345,6 +355,24 @@ router.post('/rephrase-title', requireAuth, async (req, res) => {
         const vehicleSection = vehicleMentions
             ? `\nVerified vehicle compatibility (from customer reviews): ${vehicleMentions}\nYou MUST include 1–2 of these models/years in the rephrased title. Shorten other parts of the title if needed to stay within the character limit.`
             : '';
+
+        // Titles already used by other sellers on this same SKU, plus any earlier
+        // attempt that collided. Naming them explicitly is what lets a single click
+        // converge on a unique title instead of the user re-rolling by hand.
+        const bannedTitles = [...new Set(
+            (Array.isArray(avoidTitles) ? avoidTitles : [])
+                .map(t => String(t || '').trim())
+                .filter(Boolean)
+        )].slice(0, 20);
+
+        const avoidSection = bannedTitles.length > 0
+            ? `\n\n--- ADDITIONAL REQUIREMENT: TITLES ALREADY TAKEN ---\nThese titles are already used by other listings of this product, or were rejected on an earlier attempt. Your title MUST NOT be identical to any of them once case and spacing are ignored, and must not differ from one only by punctuation:\n${bannedTitles.map((t, i) => `${i + 1}. ${t}`).join('\n')}\nRe-order the phrases and choose different synonyms so the result is clearly distinct from every line above.\nThe template instructions at the top still take priority over this requirement. Never break one of their rules in order to avoid a match - if you cannot satisfy both, follow the template instructions and get as close to distinct as their rules allow.`
+            : '';
+
+        // Attempt 1 uses the standard low temperature. A retry means the previous
+        // wording collided, so loosen sampling to break out of the same phrasing.
+        const attemptNumber = Number.isFinite(Number(attempt)) ? Math.max(1, Math.floor(Number(attempt))) : 1;
+        const temperature = Math.min(0.3 + (attemptNumber - 1) * 0.25, 1);
 
         // The template's own title rules are the ONLY rules a rephrase may use.
         // There is deliberately no generic fallback: a rephrase that doesn't know
@@ -430,7 +458,7 @@ A title was already produced from the instructions above:
 ${currentTitle}
 
 Produce a DIFFERENT wording of that title — vary the word order and use synonyms so the result is not identical to the one above.
-Every rule in the instructions above still applies in full and OVERRIDES this rephrase requirement. If rephrasing would break any rule above, follow the rule and rephrase only as much as the rules allow.${vehicleSection}
+Every rule in the instructions above still applies in full and OVERRIDES this rephrase requirement. If rephrasing would break any rule above, follow the rule and rephrase only as much as the rules allow.${vehicleSection}${avoidSection}
 
 Return only the plain title text — no quotes, markdown, or commentary.`;
 
@@ -444,7 +472,8 @@ Return only the plain title text — no quotes, markdown, or commentary.`;
             fieldType: 'core',
             templateId: templateId || undefined,
             userId: req.user?.userId,
-            apiKey: process.env.OPENAI_FITMENT_API_KEY
+            apiKey: process.env.OPENAI_FITMENT_API_KEY,
+            temperature
         });
 
         // Strip any surrounding quotes the model may add

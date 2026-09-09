@@ -24,6 +24,8 @@ function getOpenAIClient(apiKey) {
  * @param {string} prompt - The prompt to send to OpenAI
  * @param {Object} options - Generation options
  * @param {number} options.maxTokens - Maximum tokens to generate (default: 150)
+ * @param {number} options.temperature - Sampling temperature (default: 0.3). Raise it when
+ *   the same prompt must yield a genuinely different answer on a retry.
  * @returns {Promise<string>} - Generated text
  */
 export async function generateWithGemini(prompt, options = {}) {
@@ -44,7 +46,8 @@ export async function generateWithGemini(prompt, options = {}) {
       forwardedFor,
       userAgent,
       model = 'gpt-4o-mini',
-      apiKey
+      apiKey,
+      temperature = 0.3
     } = options;
 
     try {
@@ -57,7 +60,7 @@ export async function generateWithGemini(prompt, options = {}) {
           }
         ],
         model,
-        temperature: 0.3,
+        temperature,
         max_tokens: maxTokens,
       });
       
