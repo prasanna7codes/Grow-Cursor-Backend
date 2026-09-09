@@ -10,18 +10,84 @@ import pLimit from 'p-limit';
  * (scraperApiProduct.js) so fetchAmazonData can switch providers via the
  * AMAZON_PRODUCT_PROVIDER env var with zero downstream changes.
  *
- * IMPORTANT: the Scrapingdog account concurrency cap (~50) is SHARED with the
- * Amazon Stock Check feature (SCRAPINGDOG_CONCURRENT, default 40, whose runs
- * last days). Keep this pool small so precheck/preview traffic doesn't starve
- * a live stock check run (and vice versa).
+ * IMPORTANT: the Scrapingdog account concurrency cap is SHARED with the Amazon
+ * Stock Check feature (SCRAPINGDOG_CONCURRENT, default 40, whose runs last
+ * days). Sized so this pool plus that one stays under the plan's cap.
  */
 
 const SCRAPINGDOG_PRODUCT_BASE = 'https://api.scrapingdog.com/amazon/product';
 
-const CONCURRENT_REQUESTS = parseInt(process.env.SCRAPINGDOG_PRODUCT_CONCURRENT) || 40;
+const CONCURRENT_REQUESTS = parseInt(process.env.SCRAPINGDOG_PRODUCT_CONCURRENT) || 60;
 const limit = pLimit(CONCURRENT_REQUESTS);
 
 console.log(`[Scrapingdog] 🚀 Initialized with ${CONCURRENT_REQUESTS} concurrent request limit`);
+
+// Retry budgets are per error CLASS, because the classes behave differently:
+//
+// - Transient infrastructure errors (502/503/408/429, timeouts) arrive in
+//   bursts lasting tens of seconds and return almost instantly (~290ms), so
+//   they cost nothing to re-try and a spaced ladder usually outlives the burst.
+// - A 400 from this endpoint is NOT a bad-request: params here are static
+//   (api_key/domain/country/asin), and these take ~16s on average, which is a
+//   failed scrape, not a rejected request. Worth re-trying, but each attempt
+//   burns real slot time, so it gets a smaller budget.
+// - NO_PRICE_FOUND is a content miss, not an infrastructure one. Re-requesting
+//   seconds later reproduces it, so extra attempts mostly burn credits.
+// - 404/410 are permanent (product genuinely gone) and are never re-tried.
+const MAX_RETRIES_TRANSIENT = Math.max(1, parseInt(process.env.SCRAPINGDOG_PRODUCT_MAX_RETRIES_TRANSIENT) || 4);
+const MAX_RETRIES_BAD_SCRAPE = Math.max(1, parseInt(process.env.SCRAPINGDOG_PRODUCT_MAX_RETRIES_BAD_SCRAPE) || 2);
+const RETRY_BASE_MS = Math.max(250, parseInt(process.env.SCRAPINGDOG_PRODUCT_RETRY_BASE_MS) || 2500);
+const RETRY_MAX_MS = Math.max(RETRY_BASE_MS, parseInt(process.env.SCRAPINGDOG_PRODUCT_RETRY_MAX_MS) || 20000);
+
+/**
+ * Exponential backoff with +/-40% jitter.
+ *
+ * The jitter is the point, not a detail: a precheck batch fails 100 ASINs at
+ * the same instant, and an unjittered ladder would re-send all 100 at the same
+ * instant too, landing the whole batch back inside the same provider burst it
+ * just failed in.
+ */
+function backoffDelayMs(attempt) {
+  const exponential = Math.min(RETRY_BASE_MS * Math.pow(2, attempt - 1), RETRY_MAX_MS);
+  return Math.round(exponential * (0.6 + Math.random() * 0.8));
+}
+
+/**
+ * Retry budget for a failure. Returns the total attempts this class is allowed
+ * (1 = no retry).
+ */
+function retryBudgetFor(error) {
+  if (error?.message === 'NO_PRICE_FOUND') return MAX_RETRIES_BAD_SCRAPE;
+
+  const status = error?.response?.status;
+  if (status === 404 || status === 410) return 1;
+  if (status === 400) return MAX_RETRIES_BAD_SCRAPE;
+  return MAX_RETRIES_TRANSIENT;
+}
+
+/**
+ * Issue one Scrapingdog request.
+ *
+ * ONLY the HTTP call holds a concurrency slot. Backoff sleeps deliberately sit
+ * outside it: holding a slot while sleeping would mean a failing ASIN squats a
+ * scraper slot for the whole length of its retry ladder, so raising the retry
+ * count would eat exactly the throughput that raising the pool size buys.
+ *
+ * NEVER send postal_code: it was the confirmed root cause of a mass 400-error
+ * wave on the stock check flow (Scrapingdog support advised removing it).
+ * Params stay api_key/domain/country/asin only.
+ */
+function requestProduct({ apiKey, regionConfig, asin, timeout }) {
+  return limit(() => axios.get(SCRAPINGDOG_PRODUCT_BASE, {
+    params: {
+      api_key: apiKey,
+      domain: regionConfig.domain,
+      country: regionConfig.country,
+      asin
+    },
+    timeout
+  }));
+}
 
 // Delay before the single fresh re-fetch when a priced product's response is
 // missing ALL stock/delivery info (Amazon's buy-box widgets sometimes don't
@@ -289,49 +355,45 @@ function hasAvailabilitySignals(data) {
 
 /**
  * Main function - Scrape complete Amazon product data using Scrapingdog
- * With intelligent retry and exponential backoff
+ * With per-error-class retry budgets and jittered exponential backoff
  * @param {string} asin - Amazon ASIN
  * @param {string} region - Amazon region (US, UK, CA, AU)
- * @param {number} retries - Retry attempts (default: 2)
+ * @param {number} retries - Ignored; retry budgets come from retryBudgetFor().
+ *   Kept so existing callers passing a count still type-check.
  * @returns {Promise<Object>} - Complete product data (same shape as ScraperAPI client)
  */
 export async function scrapeAmazonProductWithScrapingdog(asin, region = 'US', retries = 2) {
-  return limit(async () => {
+  {
     const apiKey = getApiKey();
     const regionConfig = REGION_CONFIG[region] || REGION_CONFIG.US;
     // Short timeouts proved to cause false failures at scale — keep generous.
     const timeout = parseInt(process.env.SCRAPINGDOG_PRODUCT_TIMEOUT_MS) || 45000;
-    const maxRetries = parseInt(process.env.SCRAPINGDOG_PRODUCT_MAX_RETRIES) || retries;
+    // Upper bound on the loop. The real stopping rule is retryBudgetFor(), which
+    // is consulted per failure — a class may stop well before this.
+    const maxRetries = Math.max(MAX_RETRIES_TRANSIENT, MAX_RETRIES_BAD_SCRAPE);
 
     // One-shot fresh re-fetch when stock/delivery info is missing — tracked
     // outside the loop so it can only ever fire once per ASIN.
     let availabilityRetryAttempted = false;
-    let availabilityRetryBilled = false;
     let availabilityRetrySucceeded = false;
+    // Scrapingdog bills per delivered response, so count 200s rather than
+    // attempts — a 502 or a timeout produced nothing to charge for. Without
+    // this, a retried ASIN under-reports its credits on the usage dashboards.
+    let billableResponses = 0;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       const startTime = Date.now();
 
       try {
-        console.log(`[Scrapingdog] 🔍 Scraping ASIN: ${asin}${attempt > 1 ? ` (attempt ${attempt}/${maxRetries})` : ''}`);
+        console.log(`[Scrapingdog] 🔍 Scraping ASIN: ${asin}${attempt > 1 ? ` (attempt ${attempt})` : ''}`);
 
-        // NEVER send postal_code: it was the confirmed root cause of a mass
-        // 400-error wave on the stock check flow (Scrapingdog support advised
-        // removing it). Params stay api_key/domain/country/asin only.
-        const response = await axios.get(SCRAPINGDOG_PRODUCT_BASE, {
-          params: {
-            api_key: apiKey,
-            domain: regionConfig.domain,
-            country: regionConfig.country,
-            asin: asin
-          },
-          timeout
-        });
+        const response = await requestProduct({ apiKey, regionConfig, asin, timeout });
 
         if (response.status !== 200) {
           throw new Error(`Scrapingdog returned status ${response.status}`);
         }
 
+        billableResponses += 1;
         let data = response.data;
 
         // A priced product with NO availability_status / stock / shipping /
@@ -347,17 +409,9 @@ export async function scrapeAmazonProductWithScrapingdog(asin, region = 'US', re
           console.log(`[Scrapingdog] 🔄 Missing stock and/or delivery info for ${asin} — refetching once after ${AVAILABILITY_RETRY_DELAY_MS}ms...`);
           await new Promise(resolve => setTimeout(resolve, AVAILABILITY_RETRY_DELAY_MS));
           try {
-            const retryResponse = await axios.get(SCRAPINGDOG_PRODUCT_BASE, {
-              params: {
-                api_key: apiKey,
-                domain: regionConfig.domain,
-                country: regionConfig.country,
-                asin: asin
-              },
-              timeout
-            });
+            const retryResponse = await requestProduct({ apiKey, regionConfig, asin, timeout });
             if (retryResponse.status === 200) {
-              availabilityRetryBilled = true;
+              billableResponses += 1;
               if (hasAvailabilitySignals(retryResponse.data)) {
                 data = retryResponse.data;
                 availabilityRetrySucceeded = true;
@@ -407,8 +461,8 @@ export async function scrapeAmazonProductWithScrapingdog(asin, region = 'US', re
 
         // Validate critical fields
         if (!price) {
-          if (attempt < maxRetries) {
-            const backoffDelay = 1000 * Math.pow(2, attempt - 1); // 1s, 2s, 4s
+          if (attempt < MAX_RETRIES_BAD_SCRAPE) {
+            const backoffDelay = backoffDelayMs(attempt);
             console.warn(`[Scrapingdog] ⚠️ No price found for ${asin}, retrying after ${backoffDelay}ms...`);
             await new Promise(resolve => setTimeout(resolve, backoffDelay));
             continue;
@@ -439,7 +493,7 @@ export async function scrapeAmazonProductWithScrapingdog(asin, region = 'US', re
         trackApiUsage({
           service: 'Scrapingdog',
           asin,
-          creditsUsed: regionConfig.credits * (availabilityRetryBilled ? 2 : 1),
+          creditsUsed: regionConfig.credits * Math.max(1, billableResponses),
           success: true,
           responseTime,
           extractedFields
@@ -470,16 +524,16 @@ export async function scrapeAmazonProductWithScrapingdog(asin, region = 'US', re
       } catch (error) {
         const responseTime = Date.now() - startTime;
 
-        // 400/404/410 are permanent (bad request / product gone), 429 is the
-        // account concurrency/credit cap (retrying just burns credits — same
-        // policy as the ScraperAPI client). Timeouts and 5xx are retryable.
-        const status = error.response?.status;
-        const isRetryable = ![400, 404, 410, 429].includes(status) && error.message !== 'NO_PRICE_FOUND';
+        // Budget depends on the error class — see retryBudgetFor(). 404/410 stop
+        // immediately; a 400 or a price miss gets a small budget; transient
+        // infrastructure errors get the full ladder, since those come in bursts
+        // and a jittered ladder is what carries an ASIN past one.
+        const budget = retryBudgetFor(error);
 
-        if (isRetryable && attempt < maxRetries) {
-          const backoffDelay = 1000 * Math.pow(2, attempt - 1); // 1s, 2s, 4s
-          console.warn(`[Scrapingdog] ⚠️ Attempt ${attempt} failed for ${asin}: ${error.message}`);
-          console.log(`[Scrapingdog] 🔄 Retrying after ${backoffDelay}ms (exponential backoff)...`);
+        if (attempt < budget) {
+          const backoffDelay = backoffDelayMs(attempt);
+          console.warn(`[Scrapingdog] ⚠️ Attempt ${attempt}/${budget} failed for ${asin}: ${error.message}`);
+          console.log(`[Scrapingdog] 🔄 Retrying after ${backoffDelay}ms (jittered backoff)...`);
           await new Promise(resolve => setTimeout(resolve, backoffDelay));
           continue;
         }
@@ -488,7 +542,7 @@ export async function scrapeAmazonProductWithScrapingdog(asin, region = 'US', re
         trackApiUsage({
           service: 'Scrapingdog',
           asin,
-          creditsUsed: regionConfig.credits,
+          creditsUsed: regionConfig.credits * Math.max(1, billableResponses),
           success: false,
           errorMessage: error.message,
           responseTime,
@@ -499,5 +553,5 @@ export async function scrapeAmazonProductWithScrapingdog(asin, region = 'US', re
         throw error;
       }
     }
-  });
+  }
 }
