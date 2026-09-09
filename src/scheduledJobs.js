@@ -133,12 +133,12 @@ export function initializeScheduledJobs() {
     }
 
     if (IS_RENDER_RUNNER) {
-        // Fulfillment + Buyer Chat polling every 20 minutes.
+        // Fulfillment + Buyer Chat polling every 10 minutes.
         // These mirror the manual buttons:
         // - Fulfillment Dashboard: Poll New Orders
         // - Fulfillment Dashboard: Poll Order Updates
         // - Buyer Chat: Check New
-        cron.schedule('*/20 * * * *', async () => {
+        cron.schedule('*/10 * * * *', async () => {
             await runPollingJob('pollNewOrders', 'Poll New Orders', scheduledPollNewOrders);
             await sleep(15_000);
             await runPollingJob('pollOrderUpdates', 'Poll Order Updates', scheduledPollOrderUpdates);
@@ -146,7 +146,7 @@ export function initializeScheduledJobs() {
             await runPollingJob('buyerChatCheckNew', 'Buyer Chat Check New', scheduledSyncBuyerInbox);
         }, { timezone: 'Asia/Kolkata' });
 
-        console.log(`[CRON] Scheduled job initialized: Fulfillment and Buyer Chat polling every 20 minutes (runner: ${RUNNER_ID})`);
+        console.log(`[CRON] Scheduled job initialized: Fulfillment and Buyer Chat polling every 10 minutes (runner: ${RUNNER_ID})`);
 
         // Poll All Sellers at 12:05 AM IST daily.
         // Syncs eBay listings from lastListingPolledAt up to "now" for every seller.
