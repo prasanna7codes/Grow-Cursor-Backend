@@ -11,6 +11,9 @@ import SellerPricingConfig from '../models/SellerPricingConfig.js';
 import { fetchAmazonData, applyFieldConfigs } from '../utils/asinAutofill.js';
 import { calculateStartPrice } from '../utils/pricingCalculator.js';
 import { generateWithGemini } from '../utils/gemini.js';
+import { PRECHECK_BLOCKED_BRANDS } from '../config/blockedBrands.js';
+import { assessAsinIpRisk, getIpRiskConfig, isIpRiskCheckEnabled, toClientIpRisk } from '../utils/reverseImageCheck.js';
+import AsinIpRisk from '../models/AsinIpRisk.js';
 import { generateSKUFromASIN, generateSKUWithCount } from '../utils/skuGenerator.js';
 import { getEffectiveTemplate } from '../utils/templateMerger.js';
 import { applyOverlayMapping, buildOverlayResult, hostImagesOnEbay, IMAGE_LIST_SEPARATOR, prefetchImageRecipes, refreshExpiredImages, resolveEffectiveBadgeKey, resolveSavedImageList, resolveTemplateOverlay, splitImageList, withOverlaidImages } from '../utils/overlayImage.js';
@@ -603,11 +606,9 @@ function parseShippingDate(shippingValue, scrapedAt, timezone) {
   };
 }
 
-// Brands the ASIN precheck never surfaces. A hit anywhere in the title, brand,
-// or description drops the ASIN from the stream entirely rather than returning
-// it as an excluded row, so these never reach the results table.
-const PRECHECK_BLOCKED_BRANDS = ['spigen', 'otterbox'];
-
+// A hit on PRECHECK_BLOCKED_BRANDS (config/blockedBrands.js) anywhere in the
+// title, brand, or description drops the ASIN from the stream entirely rather
+// than returning it as an excluded row, so these never reach the results table.
 function getBlockedBrand(amazonData = {}) {
   const haystack = [amazonData.title, amazonData.brand, amazonData.description]
     .map(value => String(value || '').toLowerCase())
@@ -852,12 +853,125 @@ function getPTDayBoundsUTC(dateStr) {
   return { start, end: new Date(nextStart.getTime() - 1) };
 }
 
+const IP_RISK_CHECK_MAX_ASINS = 50;
+
+/**
+ * @swagger
+ * /template-listings/ip-risk/{asin}:
+ *   get:
+ *     tags: [Template Listings]
+ *     summary: Read the cached reverse-image IP risk result for one ASIN
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - { in: path, name: asin, required: true, schema: { type: string } }
+ *     responses:
+ *       200: { description: Cached assessment (level, reasons, matched hosts, per-image detail) }
+ *       404: { description: ASIN has not been checked }
+ */
+router.get('/ip-risk/:asin', requireAuth, async (req, res) => {
+  try {
+    const asin = String(req.params.asin || '').trim().toUpperCase();
+    if (!asin) return res.status(400).json({ error: 'ASIN is required' });
+
+    const doc = await AsinIpRisk.findOne({ asin }).lean();
+    if (!doc) return res.status(404).json({ error: 'ASIN has not been checked', asin });
+
+    return res.json({ ...doc, cached: true, enabled: isIpRiskCheckEnabled() });
+  } catch (error) {
+    console.error('[IP Risk] Lookup failed:', error.message);
+    return res.status(500).json({ error: 'Failed to read IP risk result' });
+  }
+});
+
+/**
+ * @swagger
+ * /template-listings/ip-risk-check:
+ *   post:
+ *     tags: [Template Listings]
+ *     summary: Run the reverse-image IP risk check for a list of ASINs
+ *     description: >
+ *       Fetches each ASIN's Amazon photos (through the usual product cache) and
+ *       runs them through Google Cloud Vision web detection, returning a
+ *       high / medium / low risk level per ASIN with the evidence behind it.
+ *       Results are cached per ASIN; pass force=true to re-check. Intended for
+ *       auditing already-listed products outside the precheck flow.
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               asins: { type: array, items: { type: string }, maxItems: 50 }
+ *               region: { type: string, enum: [US, UK, CA, AU], default: US }
+ *               force: { type: boolean, default: false }
+ *     responses:
+ *       200: { description: Per-ASIN results }
+ *       400: { description: No valid ASINs, or too many }
+ *       503: { description: GOOGLE_VISION_API_KEY is not configured }
+ */
+router.post('/ip-risk-check', requireAuth, async (req, res) => {
+  try {
+    if (!isIpRiskCheckEnabled()) {
+      return res.status(503).json({ error: 'Reverse-image check is not configured (set SCRAPINGDOG_API_KEY or GOOGLE_VISION_API_KEY)' });
+    }
+
+    const rawAsins = Array.isArray(req.body?.asins) ? req.body.asins : String(req.body?.asins || '').split(/[\s,]+/);
+    const asins = [...new Set(rawAsins.map(value => String(value || '').trim().toUpperCase()).filter(Boolean))];
+    const region = ['US', 'UK', 'CA', 'AU'].includes(req.body?.region) ? req.body.region : 'US';
+    const force = req.body?.force === true || String(req.body?.force || '').toLowerCase() === 'true';
+
+    if (asins.length === 0) return res.status(400).json({ error: 'At least one ASIN is required' });
+    if (asins.length > IP_RISK_CHECK_MAX_ASINS) {
+      return res.status(400).json({ error: `Maximum ${IP_RISK_CHECK_MAX_ASINS} ASINs per request` });
+    }
+
+    const usageContext = buildAiUsageContext(req, null, null);
+
+    // Vision calls are bounded process-wide inside assessAsinIpRisk, and the
+    // product fetch by its provider pool, so fan out freely here.
+    const results = await Promise.all(asins.map(async (asin) => {
+      try {
+        const amazonData = await fetchAmazonData(asin, region);
+        const risk = await assessAsinIpRisk({
+          asin,
+          images: amazonData.images,
+          amazonBrand: amazonData.brand || '',
+          title: amazonData.title || '',
+          force,
+          usage: usageContext
+        });
+        return { ...risk, title: amazonData.title || '', amazonBrand: amazonData.brand || '' };
+      } catch (error) {
+        return { asin, level: 'error', reasons: [error.message], matchedDomains: [], brandHits: [], bestGuessLabels: [], imagesChecked: 0, images: [], cached: false };
+      }
+    }));
+
+    const summary = results.reduce((counts, result) => {
+      counts[result.level] = (counts[result.level] || 0) + 1;
+      return counts;
+    }, {});
+
+    return res.json({ results, summary, region, force });
+  } catch (error) {
+    console.error('[IP Risk] Check failed:', error.message);
+    return res.status(500).json({ error: 'Failed to run IP risk check' });
+  }
+});
+
 router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
   let heartbeat = null;
 
   try {
     const { templateId, sellerId, asins: asinsParam, region = 'US' } = req.query;
     const ebayMotorsMode = String(req.query.ebayMotorsMode || '').toLowerCase() === 'true';
+    // Reverse-image IP risk check runs whenever the Vision key is configured;
+    // ?ipRiskCheck=false opts a run out (e.g. re-checking a list already vetted).
+    const ipRiskCheck = isIpRiskCheckEnabled()
+      && String(req.query.ipRiskCheck || 'true').toLowerCase() !== 'false';
 
     if (!templateId || !sellerId || !asinsParam) {
       return res.status(400).json({ error: 'Template ID, Seller ID, and ASINs are required' });
@@ -991,7 +1105,9 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
       total: asins.length,
       concurrency: Math.min(streamConcurrency, asins.length),
       sweeps: SWEEP_GAPS_MS.length,
-      ebayMotorsMode
+      ebayMotorsMode,
+      ipRiskCheck,
+      ipRiskProvider: ipRiskCheck ? getIpRiskConfig().provider : null
     });
 
     // ASINs still unresolved after the current pass, swept by the next one.
@@ -1052,9 +1168,24 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
         const sourceData = buildAmazonSourceData(amazonData);
         const active = activeSkuSet.has(generated.sku) || activeSkuSet.has(generated.baseSku);
         const enrichment = getPrecheckEnrichment(amazonData, region, scrapedAt);
-        const ebayMotorsEligibility = ebayMotorsMode
-          ? await classifyEbayMotorsTitle(amazonData.title || '', asin, usageContext)
-          : null;
+        // The title classifier and the photo check are independent network
+        // calls; run them together so the row does not pay for both in series.
+        // assessAsinIpRisk never throws (a failed check is level 'error').
+        const [ebayMotorsEligibility, ipRisk] = await Promise.all([
+          ebayMotorsMode
+            ? classifyEbayMotorsTitle(amazonData.title || '', asin, usageContext)
+            : Promise.resolve(null),
+          ipRiskCheck
+            ? assessAsinIpRisk({
+                asin,
+                images: amazonData.images,
+                amazonBrand: amazonData.brand || '',
+                title: amazonData.title || '',
+                usage: usageContext
+              })
+            : Promise.resolve(null)
+        ]);
+        const ipRiskExcluded = ipRisk?.level === 'high';
 
         sendSse({
           type: 'item',
@@ -1074,7 +1205,8 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
             ebayMotorsReason: ebayMotorsEligibility?.reason || '',
             ebayMotorsSignals: ebayMotorsEligibility?.signals || null,
             ebayMotorsDetected: ebayMotorsEligibility?.detected || null,
-            intent: ebayMotorsEligibility && !ebayMotorsEligibility.eligible ? 'excluded' : 'neutral',
+            ipRisk: toClientIpRisk(ipRisk),
+            intent: (ebayMotorsEligibility && !ebayMotorsEligibility.eligible) || ipRiskExcluded ? 'excluded' : 'neutral',
             sourceData,
             status: 'success',
             progressStage: 'complete',
@@ -1147,6 +1279,7 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
             ebayMotorsReason: ebayMotorsMode ? 'Could not check title eligibility' : '',
             ebayMotorsSignals: ebayMotorsMode ? { hasModel: false, hasYear: false, isUniversal: false } : null,
             ebayMotorsDetected: ebayMotorsMode ? { modelNames: [], years: [], universalPhrase: '' } : null,
+            ipRisk: null,
             intent: ebayMotorsMode ? 'excluded' : 'neutral',
             sourceData: null,
             status: 'error',

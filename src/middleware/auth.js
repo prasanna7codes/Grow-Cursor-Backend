@@ -47,6 +47,8 @@ export const PAGE_DEFAULT_ROLES = {
   'FeedUploadStats': ['superadmin', 'listingadmin'],
   'DailyListingComparison': ['superadmin', 'listingadmin'],
   'ManualEndListing': ['superadmin', 'listingadmin'],
+  // Ends live listings on eBay, so it follows ManualEndListing's roles.
+  'IpRiskAudit': ['superadmin', 'listingadmin'],
   'SkuSellerOrderProfit': ['superadmin', 'listingadmin', 'fulfillmentadmin', 'hoc', 'compliancemanager'],
   'SellerUploadLimits': ['superadmin', 'listingadmin'],
   'CsvStorage': ['superadmin', 'listingadmin', 'lister'],
