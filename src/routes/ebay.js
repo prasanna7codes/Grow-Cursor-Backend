@@ -115,7 +115,11 @@ async function withEbayPollRun(jobType, req, res, runJob) {
   }
 
   activeEbayPollJobs.add(activeKey);
-  const staleBefore = new Date(Date.now() - 45 * 60 * 1000);
+  // A crashed or redeployed process never clears its own run doc, and the unique
+  // partial index on status:"running" turns that orphan into a lock on the whole job
+  // type. Sweep after 15 minutes: longer than any single job takes, short enough that
+  // the next 10-minute tick recovers instead of the job going dark for most of an hour.
+  const staleBefore = new Date(Date.now() - 15 * 60 * 1000);
   await EbayPollRun.updateMany(
     { jobType, status: 'running', startedAt: { $lt: staleBefore } },
     {
