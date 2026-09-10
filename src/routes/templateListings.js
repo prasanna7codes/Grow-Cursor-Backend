@@ -957,11 +957,32 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
       if (record.baseSku) activeSkuSet.add(record.baseSku);
     });
 
-    const streamConcurrency = parseInt(process.env.ASIN_PRECHECK_CONCURRENCY, 10)
-      || parseInt(process.env.SCRAPER_API_CONCURRENT, 10)
-      || 10;
+    // How many ASINs of THIS batch are in flight at once. It is not the account
+    // limit — the provider client owns that (a process-wide pool every batch
+    // shares), so this only decides how much of that pool one batch may claim.
+    //
+    // Do not fall back to SCRAPER_API_CONCURRENT: that is ScraperAPI's per-key
+    // limit, and inheriting it tied this batch size to an unrelated provider's
+    // setting — silently, and in whichever direction that value happened to move.
+    const streamConcurrency = parseInt(process.env.ASIN_PRECHECK_CONCURRENCY, 10) || 40;
     const rowByAsin = new Map(generatedRows.map(row => [row.asin, row]));
     let completed = 0;
+
+    // Failed ASINs are swept again inside the SAME run, after a pause.
+    //
+    // A price miss is not usually permanent, but it does not clear in the ~2s
+    // the provider client's own ladder spans: measured on 70 random ASINs, one
+    // attempt each resolved 63%, a sweep at +45s took it to 80%, and a third at
+    // +165s to 86%. That is exactly the climb users were producing by hand by
+    // submitting the same list three times — so the run does it for them, and
+    // the ASINs that need a second look cost them a wait instead of a re-entry.
+    //
+    // Gaps are wall-clock pauses with nothing in flight, so they are only worth
+    // spending on ASINs that actually failed; the first pass is never delayed.
+    const SWEEP_GAPS_MS = String(process.env.ASIN_PRECHECK_SWEEP_GAPS_MS || '45000,120000')
+      .split(',')
+      .map(value => parseInt(value.trim(), 10))
+      .filter(value => Number.isFinite(value) && value > 0);
 
     const usageContext = buildAiUsageContext(req, templateId, sellerId);
 
@@ -969,11 +990,18 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
       type: 'started',
       total: asins.length,
       concurrency: Math.min(streamConcurrency, asins.length),
+      sweeps: SWEEP_GAPS_MS.length,
       ebayMotorsMode
     });
 
-    await runWithConcurrency(asins, streamConcurrency, async (asin) => {
+    // ASINs still unresolved after the current pass, swept by the next one.
+    let pending = [...asins];
+    let sweepIndex = 0;
+    const resolved = new Set();
+
+    const processAsin = async (asin) => {
       if (streamClosed) return;
+      const isFinalPass = sweepIndex >= SWEEP_GAPS_MS.length;
 
       const generated = rowByAsin.get(asin) || {
         sku: generateSKUFromASIN(asin),
@@ -1003,6 +1031,8 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
             ).catch((err) => console.error('[ASIN Precheck] Failed to log retry:', err.message));
           });
         }
+
+        resolved.add(asin);
 
         const blockedBrand = getBlockedBrand(amazonData);
         if (blockedBrand) {
@@ -1057,6 +1087,37 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
         console.error(`[ASIN Precheck] Error processing ${asin}:`, error.message);
         const active = activeSkuSet.has(generated.sku) || activeSkuSet.has(generated.baseSku);
 
+        // Not the last pass: keep the row alive and let a later sweep retry it,
+        // rather than showing the user a failure they would fix by resubmitting.
+        // It stays out of `completed` so progress counts resolved ASINs only.
+        if (!isFinalPass) {
+          // The scrape may have succeeded and a later step (the eBay Motors
+          // classifier) thrown, so undo the resolve before parking it —
+          // otherwise the ASIN leaves `pending` without ever emitting a final
+          // row, and progress never reaches total.
+          resolved.delete(asin);
+          sendSse({
+            type: 'item',
+            item: {
+              id: `asin-precheck-${asin}`,
+              asin,
+              sku: generated.sku,
+              baseSku: generated.baseSku,
+              active,
+              activeStatus: active ? 'active' : 'inactive',
+              status: 'retrying',
+              progressStage: 'retrying',
+              retryPass: sweepIndex + 1,
+              retryPassesRemaining: SWEEP_GAPS_MS.length - sweepIndex,
+              errors: [error.message]
+            },
+            progress: completed,
+            total: asins.length
+          });
+          return;
+        }
+
+        resolved.add(asin);
         sendSse({
           type: 'item',
           item: {
@@ -1096,7 +1157,33 @@ router.get('/asin-precheck-stream', requireAuthSSE, async (req, res) => {
           total: asins.length
         });
       }
-    }, () => !streamClosed);
+    };
+
+    // Pass 0 runs immediately over everything; each sweep after it waits, then
+    // retries only what is still unresolved. The 15s heartbeat keeps the SSE
+    // connection alive across the gaps.
+    for (sweepIndex = 0; sweepIndex <= SWEEP_GAPS_MS.length; sweepIndex += 1) {
+      if (streamClosed || pending.length === 0) break;
+
+      if (sweepIndex > 0) {
+        const gapMs = SWEEP_GAPS_MS[sweepIndex - 1];
+        console.log(`[ASIN Precheck] Sweep ${sweepIndex}/${SWEEP_GAPS_MS.length}: ${pending.length} unresolved, waiting ${gapMs}ms`);
+        sendSse({
+          type: 'sweep_waiting',
+          sweep: sweepIndex,
+          totalSweeps: SWEEP_GAPS_MS.length,
+          pending: pending.length,
+          waitMs: gapMs
+        });
+        await new Promise(resolve => setTimeout(resolve, gapMs));
+        if (streamClosed) break;
+        sendSse({ type: 'sweep_started', sweep: sweepIndex, totalSweeps: SWEEP_GAPS_MS.length, pending: pending.length });
+      }
+
+      const batch = pending;
+      await runWithConcurrency(batch, streamConcurrency, processAsin, () => !streamClosed);
+      pending = batch.filter(asin => !resolved.has(asin));
+    }
 
     sendSse({ type: 'complete', total: completed });
     sendDone();
