@@ -16118,7 +16118,7 @@ router.post('/end-item', requireAuth, async (req, res) => {
     }
 
     // Log successful end-listing action if a valid source is provided
-    if (source && ['duplicate_sku', 'expiry_listing', 'amazon_stock_check', 'sku_listing_manager'].includes(source)) {
+    if (source && ['duplicate_sku', 'expiry_listing', 'amazon_stock_check', 'sku_listing_manager', 'keyword_end_listing'].includes(source)) {
       try {
         await EndListingLog.create({
           seller: sellerId,

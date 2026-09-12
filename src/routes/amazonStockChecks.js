@@ -145,7 +145,7 @@ async function withMongoRetry(label, operation, attempts = 4) {
   throw lastError;
 }
 
-function normalizeCurrency(value) {
+export function normalizeCurrency(value) {
   const cur = String(value || '').trim().toUpperCase();
   if (cur === 'GB') return 'GBP';
   return cur;
@@ -163,20 +163,42 @@ function currencyAliases(currency) {
   return normalized === 'GBP' ? ['GBP', 'GB'] : [normalized];
 }
 
-function cleanSku(value) {
+export function cleanSku(value) {
   return String(value || '').trim();
 }
 
-function getBaseLabel(value) {
+export function getBaseLabel(value) {
   return cleanSku(value).split('-')[0].trim();
 }
 
-function cleanAsin(value) {
+export function cleanAsin(value) {
   return String(value || '').trim().toUpperCase();
 }
 
-function isAmazonAsin(value) {
+export function isAmazonAsin(value) {
   return /^[A-Z0-9]{10}$/.test(cleanAsin(value)) && cleanAsin(value).startsWith('B0');
+}
+
+// The ASIN each base SKU label points at, from TemplateListing. Keyed by the
+// uppercased base label; the first ASIN seen for a label wins. Shared by the
+// SKU lookup and the Keyword End Listing search, which both show an Amazon
+// link beside every seller listing.
+export async function loadAsinByBaseLabel(labels) {
+  const asinByLabel = new Map();
+  if (!labels.length) return asinByLabel;
+  const templateRows = await TemplateListing.find({
+    baseCustomLabel: { $in: labels },
+    _asinReference: { $exists: true, $ne: '' }
+  })
+    .select('customLabel baseCustomLabel +_asinReference')
+    .collation({ locale: 'en', strength: 2 })
+    .lean();
+  for (const row of templateRows) {
+    const label = getBaseLabel(row.baseCustomLabel || row.customLabel).toUpperCase();
+    const asin = cleanAsin(row._asinReference);
+    if (label && asin && !asinByLabel.has(label)) asinByLabel.set(label, asin);
+  }
+  return asinByLabel;
 }
 
 function estimateCredits(candidates) {
@@ -474,11 +496,11 @@ async function getSellerNameMap(sellerIds) {
 // Per-listing history
 //
 // Orders, end-listing actions and revisions for a set of eBay item ids, keyed
-// by `${sellerId}:${itemId}`. Shared by the verify drawer and the SKU Listing
-// Manager page, which both show one row per seller listing and need the same
-// order counts and action badges beside it.
+// by `${sellerId}:${itemId}`. Shared by the verify drawer, the SKU Listing
+// Manager page and the Keyword End Listing route, which all show one row per
+// seller listing and need the same order counts and action badges beside it.
 // ---------------------------------------------------------------------------
-async function loadListingHistory(itemIds) {
+export async function loadListingHistory(itemIds) {
   if (!itemIds.length) {
     return { endedByKey: new Map(), revisedByKey: new Map(), ordersByKey: new Map() };
   }
@@ -555,7 +577,7 @@ async function loadListingHistory(itemIds) {
 
 // Folds loadListingHistory() output onto seller-listing rows, adding the 30d /
 // 90d / lifetime order counts and the 12-month sparkline series each row shows.
-function attachListingHistory(sellerItems, history, { fallbackSku = '', fallbackCurrency = '', runSellerId = null } = {}) {
+export function attachListingHistory(sellerItems, history, { fallbackSku = '', fallbackCurrency = '', runSellerId = null } = {}) {
   const { endedByKey, revisedByKey, ordersByKey } = history;
   const since30 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
   const since90 = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);
@@ -1555,26 +1577,12 @@ router.get('/sku-lookup', requireAuth, requirePageAccess(SKU_LOOKUP_PAGES), asyn
 
     // Seller names, order/action history and the ASIN each SKU points at are
     // independent lookups — run them together.
-    const [sellerNameMap, history, templateRows] = await Promise.all([
+    const [sellerNameMap, history, asinByLabel] = await Promise.all([
       getSellerNameMap([...new Set(rows.map((row) => row.seller).filter(Boolean))]),
       loadListingHistory(itemIds),
-      labels.length
-        ? TemplateListing.find({
-            baseCustomLabel: { $in: labels },
-            _asinReference: { $exists: true, $ne: '' }
-          })
-            .select('customLabel baseCustomLabel +_asinReference')
-            .collation({ locale: 'en', strength: 2 })
-            .lean()
-        : Promise.resolve([])
+      loadAsinByBaseLabel(labels)
     ]);
 
-    const asinByLabel = new Map();
-    for (const row of templateRows) {
-      const label = getBaseLabel(row.baseCustomLabel || row.customLabel).toUpperCase();
-      const asin = cleanAsin(row._asinReference);
-      if (label && asin && !asinByLabel.has(label)) asinByLabel.set(label, asin);
-    }
     const asinForRow = (row) => {
       if (isAmazonAsin(row.sku)) return cleanAsin(row.sku);
       return asinByLabel.get(getBaseLabel(row.baseSku || row.sku).toUpperCase()) || queriedAsin || '';
