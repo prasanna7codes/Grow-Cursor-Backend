@@ -20,6 +20,40 @@ const router = express.Router();
 const PT_TIMEZONE = 'America/Los_Angeles';
 const IST_TIMEZONE = 'Asia/Kolkata';
 
+// Nothing cascades deletes into UserCategoryTarget, so a target can outlive the
+// user, seller, category or range it points at. Mongoose sets a populated path
+// to null in that case and the raw id survives only on doc.populated(path).
+//
+// Reading the id off the populated value alone is what broke this route: for a
+// dangling ref String(null) is the truthy string 'null', so filtering after
+// stringifying let it reach new ObjectId() and threw a BSONError.
+const refIdOf = (doc, path) => {
+  const ref = doc?.[path];
+  const id = ref?._id ?? ref ?? doc?.populated?.(path);
+  return id ? String(id) : null;
+};
+
+// A null populated path means either 'never set' (a target with no range) or
+// 'deleted'. populated() still holds the id in the second case, which is how we
+// tell them apart — without it a deleted range renders as 'All ranges' and
+// quietly misstates the target.
+const DELETED_REFS = {
+  user: ['username', 'Deleted user'],
+  seller: ['storeName', 'Deleted seller'],
+  category: ['name', 'Deleted category'],
+  range: ['name', 'Deleted range'],
+};
+
+// Keeps the original _id so rows stay distinct per missing ref instead of
+// collapsing into a single 'unknown' bucket in the UI.
+const withDeletedRef = (doc, path) => {
+  if (doc?.[path]) return doc[path];
+  const id = refIdOf(doc, path);
+  if (!id) return doc?.[path] ?? null;
+  const [labelField, label] = DELETED_REFS[path];
+  return { _id: id, [labelField]: label, deleted: true };
+};
+
 const pageAccess = requirePageAccess('UserCategoryTargets');
 const performancePageAccess = requirePageAccess(['UserCategoryTargets', 'UserListingPerformance']);
 
@@ -125,8 +159,8 @@ router.get('/performance', requireAuth, performancePageAccess, validate(userCate
     const { start } = getPTDayBoundsUTC(startDate);
     const { end } = getPTDayBoundsUTC(endDate);
     const days = countInclusiveDays(startDate, endDate);
-    const targetUserIds = [...new Set(targets.map((target) => String(target.user?._id || target.user)).filter(Boolean))];
-    const targetSellerIds = [...new Set(targets.map((target) => String(target.seller?._id || target.seller)).filter(Boolean))];
+    const targetUserIds = [...new Set(targets.map((target) => refIdOf(target, 'user')).filter(Boolean))];
+    const targetSellerIds = [...new Set(targets.map((target) => refIdOf(target, 'seller')).filter(Boolean))];
     const aiRunMatch = {
       lastSavedFromReviewAt: { $gte: start, $lte: end },
     };
@@ -225,16 +259,16 @@ router.get('/performance', requireAuth, performancePageAccess, validate(userCate
 
       return {
         targetId: target._id,
-        user: target.user,
-        seller: target.seller,
+        user: withDeletedRef(target, 'user'),
+        seller: withDeletedRef(target, 'seller'),
         marketplace: target.marketplace,
-        category: target.category,
-        range: target.range,
+        category: withDeletedRef(target, 'category'),
+        range: withDeletedRef(target, 'range'),
         dailyDesiredQuantity: target.dailyDesiredQuantity || 0,
         targetQuantity,
         successfulListings,
         failedListings,
-        aiSavedCount: aiSavedByUserId.get(String(target.user?._id || target.user)) || 0,
+        aiSavedCount: aiSavedByUserId.get(refIdOf(target, 'user')) || 0,
         missedListings: Math.max(targetQuantity - successfulListings, 0),
         completionPercent,
         status,
