@@ -14,14 +14,19 @@ export const AMAZON_STOCK_CHECK_RUN_FEATURE_ID = 'amazonStockCheck.run';
 // seller-scoped variant of the Amazon Stock Check page.
 const STOCK_CHECK_PAGES = ['AmazonStockCheck', 'SellerSkuStockCheck'];
 
+// The Amazon Delivery Date Check page reuses the revise/end listing surface
+// verbatim (its own run/scrape logic is entirely separate). Listed here only
+// to grant access to those endpoints — nothing about the stock check changes.
+const DELIVERY_CHECK_PAGE = 'AmazonDeliveryDateCheck';
+
 // The revision history has its own page, and is also reachable from the stock
 // check pages that create the revisions.
-const LISTING_REVISION_PAGES = ['ListingRevisions', ...STOCK_CHECK_PAGES];
+const LISTING_REVISION_PAGES = ['ListingRevisions', DELIVERY_CHECK_PAGE, ...STOCK_CHECK_PAGES];
 
 // The SKU Listing Manager searches the SKU index for a typed SKU and offers the
 // same end/revise actions on what it finds, so it shares those endpoints.
 const SKU_LISTING_MANAGER_PAGE = 'SkuListingManager';
-const LISTING_ACTION_PAGES = [SKU_LISTING_MANAGER_PAGE, ...STOCK_CHECK_PAGES];
+const LISTING_ACTION_PAGES = [SKU_LISTING_MANAGER_PAGE, DELIVERY_CHECK_PAGE, ...STOCK_CHECK_PAGES];
 // The same page also answers the read-only SKU / ASIN Lookup route, so that
 // page id may read the lookup — but not the end/revise routes above it.
 const SKU_LOOKUP_PAGES = ['SkuIndexLookup', ...LISTING_ACTION_PAGES];
@@ -478,7 +483,7 @@ async function getSellerNameMap(sellerIds) {
 // Manager page, which both show one row per seller listing and need the same
 // order counts and action badges beside it.
 // ---------------------------------------------------------------------------
-async function loadListingHistory(itemIds) {
+export async function loadListingHistory(itemIds) {
   if (!itemIds.length) {
     return { endedByKey: new Map(), revisedByKey: new Map(), ordersByKey: new Map() };
   }
@@ -555,7 +560,7 @@ async function loadListingHistory(itemIds) {
 
 // Folds loadListingHistory() output onto seller-listing rows, adding the 30d /
 // 90d / lifetime order counts and the 12-month sparkline series each row shows.
-function attachListingHistory(sellerItems, history, { fallbackSku = '', fallbackCurrency = '', runSellerId = null } = {}) {
+export function attachListingHistory(sellerItems, history, { fallbackSku = '', fallbackCurrency = '', runSellerId = null } = {}) {
   const { endedByKey, revisedByKey, ordersByKey } = history;
   const since30 = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
   const since90 = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000);

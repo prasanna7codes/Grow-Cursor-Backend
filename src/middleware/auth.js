@@ -82,6 +82,7 @@ export const PAGE_DEFAULT_ROLES = {
   'SkuIndexLookup': ['superadmin', 'listingadmin'],
   'SkuListingManager': ['superadmin', 'listingadmin'],
   'AmazonStockCheck': ['superadmin', 'listingadmin'],
+  'AmazonDeliveryDateCheck': ['superadmin', 'listingadmin'],
   'SellerSkuStockCheck': ['superadmin', 'listingadmin'],
   'ListingRevisions': ['superadmin', 'listingadmin'],
   'EndListingByDate': ['superadmin', 'listingadmin'],

@@ -8,11 +8,12 @@ const EndListingLogSchema = new mongoose.Schema({
   marketplaceId: { type: String, default: null },
   // Which Amazon Stock Check run triggered this end, if any (null for the
   // duplicate_sku/expiry_listing/sku_listing_manager sources, which aren't
-  // run-scoped).
+  // run-scoped, and for amazon_delivery_check, whose runs live in a different
+  // collection than this ref points at).
   run: { type: mongoose.Schema.Types.ObjectId, ref: 'AmazonStockCheckRun', default: null, index: true },
   source: {
     type: String,
-    enum: ['duplicate_sku', 'expiry_listing', 'amazon_stock_check', 'sku_listing_manager'],
+    enum: ['duplicate_sku', 'expiry_listing', 'amazon_stock_check', 'sku_listing_manager', 'amazon_delivery_check'],
     required: true,
   },
   // User who triggered the end action (null for legacy rows).

@@ -73,6 +73,7 @@ import listingStatsRoutes from './routes/listingStats.js';
 import itemCategoryMapRoutes from './routes/itemCategoryMap.js';
 import endListingLogsRoutes from './routes/endListingLogs.js';
 import amazonStockChecksRoutes, { resumeRunningAmazonStockCheckRuns } from './routes/amazonStockChecks.js';
+import amazonDeliveryChecksRoutes, { resumeRunningAmazonDeliveryCheckRuns } from './routes/amazonDeliveryChecks.js';
 import featurePermissionsRoutes from './routes/featurePermissions.js';
 import quantityUpdateExclusionsRoutes from './routes/quantityUpdateExclusions.js';
 import { initializeScheduledJobs } from './scheduledJobs.js';
@@ -288,6 +289,7 @@ app.use('/api/listing-stats', listingStatsRoutes);
 app.use('/api/item-category-map', itemCategoryMapRoutes);
 app.use('/api/end-listing-logs', endListingLogsRoutes);
 app.use('/api/amazon-stock-checks', amazonStockChecksRoutes);
+app.use('/api/amazon-delivery-checks', amazonDeliveryChecksRoutes);
 app.use('/api/feature-permissions', featurePermissionsRoutes);
 app.use('/api/quantity-update-exclusions', quantityUpdateExclusionsRoutes);
 
@@ -357,6 +359,16 @@ connectToDatabase()
         })
         .catch((e) => {
           logger.error('[Amazon Stock Check] Failed to resume queued/running runs:', { error: e.message });
+        });
+
+      resumeRunningAmazonDeliveryCheckRuns()
+        .then((resumedRunCount) => {
+          if (resumedRunCount > 0) {
+            logger.info(`[Amazon Delivery Check] Resumed ${resumedRunCount} queued/running run(s) after server restart`);
+          }
+        })
+        .catch((e) => {
+          logger.error('[Amazon Delivery Check] Failed to resume queued/running runs:', { error: e.message });
         });
     });
   })
